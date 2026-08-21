@@ -1,0 +1,1 @@
+CREATE INDEX `idx_skillcanvas_diagnostics_tenant_time` ON `skillcanvas_diagnostic_events` (`tenant_id`,`timestamp`);
