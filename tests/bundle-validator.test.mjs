@@ -16,7 +16,7 @@ function baseBundle() {
   };
 }
 
-test("P0 bundle validator checks frontmatter, JSON, references, duplicates, and runner contract", () => {
+test("deterministic validator separates execution blockers from contract blockers", () => {
   const files = baseBundle();
   files["SKILL.md"] += "Read references/missing.md when needed.\n";
   files["evals/capability-manifest.json"] = JSON.stringify({ capabilities: [{ id: "core" }, { id: "core" }] });
@@ -24,9 +24,11 @@ test("P0 bundle validator checks frontmatter, JSON, references, duplicates, and 
   files["evals/run_evals.py"] = "print('no entrypoint')";
   const result = validateBundleStructure(files);
   assert.equal(result.valid, false);
-  assert.ok(result.issues.every((issue) => issue.priority === "P0"));
-  assert.ok(result.issues.some((issue) => issue.code === "INVALID_JSON"));
-  assert.ok(result.issues.some((issue) => issue.code === "DUPLICATE_MANIFEST_ENTRY"));
+  assert.equal(result.executionReady, false);
+  assert.equal(result.contractReady, false);
+  assert.ok(result.issues.every((issue) => issue.detector === "deterministic"));
+  assert.ok(result.issues.some((issue) => issue.code === "INVALID_JSON" && issue.priority === "P0" && issue.repairRoute === "static-execution"));
+  assert.ok(result.issues.some((issue) => issue.code === "DUPLICATE_MANIFEST_ENTRY" && issue.priority === "P1" && issue.repairRoute === "semantic-contract"));
   assert.ok(result.issues.some((issue) => issue.code === "MISSING_REFERENCED_FILE"));
   assert.ok(result.issues.some((issue) => issue.code === "EVAL_RUNNER_START_CONTRACT"));
 });
@@ -34,18 +36,22 @@ test("P0 bundle validator checks frontmatter, JSON, references, duplicates, and 
 test("structurally valid bundle clears the deterministic P0 gate", () => {
   const result = validateBundleStructure(baseBundle());
   assert.equal(result.valid, true);
+  assert.equal(result.executionReady, true);
+  assert.equal(result.contractReady, true);
   assert.deepEqual(result.issues, []);
 });
 
-test("P0 gate rejects an empty required Skill section", () => {
+test("P1 contract gate rejects an empty required Skill section without blocking execution", () => {
   const files = baseBundle();
   files["SKILL.md"] += "\n## Goal\n\n## Workflow\n\n1. Complete the task.\n";
   const result = validateBundleStructure(files);
   assert.equal(result.valid, false);
-  assert.ok(result.issues.some((issue) => issue.code === "EMPTY_REQUIRED_SECTION"));
+  assert.equal(result.executionReady, true);
+  assert.equal(result.contractReady, false);
+  assert.ok(result.issues.some((issue) => issue.code === "EMPTY_REQUIRED_SECTION" && issue.priority === "P1"));
 });
 
-test("P0 content gate catches deterministic semantic defects without a model", () => {
+test("P1 contract gate catches deterministic semantic defects without a model", () => {
   const files = baseBundle();
   files["SKILL.md"] += `
 ## Workflow
@@ -62,7 +68,9 @@ test("P0 content gate catches deterministic semantic defects without a model", (
     { id: "generic", concept: "相关资料", name: "相关资料" },
   ] });
 
-  const codes = new Set(validateBundleContentCoherence(files).map((issue) => issue.code));
+  const issues = validateBundleContentCoherence(files);
+  const codes = new Set(issues.map((issue) => issue.code));
+  assert.ok(issues.every((issue) => issue.priority === "P1" && issue.category === "P1_CONTRACT_BLOCKER" && issue.repairRoute === "semantic-contract"));
   assert.equal(codes.has("CONTRADICTORY_ACTION_PERMISSION"), true);
   assert.equal(codes.has("ADJACENT_DUPLICATE_SENTENCE"), true);
   assert.equal(codes.has("INCOMPLETE_PROMPT"), true);
@@ -70,7 +78,7 @@ test("P0 content gate catches deterministic semantic defects without a model", (
   assert.equal(codes.has("BOILERPLATE_INPUT_OVERLAP"), true);
 });
 
-test("P0 content gate allows explicitly scoped autonomy", () => {
+test("P1 contract gate allows explicitly scoped autonomy", () => {
   const files = baseBundle();
   files["SKILL.md"] += "\n## Workflow\n\n低风险、可逆步骤可以自主推进；关键决策必须先询问用户确认。\n";
   const issues = validateBundleContentCoherence(files);

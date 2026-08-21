@@ -107,9 +107,10 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /const contentPolicyExpected = contentPolicyEvalExpectations\(contentPermission\)/);
   assert.match(page, /等待 Build Loop 修复完成后启动/);
   assert.match(page, /继续修复并启动/);
-  assert.match(page, /if \(validation\.valid\) break;\s*if \(!conflictRemains\) continue;/);
-  assert.doesNotMatch(page, /if \(validation\.valid \|\| conflictRemains\) break;/);
-  assert.match(page, /phase: "static-compiler-repair"/);
+  assert.match(page, /while \(!validation\.executionReady/);
+  assert.match(page, /validation\.issues\.filter\(\(issue\) => issue\.priority === "P0"\)/);
+  assert.match(page, /category: repairPolicy\.priority === "P0" \? "P0_EXECUTION_BLOCKER" : "P1_CONTRACT_BLOCKER"/);
+  assert.match(route, /evaluation\.category is P1_CONTRACT_BLOCKER/);
   assert.match(page, /\/api\/credentials/);
   assert.doesNotMatch(page, /window\.localStorage\.setItem\([^)]*credential/i);
   assert.match(page, /清除已保存凭据/);
@@ -485,7 +486,7 @@ test("stores credentials behind an HttpOnly tenant session without returning pla
   assert.equal(removed.status, 200);
 });
 
-test("P0 Static Gate compiles every generated Python file before semantic optimization", async () => {
+test("P0 Execution Gate compiles every generated Python file before contract optimization", async () => {
   const files = {
     "SKILL.md": `---\nname: example-skill\ndescription: "Use when the user needs an example task completed with a concrete workflow."\n---\n\n# Example\n`,
     "agents/openai.yaml": `interface:\n  display_name: "Example"\n  short_description: "Example Skill"\n  default_prompt: "Use $example-skill."`,

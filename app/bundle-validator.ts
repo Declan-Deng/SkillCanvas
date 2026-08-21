@@ -1,7 +1,14 @@
 import { auditSkillIRFiles } from "./skill-ir.ts";
 
+export type BundleIssuePriority = "P0" | "P1";
+export type BundleIssueCategory = "P0_EXECUTION_BLOCKER" | "P1_CONTRACT_BLOCKER";
+export type BundleRepairRoute = "static-execution" | "semantic-contract";
+
 export type BundleStaticIssue = {
-  priority: "P0";
+  priority: BundleIssuePriority;
+  category: BundleIssueCategory;
+  detector: "deterministic";
+  repairRoute: BundleRepairRoute;
   code: string;
   path: string;
   message: string;
@@ -15,6 +22,8 @@ export type BundleStaticCheck = {
 
 export type BundleStaticValidation = {
   valid: boolean;
+  executionReady: boolean;
+  contractReady: boolean;
   issues: BundleStaticIssue[];
   checks: BundleStaticCheck[];
 };
@@ -34,6 +43,34 @@ const AUTONOMOUS_SIGNAL = /(?:自主|自动|直接|无需确认|不必询问|不
 const SCOPED_AUTONOMY_SIGNAL = /(?:低风险|非关键|可逆).{0,80}(?:关键|高风险|不可逆)|(?:关键|高风险|不可逆).{0,80}(?:低风险|非关键|可逆)|(?:除非|仅当|只有|否则|分别|根据.{0,12}(?:风险|情况|条件))/i;
 const PROMPT_TEMPLATE_SIGNAL = /(?:相邻任务|complete the task|do the task|待替换|在此(?:填写|输入)|placeholder|示例任务(?:\s*\d+)?)/i;
 const GENERIC_INPUT_SIGNAL = /^(?:用户)?(?:补充|其他|相关|必要|更多|通用)?(?:的)?(?:输入|信息|资料|内容|上下文|材料)$/i;
+
+// Detection method and failure severity are separate dimensions. Everything in
+// this validator is deterministic, but only failures that prevent the bundle
+// from loading or executing belong to P0. Deterministic contract defects are P1
+// and must be routed to semantic repair instead of the static repair loop.
+const P0_EXECUTION_BLOCKER_CODES = new Set([
+  "INVALID_BUNDLE_PATH",
+  "EMPTY_REQUIRED_FILE",
+  "MISSING_REQUIRED_FILE",
+  "INVALID_SKILL_FRONTMATTER",
+  "INVALID_YAML",
+  "INVALID_JSON",
+  "INVALID_JSON_SCHEMA",
+  "MISSING_REFERENCED_FILE",
+  "EVAL_RUNNER_START_CONTRACT",
+  "INVALID_HARNESS_FILE",
+  "PYTHON_COMPILE_ERROR",
+  "SHELL_SYNTAX_ERROR",
+  "PYTHON_TEST_FAILURE",
+  "STATIC_VALIDATOR_UNAVAILABLE",
+]);
+
+export function classifyBundleIssue(code: string): Pick<BundleStaticIssue, "priority" | "category" | "detector" | "repairRoute"> {
+  const executionBlocker = P0_EXECUTION_BLOCKER_CODES.has(code);
+  return executionBlocker
+    ? { priority: "P0", category: "P0_EXECUTION_BLOCKER", detector: "deterministic", repairRoute: "static-execution" }
+    : { priority: "P1", category: "P1_CONTRACT_BLOCKER", detector: "deterministic", repairRoute: "semantic-contract" };
+}
 
 function safeBundlePath(path: string) {
   return path.length > 0
@@ -56,7 +93,7 @@ function duplicateValues(values: string[]) {
 }
 
 function pushIssue(issues: BundleStaticIssue[], code: string, path: string, message: string) {
-  issues.push({ priority: "P0", code, path, message });
+  issues.push({ ...classifyBundleIssue(code), code, path, message });
 }
 
 function validateSkillFrontmatter(skill: string, issues: BundleStaticIssue[]) {
@@ -360,5 +397,7 @@ export function validateBundleStructure(files: Record<string, string>): BundleSt
     { id: "runner", label: "Eval runner 启动契约", passed: passed("EVAL_RUNNER_START_CONTRACT") },
     { id: "content-coherence", label: "确定性内容自洽", passed: !uniqueIssues.some((issue) => ["CONTRADICTORY_ACTION_PERMISSION", "ADJACENT_DUPLICATE_SENTENCE", "INCOMPLETE_PROMPT", "TEMPLATE_PROMPT_TEXT", "BOILERPLATE_INPUT_OVERLAP"].includes(issue.code)) },
   ];
-  return { valid: uniqueIssues.length === 0, issues: uniqueIssues, checks };
+  const executionReady = !uniqueIssues.some((issue) => issue.priority === "P0");
+  const contractReady = !uniqueIssues.some((issue) => issue.priority === "P1");
+  return { valid: executionReady && contractReady, executionReady, contractReady, issues: uniqueIssues, checks };
 }

@@ -1,5 +1,5 @@
 import { parser as pythonParser } from "@lezer/python";
-import { validateBundleStructure, type BundleStaticIssue } from "../../bundle-validator";
+import { classifyBundleIssue, validateBundleStructure, type BundleStaticIssue } from "../../bundle-validator";
 
 type ValidationPayload = { files?: Record<string, unknown> };
 
@@ -10,7 +10,7 @@ function pythonSyntaxIssue(path: string, content: string): BundleStaticIssue | n
     if (cursor.type.isError) {
       const line = content.slice(0, cursor.from).split("\n").length;
       const excerpt = content.slice(cursor.from, Math.min(content.length, Math.max(cursor.to, cursor.from + 40))).replace(/[\r\n]+/g, " ");
-      return { priority: "P0", code: "PYTHON_COMPILE_ERROR", path, message: `${path} 无法通过 Python 语法树解析：第 ${line} 行 ${excerpt || "附近存在语法错误"}` };
+      return { ...classifyBundleIssue("PYTHON_COMPILE_ERROR"), code: "PYTHON_COMPILE_ERROR", path, message: `${path} 无法通过 Python 语法树解析：第 ${line} 行 ${excerpt || "附近存在语法错误"}` };
     }
   } while (cursor.next());
   return null;
@@ -26,7 +26,7 @@ function shellSyntaxIssue(path: string, content: string): BundleStaticIssue | nu
     if (quote) { if (char === quote) quote = ""; continue; }
     if (char === "'" || char === '"') quote = char;
   }
-  return quote ? { priority: "P0", code: "SHELL_SYNTAX_ERROR", path, message: `${path} 存在未闭合的 ${quote === "'" ? "单引号" : "双引号"}` } : null;
+  return quote ? { ...classifyBundleIssue("SHELL_SYNTAX_ERROR"), code: "SHELL_SYNTAX_ERROR", path, message: `${path} 存在未闭合的 ${quote === "'" ? "单引号" : "双引号"}` } : null;
 }
 
 export async function POST(request: Request) {
@@ -49,8 +49,12 @@ export async function POST(request: Request) {
     });
     const uniqueIssues = [...new Map(issues.map((issue) => [`${issue.code}:${issue.path}:${issue.message}`, issue])).values()];
     const syntaxPassed = !uniqueIssues.some((issue) => issue.code === "PYTHON_COMPILE_ERROR" || issue.code === "SHELL_SYNTAX_ERROR");
+    const executionReady = !uniqueIssues.some((issue) => issue.priority === "P0");
+    const contractReady = !uniqueIssues.some((issue) => issue.priority === "P1");
     return Response.json({
-      valid: uniqueIssues.length === 0,
+      valid: executionReady && contractReady,
+      executionReady,
+      contractReady,
       issues: uniqueIssues,
       checks: [...structural.checks, { id: "syntax", label: "Python 与 shell 语法", passed: syntaxPassed }],
     }, { headers: { "Cache-Control": "no-store" } });

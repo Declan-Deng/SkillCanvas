@@ -91,7 +91,7 @@ import {
   type EvalFamily,
   type PipelineIssue,
 } from "./skill-pipeline-core";
-import { validateBundleStructure, type BundleStaticValidation } from "./bundle-validator";
+import { classifyBundleIssue, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
 import {
   buildInformationDependencies,
   buildRequirementProvenance,
@@ -4005,7 +4005,7 @@ async function validateBundle(files: Record<string, string>): Promise<BundleStat
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const parsed = await response.json() as BundleStaticValidation;
-    if (!Array.isArray(parsed.issues) || !Array.isArray(parsed.checks) || typeof parsed.valid !== "boolean") throw new Error("invalid validator response");
+    if (!Array.isArray(parsed.issues) || !Array.isArray(parsed.checks) || typeof parsed.valid !== "boolean" || typeof parsed.executionReady !== "boolean" || typeof parsed.contractReady !== "boolean") throw new Error("invalid validator response");
     const scriptTestPaths = Object.keys(files).filter((path) => path.startsWith("evals/script-tests/") && path.endsWith(".py"));
     const hasScriptTests = scriptTestPaths.length > 0;
     if (!hasScriptTests) return parsed;
@@ -4015,8 +4015,8 @@ async function validateBundle(files: Record<string, string>): Promise<BundleStat
       const passed = executed && scriptTests.passed === true;
       if (executed && !passed) {
         const detail = (scriptTests.detail || "脚本测试失败").replace(/[\r\n]+/g, " ").slice(-420);
-        const issue = { priority: "P0" as const, code: "PYTHON_TEST_FAILURE", path: scriptTestPaths[0] || "evals/script-tests/", message: `生成脚本没有通过本地受限进程测试：${detail}` };
-        return { ...parsed, valid: false, issues: [...parsed.issues, issue], checks: [...parsed.checks, { id: "script-tests", label: "生成脚本独立测试", passed: false }] };
+        const issue: BundleStaticIssue = { ...classifyBundleIssue("PYTHON_TEST_FAILURE"), code: "PYTHON_TEST_FAILURE", path: scriptTestPaths[0] || "evals/script-tests/", message: `生成脚本没有通过本地受限进程测试：${detail}` };
+        return { ...parsed, valid: false, executionReady: false, issues: [...parsed.issues, issue], checks: [...parsed.checks, { id: "script-tests", label: "生成脚本独立测试", passed: false }] };
       }
       return { ...parsed, checks: [...parsed.checks, { id: "script-tests", label: "生成脚本独立测试", passed: passed || !executed }] };
     } catch {
@@ -4027,14 +4027,25 @@ async function validateBundle(files: Record<string, string>): Promise<BundleStat
     }
   } catch {
     const fallback = validateBundleStructure(files);
-    const compilerIssue = {
-      priority: "P0" as const,
+    const compilerIssue: BundleStaticIssue = {
+      ...classifyBundleIssue("STATIC_VALIDATOR_UNAVAILABLE"),
       code: "STATIC_VALIDATOR_UNAVAILABLE",
       path: "",
-      message: "P0 Static Gate 暂时不可用，已阻止进入语义优化和 Eval",
+      message: "P0 Execution Gate 暂时不可用，已阻止进入契约修复和 Eval",
     };
-    return { ...fallback, valid: false, issues: [...fallback.issues, compilerIssue], checks: [...fallback.checks, { id: "syntax", label: "Python 与 shell 语法", passed: false }] };
+    return { ...fallback, valid: false, executionReady: false, issues: [...fallback.issues, compilerIssue], checks: [...fallback.checks, { id: "syntax", label: "Python 与 shell 语法", passed: false }] };
   }
+}
+
+function bundleIssuesToPipelineIssues(issues: BundleStaticIssue[]): PipelineIssue[] {
+  return issues.map((issue, index) => ({
+    id: `deterministic-${issue.code.toLowerCase()}-${index + 1}`,
+    priority: issue.priority,
+    type: issue.category,
+    source: "static" as const,
+    evidence: `[${issue.code}] ${issue.message}`,
+    files: issue.path ? [issue.path] : [],
+  }));
 }
 
 function normalizeSourceInsight(raw: unknown, fallbackName: string): SourceInsight | null {
@@ -5837,48 +5848,21 @@ export default function Home() {
   /* eslint-disable react-hooks/immutability -- These bounded compiler loops advance local candidate snapshots; React state changes only through setters. */
   async function runP0StaticRepairLoop(inputFiles: Record<string, string>, generationPlan: CapabilityPlan) {
     let currentFiles = inputFiles;
-    showLocalBusy("检查 JSON、YAML、路径、运行器与确定性内容自洽");
+    showLocalBusy("检查 JSON、YAML、路径、运行器与可执行性");
     let validation = await validateBundle(currentFiles);
     let rounds = 0;
     let previousSignature = "";
-    while (!validation.valid && rounds < STATIC_REPAIR_MAX_ROUNDS) {
-      const blockers = validation.issues.map((issue) => `${issue.code} · ${issue.path || "bundle"} · ${issue.message}`);
+    while (!validation.executionReady && rounds < STATIC_REPAIR_MAX_ROUNDS) {
+      const p0Issues = validation.issues.filter((issue) => issue.priority === "P0");
+      const blockers = p0Issues.map((issue) => `${issue.code} · ${issue.path || "bundle"} · ${issue.message}`);
       const signature = blockers.join("\n");
       setBuildLoop((current) => ({ ...current, status: "repairing", phase: "bundle", rounds, issues: blockers.slice(0, 8) }));
-      setGenerationLoop((current) => ({ ...current, status: "running", phase: "static", stopReason: `P0 Static Gate 第 ${rounds + 1}/${STATIC_REPAIR_MAX_ROUNDS} 轮：修复语法、路径、启动阻塞与可确定识别的内容冲突` }));
-      reportClientGenerationLoopEvent("generation_loop_phase", { phase: "static-repair", round: rounds + 1, blockers, reason: `P0 Static Gate 发现 ${validation.issues.length} 项：${blockers.slice(0, 2).join("；")}` });
-      let repairBlockers = blockers;
-      const permissionConflict = validation.issues.some((issue) => /\[(?:USER_PERMISSION_IR_CONFLICT|USER_PERMISSION_RUNTIME_CONFLICT|USER_PERMISSION_EVAL_CONFLICT|UNCONFIRMED_CONTENT_RESTRICTION)\]/.test(issue.message));
-      if (permissionConflict) {
-        const beforeFiles = currentFiles;
-        currentFiles = finalizeSkillFiles(currentFiles, idea, demoAnswers, sourceInsightText, generationPlan, loopPlan);
-        rounds += 1;
-        validation = await validateBundle(currentFiles);
-        const conflictRemains = validation.issues.some((issue) => /\[(?:USER_PERMISSION_IR_CONFLICT|USER_PERMISSION_RUNTIME_CONFLICT|USER_PERMISSION_EVAL_CONFLICT|UNCONFIRMED_CONTENT_RESTRICTION)\]/.test(issue.message));
-        const changedPaths = Object.keys({ ...beforeFiles, ...currentFiles }).filter((path) => beforeFiles[path] !== currentFiles[path]);
-        reportClientGenerationLoopEvent("generation_loop_candidate", {
-          phase: "static-compiler-repair",
-          round: rounds,
-          accepted: !conflictRemains,
-          updatedPaths: changedPaths,
-          reason: changedPaths.length ? `统一权限编译器已更新 ${changedPaths.length} 个受影响文件` : "统一权限编译器没有找到可确定性改写的文本，继续定向修复",
-        });
-        if (validation.valid) break;
-        if (!conflictRemains) continue;
-        repairBlockers = validation.issues.map((issue) => `${issue.code} · ${issue.path || "bundle"} · ${issue.message}`);
-        if (rounds >= STATIC_REPAIR_MAX_ROUNDS) break;
-      }
+      setGenerationLoop((current) => ({ ...current, status: "running", phase: "static", stopReason: `P0 Execution Gate 第 ${rounds + 1}/${STATIC_REPAIR_MAX_ROUNDS} 轮：只修复语法、路径、依赖与启动阻塞` }));
+      reportClientGenerationLoopEvent("generation_loop_phase", { phase: "static-repair", round: rounds + 1, blockers, reason: `P0 Execution Gate 发现 ${p0Issues.length} 项：${blockers.slice(0, 2).join("；")}` });
       let repairedResult: { updatedFiles?: Record<string, unknown> } = {};
       try {
-        const issuePaths = validation.issues.map((issue) => issue.path).filter((path) => isSafeSkillFilePath(path) && Boolean(currentFiles[path]));
-        const permissionPaths = permissionConflict ? [
-          "SKILL.md",
-          "references/domain-playbook.md",
-          "evals/evals.json",
-          "evals/graders.json",
-          "evals/knowledge-contract.json",
-        ] : [];
-        const repairPaths = Array.from(new Set([...issuePaths, ...permissionPaths, "SKILL.md", "agents/openai.yaml"]))
+        const issuePaths = p0Issues.map((issue) => issue.path).filter((path) => isSafeSkillFilePath(path) && Boolean(currentFiles[path]));
+        const repairPaths = Array.from(new Set([...issuePaths, "SKILL.md", "agents/openai.yaml"]))
           .filter((path) => Boolean(currentFiles[path]))
           .slice(0, 8);
         let repairBudget = 64_000;
@@ -5911,7 +5895,7 @@ export default function Home() {
           loopPlan,
           skillIR: compactSkillIR,
           skill: targetedFiles,
-          evaluation: { priority: "P0", blockers: repairBlockers, warnings: [], staticAttempt: rounds + 1 },
+          evaluation: { priority: "P0", category: "P0_EXECUTION_BLOCKER", repairRoute: "static-execution", blockers, warnings: [], staticAttempt: rounds + 1 },
         });
       } catch (error) {
         rounds += 1;
@@ -5928,16 +5912,16 @@ export default function Home() {
       }
       showLocalBusy("修复结果已返回，正在重新执行同一组确定性检查");
       validation = await validateBundle(currentFiles);
-      const nextSignature = validation.issues.map((issue) => `${issue.code}:${issue.path}:${issue.message}`).join("\n");
-      if (validation.valid) break;
+      const nextSignature = validation.issues.filter((issue) => issue.priority === "P0").map((issue) => `${issue.code}:${issue.path}:${issue.message}`).join("\n");
+      if (validation.executionReady) break;
       if (!Object.keys(replacements).length && nextSignature === previousSignature) break;
       previousSignature = signature;
     }
     reportClientGenerationLoopEvent("generation_loop_phase", {
       phase: "static-validation",
       round: rounds,
-      blockers: validation.issues.map((issue) => issue.message),
-      reason: validation.valid ? "P0 Static Gate 已通过" : `P0 Static Gate 自动修复 ${rounds} 轮后仍未通过`,
+      blockers: validation.issues.filter((issue) => issue.priority === "P0").map((issue) => issue.message),
+      reason: validation.executionReady ? "P0 Execution Gate 已通过" : `P0 Execution Gate 自动修复 ${rounds} 轮后仍未通过`,
     });
     return { files: currentFiles, validation, rounds };
   }
@@ -5988,25 +5972,27 @@ export default function Home() {
     }
     const initialStaticRepair = await runP0StaticRepairLoop(compilerInputFiles, generationPlan);
     let bestFiles = initialStaticRepair.files;
+    let bestBundleValidation = initialStaticRepair.validation;
     const skillContract = createBuildTimeSkillContract(idea, evaluationAnswers, generationPlan, loopPlan);
     let bestClosure = auditCapabilityClosure(bestFiles, generationPlan.items);
     let bestAudit = auditSkillFiles(bestFiles, evaluationAnswers);
     let bestCrossArtifact = auditCrossArtifactConsistency(bestFiles);
     const initialStaticIssues = [
+      ...bundleIssuesToPipelineIssues(bestBundleValidation.issues),
       ...makeStaticIssues(bestAudit.blockers),
       ...bestCrossArtifact.issues,
     ];
     const staticPolicy = optimizationPolicyFor(initialStaticIssues);
     reportClientGenerationLoopEvent("generation_loop_phase", { phase: "static", beforeCount: bestClosure.total, afterCount: bestClosure.closed, blockerCount: staticPolicy.selected.length, reason: `能力闭环 ${bestClosure.closed}/${bestClosure.total}；当前优先级 ${staticPolicy.priority || "none"}` });
-    if (!initialStaticRepair.validation.valid || staticPolicy.priority === "P0") {
-      const p0Evidence = initialStaticRepair.validation.issues.map((issue) => issue.message);
+    if (!bestBundleValidation.executionReady || staticPolicy.priority === "P0") {
+      const p0Evidence = bestBundleValidation.issues.filter((issue) => issue.priority === "P0").map((issue) => issue.message);
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
         issues: [...p0Evidence, ...staticPolicy.selected.map((item) => item.evidence)].slice(0, 8),
-        stopReason: `P0 Static Gate 已自动修复 ${initialStaticRepair.rounds} 轮仍未通过；语义优化和 Eval 已停止`,
+        stopReason: `P0 Execution Gate 已自动修复 ${initialStaticRepair.rounds} 轮仍未通过；契约修复和 Eval 已停止`,
       };
       setGenerationLoop(state);
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "static", blockers: state.issues, reason: state.stopReason });
@@ -6175,7 +6161,8 @@ export default function Home() {
       return { files: appendDecisionLedgerEntry(input.targetFiles, entry), entry };
     };
     let stopReason = "达到自动优化上限，已保留当前最佳版本";
-    const collectPipelineIssues = (semantic: GenerationSemanticAudit, closure: ReturnType<typeof auditCapabilityClosure>, crossArtifact: ReturnType<typeof auditCrossArtifactConsistency>, audit: ReturnType<typeof auditSkillFiles>): PipelineIssue[] => [
+    const collectPipelineIssues = (semantic: GenerationSemanticAudit, closure: ReturnType<typeof auditCapabilityClosure>, crossArtifact: ReturnType<typeof auditCrossArtifactConsistency>, audit: ReturnType<typeof auditSkillFiles>, bundleValidation: BundleStaticValidation): PipelineIssue[] => [
+      ...bundleIssuesToPipelineIssues(bundleValidation.issues),
       ...makeStaticIssues(audit.blockers),
       ...crossArtifact.issues,
       ...closure.issues.map((item) => ({ id: item.id, priority: item.severity === "critical" ? "P1" as const : "P3" as const, type: item.type.toUpperCase().replaceAll("-", "_"), source: "closure" as const, evidence: item.detail, files: item.files, capabilityId: item.capabilityId })),
@@ -6202,7 +6189,7 @@ export default function Home() {
         files: ["SKILL.md"],
       })),
     ];
-    let bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit), blindResult), bestEvidence);
+    let bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit, bestBundleValidation), blindResult), bestEvidence);
 
     const initialCritical = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
     let goalReached = generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: initialCritical })
@@ -6303,9 +6290,9 @@ export default function Home() {
       }
       const candidateFiles = finalizeSkillFiles(applied.files, idea, evaluationAnswers, sourceInsightText, generationPlan, loopPlan);
       const candidateBundleValidation = await validateBundle(candidateFiles);
-      if (!candidateBundleValidation.valid) {
+      if (!candidateBundleValidation.executionReady) {
         rejectedPatches += 1;
-        const reason = `候选版本产生 P0，已在语义与 Eval 前自动回滚：${candidateBundleValidation.issues.map((issue) => issue.message).join("；")}`;
+        const reason = `候选版本产生 P0 执行阻断，已在语义与 Eval 前自动回滚：${candidateBundleValidation.issues.filter((issue) => issue.priority === "P0").map((issue) => issue.message).join("；")}`;
         rejectedHistory.push({ round, reason, files: applied.changedPaths });
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "static-regression", round, accepted: false, updatedPaths: applied.changedPaths, reason });
         continue;
@@ -6380,7 +6367,7 @@ export default function Home() {
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "diagnose", round, accepted: false, updatedPaths: applied.changedPaths, reason: "候选语义检查不完整" });
         continue;
       }
-      const candidatePipelineIssues = includeHeldOutFailureEvidence(collectPipelineIssues(candidateSemantic, candidateClosure, candidateCrossArtifact, candidateAudit), candidateEvidence);
+      const candidatePipelineIssues = includeHeldOutFailureEvidence(collectPipelineIssues(candidateSemantic, candidateClosure, candidateCrossArtifact, candidateAudit, candidateBundleValidation), candidateEvidence);
       const gate = decideGenerationGoalGate({
         baseline: bestEvidence,
         candidate: candidateEvidence,
@@ -6457,6 +6444,7 @@ export default function Home() {
         consumedDecisionIds: patchPlan.consumedDecisionIds,
       });
       bestFiles = acceptedDecision.files;
+      bestBundleValidation = candidateBundleValidation;
       bestClosure = candidateClosure;
       bestAudit = candidateAudit;
       bestEvidence = candidateEvidence;
@@ -6487,8 +6475,9 @@ export default function Home() {
       const prunedAudit = auditSkillFiles(prunedFiles, evaluationAnswers);
       const prunedClosure = auditCapabilityClosure(prunedFiles, generationPlan.items);
       const prunedCrossArtifact = auditCrossArtifactConsistency(prunedFiles);
-      const pruneStaticPolicy = optimizationPolicyFor([...makeStaticIssues(prunedAudit.blockers), ...prunedCrossArtifact.issues]);
-      if (pruneStaticPolicy.priority !== "P0") {
+      const prunedBundleValidation = await validateBundle(prunedFiles);
+      const pruneStaticPolicy = optimizationPolicyFor([...bundleIssuesToPipelineIssues(prunedBundleValidation.issues), ...makeStaticIssues(prunedAudit.blockers), ...prunedCrossArtifact.issues]);
+      if (prunedBundleValidation.executionReady && pruneStaticPolicy.priority !== "P0") {
         const prunedHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: prunedFiles, configuration: "candidate", repeats: 1 });
         const prunedEvidence = prunedHarness.evidence;
         if (prunedEvidence) {
@@ -6507,13 +6496,14 @@ export default function Home() {
           const pruneBlind = pruningSafe ? await runBlindHarnessComparison(bestHarness, prunedHarness) : null;
           if (pruningSafe && pruneBlind?.revealedWinner !== "left") {
             bestFiles = prunedFiles;
+            bestBundleValidation = prunedBundleValidation;
             bestAudit = prunedAudit;
             bestClosure = prunedClosure;
             bestCrossArtifact = prunedCrossArtifact;
             bestEvidence = prunedEvidence;
             bestHarness = prunedHarness;
             bestMetrics = prunedMetrics;
-            bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit), blindResult), bestEvidence);
+            bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit, bestBundleValidation), blindResult), bestEvidence);
             acceptedPatches += 1;
             stopReason = `${stopReason}；精简冗余已安全删除 ${pruneResult.deletedPaths.length} 个文件并去除 ${pruneResult.changedPaths.length - pruneResult.deletedPaths.length} 处重复声明`;
             reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "delete-pass", accepted: true, updatedPaths: pruneResult.changedPaths, reason: "完整回归无退化，接受删减版本" });
@@ -6790,12 +6780,16 @@ export default function Home() {
       compiledFiles = initialStaticRepair.files;
       let staticValidation = initialStaticRepair.validation;
       let audit = auditSkillFiles(compiledFiles, demoAnswers);
-      if (!staticValidation.valid) audit = { ...audit, blockers: [...staticValidation.issues.map((issue) => issue.message), ...audit.blockers] };
+      const deterministicBlockers = staticValidation.issues.map((issue) => `[${issue.code}] ${issue.message}`);
+      if (deterministicBlockers.length) audit = { ...audit, blockers: [...new Set([...deterministicBlockers, ...audit.blockers])] };
       let repairRounds = initialStaticRepair.rounds;
 
-      while (staticValidation.valid && audit.blockers.length && repairRounds < BUILD_REPAIR_MAX_ROUNDS + initialStaticRepair.rounds) {
+      while (staticValidation.executionReady && audit.blockers.length && repairRounds < BUILD_REPAIR_MAX_ROUNDS + initialStaticRepair.rounds) {
         setBusyPhaseIndex(3);
-        const repairPolicy = optimizationPolicyFor(makeStaticIssues(audit.blockers));
+        const repairPolicy = optimizationPolicyFor([
+          ...bundleIssuesToPipelineIssues(staticValidation.issues),
+          ...makeStaticIssues(audit.blockers),
+        ]);
         const repairBlockers = repairPolicy.selected.map((item) => item.evidence);
         setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "repairing", phase: "bundle", rounds: repairRounds, issues: repairBlockers });
         const blockersBefore = audit.blockers.join("\n");
@@ -6808,7 +6802,13 @@ export default function Home() {
             loopPlan,
             skillIR: canonicalIR,
             skill: compiledFiles,
-            evaluation: { priority: repairPolicy.priority, blockers: repairBlockers, warnings: repairPolicy.priority === "P0" ? [] : audit.warnings },
+            evaluation: {
+              priority: repairPolicy.priority,
+              category: repairPolicy.priority === "P0" ? "P0_EXECUTION_BLOCKER" : "P1_CONTRACT_BLOCKER",
+              repairRoute: repairPolicy.priority === "P0" ? "static-execution" : "semantic-contract",
+              blockers: repairBlockers,
+              warnings: repairPolicy.priority === "P0" ? [] : audit.warnings,
+            },
           });
           const replacements = Object.fromEntries(Object.entries(repairedResult.updatedFiles || {}).filter((entry): entry is [string, string] => (
             isSafeSkillFilePath(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1].trim())
@@ -6824,8 +6824,11 @@ export default function Home() {
           repairRounds += staticRepair.rounds;
           compiledFiles = nextFiles;
           audit = auditSkillFiles(compiledFiles, demoAnswers);
-          if (!staticValidation.valid) {
-            audit = { ...audit, blockers: [...staticValidation.issues.map((issue) => issue.message), ...audit.blockers] };
+          const nextDeterministicBlockers = staticValidation.issues.map((issue) => `[${issue.code}] ${issue.message}`);
+          if (nextDeterministicBlockers.length) {
+            audit = { ...audit, blockers: [...new Set([...nextDeterministicBlockers, ...audit.blockers])] };
+          }
+          if (!staticValidation.executionReady) {
             break;
           }
           if (audit.blockers.join("\n") === blockersBefore) break;
@@ -6835,7 +6838,7 @@ export default function Home() {
         }
       }
 
-      if (staticValidation.valid && !audit.blockers.length) {
+      if (staticValidation.executionReady && !audit.blockers.length) {
         try {
           const goalLoopResult = await runOptimizationLoop(compiledFiles, generationPlan);
           compiledFiles = goalLoopResult.files;
@@ -6918,7 +6921,7 @@ export default function Home() {
       setCapabilityPlan(generationPlan);
       const result = await runOptimizationLoop(reconciledFiles, generationPlan);
       const nextAudit = auditSkillFiles(result.files, demoAnswers);
-      const staticBlocked = result.state.stopReason.includes("P0 Static Gate");
+      const staticBlocked = result.state.stopReason.includes("P0 Execution Gate");
       const buildIssues = staticBlocked ? result.state.issues : nextAudit.blockers;
       setFiles(result.files);
       setBuildLoop({
