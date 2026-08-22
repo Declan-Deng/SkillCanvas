@@ -61,6 +61,7 @@ export type SkillIR = {
     intent: string;
     stableGoal: string;
     summary: string;
+    description: string;
   };
   outcomeModel: {
     ultimateGoal: string;
@@ -149,6 +150,8 @@ export type SkillIR = {
     execution: { families: ["capability", "grounding", "integration"]; caseIds: string[]; heldOutRequired: boolean };
     lift: { baseline: "without-skill"; candidate: "with-skill"; metrics: string[] };
     failureModes: string[];
+    datasetSummary: string;
+    cases: Array<Record<string, unknown>>;
   };
   informationDependencies: unknown[];
   domainEvidence: unknown[];
@@ -157,6 +160,19 @@ export type SkillIR = {
     internal: string[];
     visibleOnFailure: string[];
     userVisible: string[];
+  };
+  runtimeContract: {
+    instructionPriority: string[];
+    workflow: Array<{
+      id: string;
+      capabilityIds: string[];
+      when: string;
+      input: string;
+      action: string;
+      output: string;
+      fallback: string;
+    }>;
+    completionChecks: string[];
   };
   controlModel: Record<string, unknown>;
   traceability: Array<{
@@ -508,13 +524,13 @@ export function compileSkillIR(input: {
   skillName: string;
   idea: string;
   answers: Record<string, string>;
-  skillText?: string;
   plan: PlanInput;
   loop: LoopInput;
   requirements: RequirementInput[];
   informationDependencies?: unknown[];
   domainEvidence?: unknown[];
   scopeProvenance?: unknown[];
+  description?: string;
 }): SkillIR {
   const capabilities: SkillIRCapability[] = input.plan.items.filter(activeCapability).map((item) => {
     const necessity = item.necessity ? { ...item.necessity, reason: item.reason || item.deterministicAdvantage || "由资源必要性分析决定" } : fallbackNecessity(item);
@@ -569,7 +585,6 @@ export function compileSkillIR(input: {
   const inputs = deriveTaskInputContract({
     idea: input.idea,
     answers: input.answers,
-    skillText: input.skillText,
     // Script/tool contracts describe runtime parameters, not automatically
     // user-owned task inputs. Only the semantic task capability may contribute
     // implicit inputs; deterministic capability inputs stay local to that step.
@@ -600,6 +615,7 @@ export function compileSkillIR(input: {
       intent: input.idea.trim(),
       stableGoal: input.loop.goal || input.plan.outcomeModel.ultimateGoal || input.idea.trim(),
       summary: input.plan.summary,
+      description: input.description?.trim() || `用于用户要求“${input.idea.trim()}”或提供相关材料继续处理时；执行已确认工作流并交付可检查结果。`,
     },
     outcomeModel: input.plan.outcomeModel,
     tasks: [{
@@ -667,6 +683,8 @@ export function compileSkillIR(input: {
       execution: { families: ["capability", "grounding", "integration"], caseIds: [], heldOutRequired: true },
       lift: { baseline: "without-skill", candidate: "with-skill", metrics: ["task_success", "hallucination_rate", "consistency", "token_cost"] },
       failureModes: unique(input.plan.failureModes),
+      datasetSummary: "Trigger、Capability、Grounding 与 Integration 分层回归；每项激活能力必须绑定可执行用例。",
+      cases: [],
     },
     informationDependencies: input.informationDependencies || [],
     domainEvidence: input.domainEvidence || [],
@@ -675,6 +693,29 @@ export function compileSkillIR(input: {
       internal: ["schema", "static", "dependency", "security", "runtime-smoke", "semantic-closure", "behavior", "regression"],
       visibleOnFailure: ["missing irreplaceable user decision", "unresolved external authorization", "unsafe irreversible action"],
       userVisible: ["final deliverable first"],
+    },
+    runtimeContract: {
+      instructionPriority: [
+        "Current explicit task instructions",
+        "Confirmed reusable preferences",
+        "User-approved examples",
+        "Source-grounded domain evidence",
+        "Working inferences",
+        "Generator defaults",
+      ],
+      workflow: capabilities.filter((item) => item.kind !== "eval").map((item, index) => ({
+        id: `step-${index + 1}-${item.id}`,
+        capabilityIds: [item.id],
+        when: item.activationCondition || item.routingCondition,
+        input: item.input,
+        action: item.purpose || item.requirement,
+        output: item.output,
+        fallback: item.fallback,
+      })),
+      completionChecks: unique([
+        ...input.plan.outcomeModel.observableIndicators,
+        ...input.plan.outputContract.validation,
+      ]),
     },
     controlModel: {
       mode: input.loop.mode,
@@ -688,11 +729,130 @@ export function compileSkillIR(input: {
   return bindSkillIREvals(ir, "");
 }
 
+function yamlString(value: string) {
+  return JSON.stringify(value.replace(/\s+/g, " ").trim());
+}
+
+function markdownList(values: string[], empty: string) {
+  return values.length ? values.map((value) => `- ${value}`).join("\n") : `- ${empty}`;
+}
+
+/**
+ * Deterministic runtime projection. This is intentionally a renderer, not a
+ * repair pass: every behavioral statement comes from Canonical SkillIR.
+ */
+export function projectSkillMarkdown(ir: SkillIR) {
+  const byInputId = new Map(ir.inputs.map((item) => [item.id, item]));
+  const task = ir.tasks[0];
+  const requiredInputs = (task?.requiredInputIds || []).map((id) => byInputId.get(id)).filter((item): item is SkillIR["inputs"][number] => Boolean(item));
+  const optionalInputs = (task?.optionalInputIds || []).map((id) => byInputId.get(id)).filter((item): item is SkillIR["inputs"][number] => Boolean(item));
+  const requirements = ir.requirements.filter((item) => item.provenance !== "generator_default");
+  const runtimeResources = ir.capabilities.filter((item) => item.implementation.layer === "runtime" && item.implementation.path && item.implementation.path !== "SKILL.md");
+  const output = ir.outputs[0];
+  const workflow = ir.runtimeContract?.workflow || [];
+  const priority = ir.runtimeContract?.instructionPriority || [];
+  const checks = ir.runtimeContract?.completionChecks || [];
+  const hasStateContract = ir.stateRequirement?.needed === true || ir.stateRequirement?.scope !== "none";
+  const hasToolContract = ir.capabilities.some((item) => item.kind === "builtin-tool" || item.kind === "mcp");
+  const canonicalContracts = [
+    "- [Output contract](references/output-contract.md)",
+    ...(hasStateContract ? ["- [State contract](references/state-model.md)"] : []),
+    ...(hasToolContract ? ["- [Tool contracts](references/tooling.md)", "- [Machine-readable tool contracts](integrations/tool-contracts.json)"] : []),
+  ];
+
+  const sections = [
+    `---\nname: ${ir.identity.skillName}\ndescription: ${yamlString(ir.identity.description)}\n---`,
+    `## Goal\n\n${ir.identity.stableGoal}\n\nControllable outcomes:\n${markdownList(ir.outcomeModel.controllableOutcomes, ir.identity.intent)}\n\nDo not promise uncontrollable outcomes:\n${markdownList(ir.outcomeModel.uncontrollableOutcomes, "No additional external outcome is claimed.")}`,
+    `## When to use\n\n${markdownList(ir.tasks.map((item) => item.activationCondition), ir.identity.intent)}`,
+    `## Instruction priority\n\n${priority.map((item, index) => `${index + 1}. ${item}`).join("\n")}`,
+    `## Inputs\n\n### Required\n\n${markdownList(requiredInputs.map((item) => item.name), "Current task request")}\n\n### Optional\n\n${markdownList(optionalInputs.map((item) => item.name), "No optional inputs")}`,
+    `## Input resolution contract\n\n${markdownList(ir.inputs.map((item) => item.resolution
+      ? `**${item.name}:** ${item.missingBehavior} (mode: \`${item.resolution.mode}\`; authority: \`${item.resolution.authority}\`)`
+      : `**${item.name}:** INVALID — resolution contract is missing`), "Use only the current request")}`,
+    `## Executable workflow\n\n${workflow.map((step, index) => `${index + 1}. **${step.action}**\n   - When: ${step.when}\n   - Input: ${step.input}\n   - Output: ${step.output}\n   - If unavailable: ${step.fallback}`).join("\n") || "1. Complete the declared task using the resolved inputs."}`,
+    requirements.length ? `## Confirmed requirements\n\n${requirements.map((item) => `- [${item.modality}; ${item.provenance}] ${item.statement}`).join("\n")}` : "",
+    ir.riskBranches.length ? `## Runtime branches\n\n${ir.riskBranches.map((item) => `- **If ${item.condition}:** ${item.action}. ${item.stopOrRedirect}`).join("\n")}` : "",
+    runtimeResources.length ? `## Capabilities and bundled resources\n\n${runtimeResources.map((item) => `- **${item.name}:** [${item.implementation.path}](${item.implementation.path}) — use when ${item.activationCondition}. Fallback: ${item.fallback}`).join("\n")}` : "",
+    `## Canonical contracts\n\n${canonicalContracts.join("\n")}`,
+    output ? `## Output contract\n\n- Mode: \`${output.mode}\`\n- Format: ${output.name}\n- Required sections:\n${markdownList(output.requiredSections, "Primary result")}\n- Artifact patterns:\n${markdownList(output.artifactPatterns.map((item) => `\`${item}\``), "No file artifact promised")}` : "",
+    `## Completion checks\n\nRun these checks internally and deliver the result first. Surface a check only when failure changes what the user can safely use.\n\n${markdownList(checks, "The requested result is complete and usable")}`,
+  ];
+  return sections.filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+}
+
+export function projectToolContracts(ir: SkillIR) {
+  const tools = ir.capabilities.filter((item) => item.kind === "builtin-tool" || item.kind === "mcp").map((item) => ({
+    id: item.id,
+    kind: item.kind,
+    name: item.name,
+    availability: item.implementation.status,
+    requirement: item.requirement,
+    purpose: item.purpose,
+    activation_condition: item.activationCondition,
+    routing_condition: item.routingCondition,
+    input: item.input,
+    output: item.output,
+    fallback: item.fallback,
+    affects: item.affects,
+    must_not_affect: item.mustNotAffect,
+    configuration: item.implementation.status === "requires-setup"
+      ? "Unavailable until host-side installation or authorization is completed and verified."
+      : "Use only when the host exposes this capability and returns a verifiable response.",
+    ...(item.connection ? { server: item.connection.server, tools: item.connection.tools, user_verified: item.connection.verified } : {}),
+  }));
+  return tools.length ? JSON.stringify({
+    version: "1.0",
+    skill_ir_digest: skillIRDigest(ir),
+    policy: "Never claim a tool call succeeded unless the host returned verifiable output.",
+    tools,
+  }, null, 2) : "";
+}
+
+export function projectToolingReference(ir: SkillIR) {
+  const tools = ir.capabilities.filter((item) => item.kind === "builtin-tool" || item.kind === "mcp");
+  if (!tools.length) return "";
+  return `# Tool and MCP execution contracts\n\nCanonical source: \`evals/skill-ir.json\` (${skillIRDigest(ir)}). Use a tool only when its capability is available in the host; never simulate a call or claim success without verifiable output.\n\n${tools.map((item) => `## ${item.name}\n\n- Kind: ${item.kind}\n- Availability: ${item.implementation.status}\n- Activation: ${item.activationCondition}\n- Input: ${item.input}\n- Output: ${item.output}\n- Unavailable behavior: ${item.fallback}${item.connection ? `\n- Server: ${item.connection.server}\n- Expected tools: ${item.connection.tools.join(", ") || "Discover in host"}\n- User verified: ${item.connection.verified}` : ""}`).join("\n\n")}\n`;
+}
+
+export function projectStateReference(ir: SkillIR) {
+  const state = ir.stateRequirement || {};
+  if (state.needed !== true && state.scope === "none") return "";
+  return `# State contract\n\nCanonical source: \`evals/skill-ir.json\` (${skillIRDigest(ir)})\n\n\`\`\`json\n${JSON.stringify(state, null, 2)}\n\`\`\`\n`;
+}
+
+export function projectLoopReference(ir: SkillIR) {
+  const hasLoopResource = ir.resourcePlan.resources.some((item) => item.path === "references/loop-plan.md" && item.decision !== "exclude");
+  if (!hasLoopResource) return "";
+  return `# Loop control contract\n\nCanonical source: \`evals/skill-ir.json\` (${skillIRDigest(ir)})\n\n\`\`\`json\n${JSON.stringify(ir.controlModel, null, 2)}\n\`\`\`\n`;
+}
+
+export function projectOutputReference(ir: SkillIR) {
+  const output = ir.outputs[0];
+  if (!output) return "";
+  return `# Output contract\n\nCanonical source: \`evals/skill-ir.json\` (${skillIRDigest(ir)})\n\n- Mode: \`${output.mode}\`\n- Format: ${output.name}\n- Required sections:\n${markdownList(output.requiredSections, "Primary result")}\n- Artifact patterns:\n${markdownList(output.artifactPatterns.map((item) => `\`${item}\``), "No file artifact promised")}\n- Validation:\n${markdownList(output.validation, "No additional validation")}\n`;
+}
+
+export function projectDomainPlaybook(ir: SkillIR) {
+  const rules = (ir.domainEvidence || []).filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+  if (!rules.length) return "";
+  return `# Domain playbook\n\nCanonical source: \`evals/skill-ir.json\` (${skillIRDigest(ir)}). Runtime strength is determined by evidence type and confidence; advisory evidence must not become a hard constraint.\n\n${rules.map((item, index) => {
+    const urls = Array.isArray(item.source_urls) ? item.source_urls.map(String).filter(Boolean) : [];
+    return `## ${index + 1}. ${String(item.rule || item.knowledge || "Domain decision rule")}\n\n- Evidence type: \`${String(item.evidence_type || "unknown")}\`\n- Confidence: ${String(item.confidence ?? "unknown")}\n- Applies when: ${String(item.applies_when || "the declared condition is satisfied")}\n- Exception: ${String(item.exception || "none declared")}\n- Runtime strength: ${item.hard_constraint_allowed === true ? "eligible for enforcement when no higher-priority user instruction conflicts" : "advisory only"}\n- Sources: ${urls.length ? urls.join(", ") : "no canonical URL recorded"}`;
+  }).join("\n\n")}\n`;
+}
+
+export function projectAgentMetadata(ir: SkillIR) {
+  const displayName = ir.identity.skillName.split("-").filter(Boolean).map((item) => item[0]?.toUpperCase() + item.slice(1)).join(" ");
+  return `interface:\n  display_name: ${yamlString(displayName)}\n  short_description: ${yamlString(ir.identity.summary.slice(0, 64))}\n  default_prompt: ${yamlString(`Use $${ir.identity.skillName} to ${ir.identity.intent}.`)}`;
+}
+
 export function bindSkillIREvals(ir: SkillIR, evalText: string): SkillIR {
   let cases: Array<Record<string, unknown>> = [];
+  let datasetSummary = ir.evaluationPlan.datasetSummary || "";
   try {
-    const parsed = JSON.parse(evalText || "{}") as { evals?: Array<Record<string, unknown>> };
+    const parsed = JSON.parse(evalText || "{}") as { evals?: Array<Record<string, unknown>>; dataset_summary?: string };
     if (Array.isArray(parsed.evals)) cases = parsed.evals;
+    if (typeof parsed.dataset_summary === "string" && parsed.dataset_summary.trim()) datasetSummary = parsed.dataset_summary.trim();
   } catch {
     cases = [];
   }
@@ -709,6 +869,8 @@ export function bindSkillIREvals(ir: SkillIR, evalText: string): SkillIR {
     capabilities,
     evaluationPlan: {
       ...ir.evaluationPlan,
+      datasetSummary,
+      cases,
       activation: { ...ir.evaluationPlan.activation, caseIds: triggerCaseIds },
       execution: { ...ir.evaluationPlan.execution, caseIds: executionCaseIds },
     },
@@ -717,6 +879,15 @@ export function bindSkillIREvals(ir: SkillIR, evalText: string): SkillIR {
       return capability ? [{ requirementId: requirement.id, capabilityId, implementationPath: capability.implementation.path, evalCaseIds: capability.evalCaseIds }] : [];
     })),
   };
+}
+
+export function projectEvalBank(ir: SkillIR) {
+  return JSON.stringify({
+    version: "2.7",
+    skill_name: ir.identity.skillName,
+    dataset_summary: ir.evaluationPlan.datasetSummary,
+    evals: ir.evaluationPlan.cases,
+  }, null, 2);
 }
 
 function stableJson(value: unknown): string {
@@ -817,6 +988,10 @@ export function auditSkillIRFiles(files: Record<string, string>) {
     evalIds = new Set((parsed.evals || []).map((item) => String(item.id || "")).filter(Boolean));
   } catch { /* JSON gate reports the malformed file separately. */ }
   if (ir.schemaVersion !== "1.0" || ir.compiler !== "skillcanvas") issues.push("Canonical SkillIR 的 schemaVersion 或 compiler 标识无效");
+  if (!ir.runtimeContract?.workflow?.length) issues.push("Canonical SkillIR 缺少可投影的 Runtime Workflow");
+  if ((files["SKILL.md"] || "").replace(/\r\n/g, "\n").trim() !== projectSkillMarkdown(ir).trim()) {
+    issues.push("[SKILL_PROJECTION_DRIFT] SKILL.md 不是 Canonical SkillIR 的确定性投影");
+  }
   const ids = ir.capabilities.map((item) => item.id);
   if (new Set(ids).size !== ids.length) issues.push("Canonical SkillIR 存在重复 capability id");
   const capabilityIds = new Set(ids);
@@ -824,30 +999,6 @@ export function auditSkillIRFiles(files: Record<string, string>) {
   ir.tasks.forEach((task) => {
     task.capabilityIds.filter((id) => !capabilityIds.has(id)).forEach((id) => issues.push(`任务 ${task.id} 引用了不存在的能力 ${id}`));
     [...task.requiredInputIds, ...task.optionalInputIds].filter((id) => !inputIds.has(id)).forEach((id) => issues.push(`[REQUIRED_TASK_INPUT_NOT_MODELED] 任务 ${task.id} 引用了不存在的输入 ${id}`));
-  });
-  const auditAnswers = Object.fromEntries(ir.requirements
-    .filter((item) => item.provenance === "user_explicit" || item.provenance === "user_example")
-    .map((item) => {
-      const key = item.source.startsWith("interview.") ? item.source.slice("interview.".length) : item.source === "initial user goal" ? "__idea" : item.source || item.id;
-      return [key, item.statement];
-    }));
-  const expectedInputs = deriveTaskInputContract({
-    idea: ir.identity.intent,
-    answers: auditAnswers,
-    skillText: files["SKILL.md"] || "",
-    capabilityInputs: ir.capabilities.filter((item) => item.kind === "llm").map((item) => item.input),
-    missingBehavior: ir.inputs.map((item) => item.missingBehavior).join("\n"),
-  });
-  expectedInputs.forEach((expected) => {
-    const modeled = ir.inputs.find((item) => item.concept === expected.concept || inputMatchesConcept(`${item.name} ${item.id}`, expected.concept));
-    if (!modeled) {
-      issues.push(`[DESCRIPTION_INPUT_SCOPE_MISMATCH] Skill 承诺或任务要求使用“${expected.name}”，但 Input Contract 没有建模`);
-      return;
-    }
-    const assignedRequired = ir.tasks.some((task) => task.requiredInputIds.includes(modeled.id));
-    const assignedOptional = ir.tasks.some((task) => task.optionalInputIds.includes(modeled.id));
-    if (expected.required && !assignedRequired) issues.push(`[REQUIRED_TASK_INPUT_NOT_MODELED] 必需输入“${modeled.name}”没有进入核心任务 requiredInputIds`);
-    if (!expected.required && !assignedRequired && !assignedOptional) issues.push(`[REQUIRED_TASK_INPUT_NOT_MODELED] 可选输入“${modeled.name}”没有进入任何任务输入`);
   });
   const explicitInputPolicy = ir.requirements.filter((item) => item.provenance === "user_explicit").map((item) => item.statement).join("\n");
   ir.inputs.forEach((taskInput) => {
@@ -925,6 +1076,17 @@ export function auditSkillIRFiles(files: Record<string, string>) {
   const manifestIR = manifest.skill_ir && typeof manifest.skill_ir === "object" ? manifest.skill_ir as Record<string, unknown> : {};
   if (manifestIR.path !== "evals/skill-ir.json") issues.push("Capability Manifest 没有声明 Canonical SkillIR 路径");
   if (manifestIR.digest !== skillIRDigest(ir)) issues.push("Capability Manifest 与 Canonical SkillIR 已漂移，需要重新编译");
+  if (stableJson(manifest) !== stableJson(projectCapabilityManifest(ir))) issues.push("[MANIFEST_PROJECTION_DRIFT] Capability Manifest 不是 Canonical SkillIR 的确定性投影");
+  if ((files["evals/evals.json"] || "").trim() !== projectEvalBank(ir).trim()) issues.push("[EVAL_PROJECTION_DRIFT] Eval Bank 不是 Canonical SkillIR 的确定性投影");
+  const projectedTools = projectToolContracts(ir);
+  if (projectedTools && (files["integrations/tool-contracts.json"] || "").trim() !== projectedTools.trim()) issues.push("[TOOL_CONTRACT_PROJECTION_DRIFT] Tool Contract 不是 Canonical SkillIR 的确定性投影");
+  const projectedState = projectStateReference(ir);
+  if (projectedState && (files["references/state-model.md"] || "").trim() !== projectedState.trim()) issues.push("[STATE_PROJECTION_DRIFT] State Contract 不是 Canonical SkillIR 的确定性投影");
+  const projectedLoop = projectLoopReference(ir);
+  if (projectedLoop && (files["references/loop-plan.md"] || "").trim() !== projectedLoop.trim()) issues.push("[LOOP_PROJECTION_DRIFT] Loop Contract 不是 Canonical SkillIR 的确定性投影");
+  if (files["references/output-contract.md"] && files["references/output-contract.md"].trim() !== projectOutputReference(ir).trim()) issues.push("[OUTPUT_PROJECTION_DRIFT] Output Contract 不是 Canonical SkillIR 的确定性投影");
+  if (files["agents/openai.yaml"] && files["agents/openai.yaml"].trim() !== projectAgentMetadata(ir).trim()) issues.push("[AGENT_METADATA_PROJECTION_DRIFT] Agent Metadata 不是 Canonical SkillIR 的确定性投影");
+  if (files["references/domain-playbook.md"] && files["references/domain-playbook.md"].trim() !== projectDomainPlaybook(ir).trim()) issues.push("[DOMAIN_PLAYBOOK_PROJECTION_DRIFT] Domain Playbook 不是 Canonical SkillIR 的确定性投影");
   const manifestIds = new Set(Array.isArray(manifest.capabilities) ? manifest.capabilities.map((item) => String((item as Record<string, unknown>).id || "")) : []);
   if (ids.some((id) => !manifestIds.has(id)) || [...manifestIds].some((id) => id && !capabilityIds.has(id))) issues.push("Capability Manifest 的能力集合与 Canonical SkillIR 不一致");
   return unique(issues);

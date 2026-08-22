@@ -80,7 +80,7 @@ import {
   candidateUtility,
   constrainPatchPlan,
   estimateDomainValueDensity,
-  makeStaticIssues,
+  makeContractIssues,
   normalizeCapabilityScope,
   normalizePatchPlan,
   optimizationPolicyFor,
@@ -111,11 +111,19 @@ import {
   semanticGateAudit,
 } from "./evidence-gates";
 import {
-  auditSkillIRFiles,
   bindSkillIREvals,
   compileSkillIR,
   ensureSkillSemanticClosure,
+  projectAgentMetadata,
   projectCapabilityManifest,
+  projectDomainPlaybook,
+  projectEvalBank,
+  projectLoopReference,
+  projectOutputReference,
+  projectSkillMarkdown,
+  projectStateReference,
+  projectToolContracts,
+  projectToolingReference,
   type SkillIR,
 } from "./skill-ir";
 import {
@@ -1170,12 +1178,14 @@ function createCanonicalSkillIR(input: {
     })),
   };
   const userEvidence = `${input.idea}\n${Object.values(input.answers).join("\n")}`;
+  const identity = deriveSkillIdentity(input.idea, input.answers);
   return compileSkillIR({
     skillName: input.skillName,
     idea: input.idea,
     answers: input.answers,
     plan: activePlan,
     loop: input.loop,
+    description: identity.description,
     requirements: buildRequirementProvenance({
       idea: input.idea,
       answers: input.answers,
@@ -1192,8 +1202,17 @@ function createCanonicalSkillIR(input: {
       missingBehavior: activePlan.stateModel.missingBehavior || "标注缺失并请求最少必要信息",
     }),
     domainEvidence: deriveDomainEvidence(files["evals/knowledge-contract.json"] || files["references/domain-playbook.md"] || "", userEvidence, sourceEvidence),
-    scopeProvenance: deriveScopeProvenance(files["SKILL.md"] || "", `${userEvidence}\n${sourceEvidence}`),
-    skillText: files["SKILL.md"] || "",
+    // Scope comes from provenance-bearing requirements, never from a rendered
+    // artifact. Reading SKILL.md here would create IR <-> projection cycles.
+    scopeProvenance: deriveScopeProvenance(
+      buildRequirementProvenance({
+        idea: input.idea,
+        answers: input.answers,
+        sourceEvidence,
+        capabilityRequirements: activePlan.items,
+      }).map((item) => item.requirement).join("\n"),
+      `${userEvidence}\n${sourceEvidence}`,
+    ),
   });
 }
 
@@ -2773,7 +2792,45 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     : `Use $${skillName} to ${compactTaskPhrase(idea)} with the confirmed workflow, content policy, and collaboration boundaries.`;
   files["agents/openai.yaml"] = `interface:\n  display_name: ${JSON.stringify(displayName)}\n  short_description: ${JSON.stringify(shortDescription)}\n  default_prompt: ${JSON.stringify(defaultPrompt)}`;
   files = reconcileDomainRuleCountClaims(files);
-  return finalMinimalityPass(files).files;
+  files = finalMinimalityPass(files).files;
+
+  // Freeze Canonical SkillIR last, then overwrite every compiler-owned
+  // semantic artifact from that one source. No semantic repair is allowed
+  // after this boundary.
+  const frozenIR = bindSkillIREvals(createCanonicalSkillIR({
+    skillName,
+    idea,
+    answers,
+    plan: capabilityPlan,
+    loop: loopPlan,
+    sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
+    files,
+  }), files["evals/evals.json"] || "");
+  files["evals/skill-ir.json"] = JSON.stringify(frozenIR, null, 2);
+  files["evals/capability-manifest.json"] = JSON.stringify(projectCapabilityManifest(frozenIR), null, 2);
+  files["evals/evals.json"] = projectEvalBank(frozenIR);
+  files["SKILL.md"] = projectSkillMarkdown(frozenIR);
+  files["agents/openai.yaml"] = projectAgentMetadata(frozenIR);
+
+  const projectedOutput = projectOutputReference(frozenIR);
+  if (projectedOutput) files["references/output-contract.md"] = projectedOutput;
+  else delete files["references/output-contract.md"];
+  const projectedState = projectStateReference(frozenIR);
+  if (projectedState) files["references/state-model.md"] = projectedState;
+  else delete files["references/state-model.md"];
+  const projectedLoop = projectLoopReference(frozenIR);
+  if (projectedLoop) files["references/loop-plan.md"] = projectedLoop;
+  else delete files["references/loop-plan.md"];
+  const projectedTools = projectToolContracts(frozenIR);
+  const projectedTooling = projectToolingReference(frozenIR);
+  if (projectedTools) files["integrations/tool-contracts.json"] = projectedTools;
+  else delete files["integrations/tool-contracts.json"];
+  if (projectedTooling) files["references/tooling.md"] = projectedTooling;
+  else delete files["references/tooling.md"];
+  const projectedPlaybook = projectDomainPlaybook(frozenIR);
+  if (projectedPlaybook) files["references/domain-playbook.md"] = projectedPlaybook;
+  else delete files["references/domain-playbook.md"];
+  return files;
 }
 
 function auditSkillFiles(files: Record<string, string>, answers: Record<string, string> = {}) {
@@ -2785,7 +2842,6 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
   const blockers: string[] = [];
   const warnings: string[] = [];
   blockers.push(...semanticGateAudit(files));
-  blockers.push(...auditSkillIRFiles(files));
   if (!name || /my-personal-skill|generic-skill/i.test(name)) blockers.push("触发名称过于泛化");
   if (description.length < 40 || /help the user with|personally aligned/i.test(description) || !descriptionCoversSpecificDomain(description, answers.__idea || "")) blockers.push("触发描述缺少具体任务与使用场景");
   if (/Complete the task|sufficient context|material decision missing/i.test(evalText)) blockers.push("评测任务仍是占位文本");
@@ -5926,6 +5982,107 @@ export default function Home() {
     return { files: currentFiles, validation, rounds };
   }
 
+  function collectP1ContractState(files: Record<string, string>, answers: Record<string, string>, generationPlan: CapabilityPlan, validation: BundleStaticValidation) {
+    const audit = auditSkillFiles(files, answers);
+    const closure = auditCapabilityClosure(files, generationPlan.items);
+    const crossArtifact = auditCrossArtifactConsistency(files);
+    const issues: PipelineIssue[] = [
+      ...bundleIssuesToPipelineIssues(validation.issues.filter((issue) => issue.priority === "P1")),
+      ...makeContractIssues(audit.blockers),
+      ...crossArtifact.issues.filter((issue) => issue.priority === "P1"),
+      ...closure.issues.filter((issue) => issue.severity === "critical").map((issue) => ({
+        id: issue.id,
+        priority: "P1" as const,
+        type: issue.type.toUpperCase().replaceAll("-", "_"),
+        source: "closure" as const,
+        evidence: issue.detail,
+        files: issue.files,
+        capabilityId: issue.capabilityId,
+      })),
+    ];
+    const uniqueIssues = [...new Map(issues.map((issue) => [`${issue.type}:${issue.evidence}`, issue])).values()];
+    return { audit, closure, crossArtifact, issues: uniqueIssues };
+  }
+
+  async function runP1ContractRepairLoop(input: {
+    files: Record<string, string>;
+    validation: BundleStaticValidation;
+    generationPlan: CapabilityPlan;
+    answers: Record<string, string>;
+    sourceText: string;
+    skillIR: unknown;
+  }) {
+    let currentFiles = input.files;
+    let validation = input.validation;
+    let state = collectP1ContractState(currentFiles, input.answers, input.generationPlan, validation);
+    let rounds = 0;
+    let nestedP0Rounds = 0;
+    let previousSignature = "";
+    while (validation.executionReady && state.issues.length && rounds < BUILD_REPAIR_MAX_ROUNDS) {
+      const blockers = state.issues.map((issue) => `${issue.type} · ${issue.files.join("、") || "bundle"} · ${issue.evidence}`);
+      const signature = state.issues.map((issue) => `${issue.type}:${issue.evidence}`).join("\n");
+      setBuildLoop((current) => ({ ...current, status: "repairing", phase: "bundle", rounds, issues: blockers.slice(0, 8) }));
+      setGenerationLoop((current) => ({ ...current, status: "running", phase: "static", stopReason: `P1 Contract Gate 第 ${rounds + 1}/${BUILD_REPAIR_MAX_ROUNDS} 轮：修复契约矛盾、闭环和跨文件语义` }));
+      reportClientGenerationLoopEvent("generation_loop_phase", { phase: "contract-repair", round: rounds + 1, blockers, reason: `P1 Contract Gate 发现 ${state.issues.length} 项契约阻断` });
+      let repairedResult: { updatedFiles?: Record<string, unknown> } = {};
+      try {
+        repairedResult = await callAI<{ updatedFiles?: Record<string, unknown> }>("repair", {
+          idea,
+          sourceText: input.sourceText,
+          answers: input.answers,
+          capabilityPlan: input.generationPlan,
+          loopPlan,
+          skillIR: input.skillIR,
+          skill: currentFiles,
+          evaluation: {
+            priority: "P1",
+            category: "P1_CONTRACT_BLOCKER",
+            repairRoute: "semantic-contract",
+            blockers,
+            warnings: state.audit.warnings,
+            contractAttempt: rounds + 1,
+          },
+        });
+      } catch (error) {
+        rounds += 1;
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason: error instanceof Error ? error.message : "P1 契约修复请求失败" });
+        if (rounds >= BUILD_REPAIR_MAX_ROUNDS) break;
+        continue;
+      }
+      const replacements = Object.fromEntries(Object.entries(repairedResult.updatedFiles || {}).filter((entry): entry is [string, string] => (
+        isSafeSkillFilePath(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1].trim())
+      )));
+      rounds += 1;
+      if (!Object.keys(replacements).length) break;
+      const nextFiles = finalizeSkillFiles({ ...currentFiles, ...replacements }, idea, input.answers, input.sourceText, input.generationPlan, loopPlan);
+      if (!Object.keys({ ...currentFiles, ...nextFiles }).some((path) => currentFiles[path] !== nextFiles[path])) break;
+      const staticRepair = await runP0StaticRepairLoop(nextFiles, input.generationPlan);
+      nestedP0Rounds += staticRepair.rounds;
+      currentFiles = staticRepair.files;
+      validation = staticRepair.validation;
+      state = collectP1ContractState(currentFiles, input.answers, input.generationPlan, validation);
+      const nextSignature = state.issues.map((issue) => `${issue.type}:${issue.evidence}`).join("\n");
+      reportClientGenerationLoopEvent("generation_loop_candidate", {
+        phase: "contract-repair",
+        round: rounds,
+        accepted: validation.executionReady && nextSignature !== signature,
+        updatedPaths: Object.keys(replacements),
+        reason: validation.executionReady ? `P1 契约问题由 ${blockers.length} 项降至 ${state.issues.length} 项` : "修复引入 P0，已转回 Execution Gate",
+      });
+      if (!validation.executionReady || !state.issues.length) break;
+      if (nextSignature === previousSignature) break;
+      previousSignature = signature;
+    }
+    const passed = validation.executionReady && validation.contractReady && state.issues.length === 0;
+    reportClientGenerationLoopEvent("generation_loop_phase", {
+      phase: "contract-validation",
+      round: rounds,
+      blockers: state.issues.map((issue) => issue.evidence),
+      reason: passed ? "P1 Contract Gate 已通过，可以冻结并进入 Eval" : `P1 Contract Gate 自动修复 ${rounds} 轮后仍未收敛`,
+    });
+    return { files: currentFiles, validation, rounds, nestedP0Rounds, passed, ...state };
+  }
+
   async function runOptimizationLoop(initialFiles: Record<string, string>, generationPlan: CapabilityPlan = capabilityPlan) {
     setBusyPhaseIndex(4);
     showLoopBusy("Build 已通过，正在固定能力边界并启动 Optimization Loop");
@@ -5971,17 +6128,23 @@ export default function Home() {
       }, idea, evaluationAnswers, contextBundle, generationPlan, loopPlan);
     }
     const initialStaticRepair = await runP0StaticRepairLoop(compilerInputFiles, generationPlan);
-    let bestFiles = initialStaticRepair.files;
-    let bestBundleValidation = initialStaticRepair.validation;
+    let optimizerSkillIR: unknown = {};
+    try { optimizerSkillIR = JSON.parse(initialStaticRepair.files["evals/skill-ir.json"] || "{}"); } catch { optimizerSkillIR = { unavailable: true }; }
+    const initialContractRepair = await runP1ContractRepairLoop({
+      files: initialStaticRepair.files,
+      validation: initialStaticRepair.validation,
+      generationPlan,
+      answers: evaluationAnswers,
+      sourceText: contextBundle,
+      skillIR: optimizerSkillIR,
+    });
+    let bestFiles = initialContractRepair.files;
+    let bestBundleValidation = initialContractRepair.validation;
     const skillContract = createBuildTimeSkillContract(idea, evaluationAnswers, generationPlan, loopPlan);
-    let bestClosure = auditCapabilityClosure(bestFiles, generationPlan.items);
-    let bestAudit = auditSkillFiles(bestFiles, evaluationAnswers);
-    let bestCrossArtifact = auditCrossArtifactConsistency(bestFiles);
-    const initialStaticIssues = [
-      ...bundleIssuesToPipelineIssues(bestBundleValidation.issues),
-      ...makeStaticIssues(bestAudit.blockers),
-      ...bestCrossArtifact.issues,
-    ];
+    let bestClosure = initialContractRepair.closure;
+    let bestAudit = initialContractRepair.audit;
+    let bestCrossArtifact = initialContractRepair.crossArtifact;
+    const initialStaticIssues = initialContractRepair.issues;
     const staticPolicy = optimizationPolicyFor(initialStaticIssues);
     reportClientGenerationLoopEvent("generation_loop_phase", { phase: "static", beforeCount: bestClosure.total, afterCount: bestClosure.closed, blockerCount: staticPolicy.selected.length, reason: `能力闭环 ${bestClosure.closed}/${bestClosure.total}；当前优先级 ${staticPolicy.priority || "none"}` });
     if (!bestBundleValidation.executionReady || staticPolicy.priority === "P0") {
@@ -5992,17 +6155,31 @@ export default function Home() {
         phase: "complete",
         closureScore: bestClosure.score,
         issues: [...p0Evidence, ...staticPolicy.selected.map((item) => item.evidence)].slice(0, 8),
-        stopReason: `P0 Execution Gate 已自动修复 ${initialStaticRepair.rounds} 轮仍未通过；契约修复和 Eval 已停止`,
+        stopReason: `P0 Execution Gate 已自动修复 ${initialStaticRepair.rounds + initialContractRepair.nestedP0Rounds} 轮仍未通过；契约修复和 Eval 已停止`,
       };
       setGenerationLoop(state);
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "static", blockers: state.issues, reason: state.stopReason });
+      return { files: bestFiles, state };
+    }
+    if (!initialContractRepair.passed || !bestBundleValidation.contractReady || staticPolicy.priority === "P1") {
+      const state: GenerationLoopState = {
+        ...DEFAULT_GENERATION_LOOP,
+        status: "attention",
+        phase: "complete",
+        closureScore: bestClosure.score,
+        issues: initialContractRepair.issues.map((issue) => issue.evidence).slice(0, 8),
+        stopReason: `P1 Contract Gate 自动修复 ${initialContractRepair.rounds} 轮后仍未收敛；Bundle 未冻结，Eval 未启动`,
+      };
+      setGenerationLoop(state);
+      setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "attention", phase: "bundle", rounds: initialStaticRepair.rounds + initialContractRepair.rounds + initialContractRepair.nestedP0Rounds, issues: state.issues, frozen: false });
+      reportClientGenerationLoopEvent("generation_loop_finished", { phase: "contract", blockers: state.issues, reason: state.stopReason });
       return { files: bestFiles, state };
     }
     setBuildLoop({
       ...DEFAULT_BUILD_LOOP,
       status: "passed",
       phase: "frozen",
-      rounds: initialStaticRepair.rounds,
+      rounds: initialStaticRepair.rounds + initialContractRepair.rounds + initialContractRepair.nestedP0Rounds,
       issues: [],
       frozen: true,
     });
@@ -6163,7 +6340,7 @@ export default function Home() {
     let stopReason = "达到自动优化上限，已保留当前最佳版本";
     const collectPipelineIssues = (semantic: GenerationSemanticAudit, closure: ReturnType<typeof auditCapabilityClosure>, crossArtifact: ReturnType<typeof auditCrossArtifactConsistency>, audit: ReturnType<typeof auditSkillFiles>, bundleValidation: BundleStaticValidation): PipelineIssue[] => [
       ...bundleIssuesToPipelineIssues(bundleValidation.issues),
-      ...makeStaticIssues(audit.blockers),
+      ...makeContractIssues(audit.blockers),
       ...crossArtifact.issues,
       ...closure.issues.map((item) => ({ id: item.id, priority: item.severity === "critical" ? "P1" as const : "P3" as const, type: item.type.toUpperCase().replaceAll("-", "_"), source: "closure" as const, evidence: item.detail, files: item.files, capabilityId: item.capabilityId })),
       ...semantic.issues.map((item) => ({ id: item.id, priority: item.priority, type: item.type, source: "semantic" as const, evidence: item.evidence, files: item.files, capabilityId: item.capabilityId || undefined })),
@@ -6300,7 +6477,7 @@ export default function Home() {
       const candidateClosure = auditCapabilityClosure(candidateFiles, generationPlan.items);
       const candidateAudit = auditSkillFiles(candidateFiles, evaluationAnswers);
       const candidateCrossArtifact = auditCrossArtifactConsistency(candidateFiles);
-      const candidateStaticPolicy = optimizationPolicyFor([...makeStaticIssues(candidateAudit.blockers), ...candidateCrossArtifact.issues]);
+      const candidateStaticPolicy = optimizationPolicyFor([...makeContractIssues(candidateAudit.blockers), ...candidateCrossArtifact.issues]);
       if (candidateStaticPolicy.priority === "P0") {
         rejectedPatches += 1;
         const reason = `候选版本产生 P0，已在语义评测前回滚：${candidateStaticPolicy.selected.map((item) => item.evidence).join("；")}`;
@@ -6328,7 +6505,7 @@ export default function Home() {
       const candidateSemanticRaw = await callAI<unknown>("optimization-diagnose", {
         ...evidencePayload,
         skill: candidateFiles,
-        closureReport: { skillContract, capabilityClosure: candidateClosure, staticIssues: makeStaticIssues(candidateAudit.blockers), crossArtifactRegression: candidateCrossArtifact },
+        closureReport: { skillContract, capabilityClosure: candidateClosure, staticIssues: makeContractIssues(candidateAudit.blockers), crossArtifactRegression: candidateCrossArtifact },
         baselineEvidence,
         rolloutEvidence: { diagnostic: candidateTrainingEvidence, heldOut: candidateEvidence },
       });
@@ -6476,7 +6653,7 @@ export default function Home() {
       const prunedClosure = auditCapabilityClosure(prunedFiles, generationPlan.items);
       const prunedCrossArtifact = auditCrossArtifactConsistency(prunedFiles);
       const prunedBundleValidation = await validateBundle(prunedFiles);
-      const pruneStaticPolicy = optimizationPolicyFor([...bundleIssuesToPipelineIssues(prunedBundleValidation.issues), ...makeStaticIssues(prunedAudit.blockers), ...prunedCrossArtifact.issues]);
+      const pruneStaticPolicy = optimizationPolicyFor([...bundleIssuesToPipelineIssues(prunedBundleValidation.issues), ...makeContractIssues(prunedAudit.blockers), ...prunedCrossArtifact.issues]);
       if (prunedBundleValidation.executionReady && pruneStaticPolicy.priority !== "P0") {
         const prunedHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: prunedFiles, configuration: "candidate", repeats: 1 });
         const prunedEvidence = prunedHarness.evidence;
@@ -6777,68 +6954,19 @@ export default function Home() {
       if (!result.files?.["SKILL.md"]) throw new Error("模型没有生成有效的 SKILL.md");
       let compiledFiles = finalizeSkillFiles(applyKnowledgePackToFiles(result.files, liveKnowledgePack), idea, demoAnswers, sourceInsightText, generationPlan, loopPlan);
       const initialStaticRepair = await runP0StaticRepairLoop(compiledFiles, generationPlan);
-      compiledFiles = initialStaticRepair.files;
-      let staticValidation = initialStaticRepair.validation;
-      let audit = auditSkillFiles(compiledFiles, demoAnswers);
-      const deterministicBlockers = staticValidation.issues.map((issue) => `[${issue.code}] ${issue.message}`);
-      if (deterministicBlockers.length) audit = { ...audit, blockers: [...new Set([...deterministicBlockers, ...audit.blockers])] };
-      let repairRounds = initialStaticRepair.rounds;
+      const contractRepair = await runP1ContractRepairLoop({
+        files: initialStaticRepair.files,
+        validation: initialStaticRepair.validation,
+        generationPlan,
+        answers: demoAnswers,
+        sourceText: contextBundle,
+        skillIR: canonicalIR,
+      });
+      compiledFiles = contractRepair.files;
+      let audit = contractRepair.audit;
+      const repairRounds = initialStaticRepair.rounds + contractRepair.rounds + contractRepair.nestedP0Rounds;
 
-      while (staticValidation.executionReady && audit.blockers.length && repairRounds < BUILD_REPAIR_MAX_ROUNDS + initialStaticRepair.rounds) {
-        setBusyPhaseIndex(3);
-        const repairPolicy = optimizationPolicyFor([
-          ...bundleIssuesToPipelineIssues(staticValidation.issues),
-          ...makeStaticIssues(audit.blockers),
-        ]);
-        const repairBlockers = repairPolicy.selected.map((item) => item.evidence);
-        setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "repairing", phase: "bundle", rounds: repairRounds, issues: repairBlockers });
-        const blockersBefore = audit.blockers.join("\n");
-        try {
-          const repairedResult = await callAI<{ updatedFiles?: Record<string, unknown> }>("repair", {
-            idea,
-            sourceText: contextBundle,
-            answers: interviewEvidence,
-            capabilityPlan: generationPlan,
-            loopPlan,
-            skillIR: canonicalIR,
-            skill: compiledFiles,
-            evaluation: {
-              priority: repairPolicy.priority,
-              category: repairPolicy.priority === "P0" ? "P0_EXECUTION_BLOCKER" : "P1_CONTRACT_BLOCKER",
-              repairRoute: repairPolicy.priority === "P0" ? "static-execution" : "semantic-contract",
-              blockers: repairBlockers,
-              warnings: repairPolicy.priority === "P0" ? [] : audit.warnings,
-            },
-          });
-          const replacements = Object.fromEntries(Object.entries(repairedResult.updatedFiles || {}).filter((entry): entry is [string, string] => (
-            isSafeSkillFilePath(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1].trim())
-          )));
-          if (!Object.keys(replacements).length) break;
-          let nextFiles = finalizeSkillFiles(applyKnowledgePackToFiles({ ...compiledFiles, ...replacements }, liveKnowledgePack), idea, demoAnswers, sourceInsightText, generationPlan, loopPlan);
-          const changed = Object.keys(nextFiles).some((path) => nextFiles[path] !== compiledFiles[path]);
-          if (!changed) break;
-          repairRounds += 1;
-          const staticRepair = await runP0StaticRepairLoop(nextFiles, generationPlan);
-          nextFiles = staticRepair.files;
-          staticValidation = staticRepair.validation;
-          repairRounds += staticRepair.rounds;
-          compiledFiles = nextFiles;
-          audit = auditSkillFiles(compiledFiles, demoAnswers);
-          const nextDeterministicBlockers = staticValidation.issues.map((issue) => `[${issue.code}] ${issue.message}`);
-          if (nextDeterministicBlockers.length) {
-            audit = { ...audit, blockers: [...new Set([...nextDeterministicBlockers, ...audit.blockers])] };
-          }
-          if (!staticValidation.executionReady) {
-            break;
-          }
-          if (audit.blockers.join("\n") === blockersBefore) break;
-        } catch {
-          // Keep the usable first draft and surface its exact remaining checks instead of losing the generation.
-          break;
-        }
-      }
-
-      if (staticValidation.executionReady && !audit.blockers.length) {
+      if (contractRepair.passed) {
         try {
           const goalLoopResult = await runOptimizationLoop(compiledFiles, generationPlan);
           compiledFiles = goalLoopResult.files;
@@ -6854,16 +6982,19 @@ export default function Home() {
           ...DEFAULT_GENERATION_LOOP,
           status: "attention",
           phase: "complete",
-          closureScore: auditCapabilityClosure(compiledFiles, generationPlan.items).score,
-          issues: audit.blockers.slice(0, 8),
-          stopReason: "Build Loop 的确定性检查未通过，Optimization Loop 没有启动",
+          closureScore: contractRepair.closure.score,
+          issues: contractRepair.issues.map((issue) => issue.evidence).slice(0, 8),
+          stopReason: contractRepair.validation.executionReady
+            ? "P1 Contract Gate 未收敛，Bundle 未冻结，Optimization Loop 与 Eval 没有启动"
+            : "P0 Execution Gate 未通过，P1 Contract Gate、Optimization Loop 与 Eval 没有启动",
         });
       }
 
       setBusyPhaseIndex(9);
       showLocalBusy("生成与自动优化已结束，正在保存当前最佳版本");
       setFiles(compiledFiles);
-      setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: audit.blockers.length ? "attention" : "passed", phase: audit.blockers.length ? "bundle" : "frozen", rounds: repairRounds, issues: audit.blockers, frozen: !audit.blockers.length });
+      const unresolvedBuildIssues = contractRepair.passed ? audit.blockers : contractRepair.issues.map((issue) => issue.evidence);
+      setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: unresolvedBuildIssues.length ? "attention" : "passed", phase: unresolvedBuildIssues.length ? "bundle" : "frozen", rounds: repairRounds, issues: unresolvedBuildIssues, frozen: !unresolvedBuildIssues.length });
       setEvalRan(false);
       setSkillDemo(null);
       setDemoReviewPending(false);
@@ -6887,7 +7018,7 @@ export default function Home() {
       setRetryAction(goalLoopError ? "rerun-optimization-loop" : null);
       setToast(goalLoopError
         ? `Skill 文件已生成，但自动优化停在：${goalLoopError}`
-        : audit.blockers.length
+        : unresolvedBuildIssues.length
         ? "内部编译没有收敛，已保留当前候选并自动记录失败节点"
         : repairRounds
           ? `已完成生成、质检和 ${repairRounds} 轮定向修复`

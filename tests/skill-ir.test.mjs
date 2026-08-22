@@ -9,6 +9,8 @@ import {
   deriveTaskInputContract,
   ensureSkillSemanticClosure,
   projectCapabilityManifest,
+  projectEvalBank,
+  projectSkillMarkdown,
 } from "../app/skill-ir.ts";
 
 function fixturePlan() {
@@ -229,21 +231,42 @@ test("Eval bindings and manifest are projections of the same SkillIR", () => {
   ] });
   const ir = bindSkillIREvals(compile(), evalText);
   const manifest = projectCapabilityManifest(ir);
-  const closedSkill = ensureSkillSemanticClosure({
-    skill: `---\nname: tailor-resume\ndescription: "根据目标 JD 与用户现有简历完成岗位定制和改写"\n---\n\n## Goal\n\n根据目标岗位要求重组简历证据并交付可用版本。`,
-    idea: "根据 JD 修改简历",
-    answers: { inputs: "目标 JD；真实经历" },
-    capabilityInputs: ["JD 与经历"],
-  });
   const files = {
-    "SKILL.md": closedSkill,
+    "SKILL.md": projectSkillMarkdown(ir),
     "evals/skill-ir.json": JSON.stringify(ir),
     "evals/capability-manifest.json": JSON.stringify(manifest),
-    "evals/evals.json": evalText,
+    "evals/evals.json": projectEvalBank(ir),
   };
   assert.deepEqual(auditSkillIRFiles(files), []);
   assert.deepEqual(ir.capabilities.find((item) => item.id === "core-resume")?.evalCaseIds, ["core-1"]);
   assert.equal(manifest.skill_ir.path, "evals/skill-ir.json");
+});
+
+test("frozen SkillIR rejects semantic edits to every canonical projection", () => {
+  const seed = JSON.stringify({
+    version: "2.7",
+    dataset_summary: "isolated regression cases",
+    evals: [{ id: "core-1", eval_family: "capability", capability_ids: ["core-resume"] }],
+  });
+  const ir = bindSkillIREvals(compile(), seed);
+  const files = {
+    "SKILL.md": projectSkillMarkdown(ir),
+    "evals/skill-ir.json": JSON.stringify(ir),
+    "evals/capability-manifest.json": JSON.stringify(projectCapabilityManifest(ir)),
+    "evals/evals.json": projectEvalBank(ir),
+  };
+  files["SKILL.md"] += "\n- post-IR semantic rewrite\n";
+  assert.ok(auditSkillIRFiles(files).some((item) => item.includes("SKILL_PROJECTION_DRIFT")));
+  files["SKILL.md"] = projectSkillMarkdown(ir);
+  const manifest = JSON.parse(files["evals/capability-manifest.json"]);
+  manifest.summary = "silently changed after freeze";
+  files["evals/capability-manifest.json"] = JSON.stringify(manifest);
+  assert.ok(auditSkillIRFiles(files).some((item) => item.includes("MANIFEST_PROJECTION_DRIFT")));
+  files["evals/capability-manifest.json"] = JSON.stringify(projectCapabilityManifest(ir));
+  const evalBank = JSON.parse(files["evals/evals.json"]);
+  evalBank.evals[0].expected = { behaviors: ["new untracked contract"] };
+  files["evals/evals.json"] = JSON.stringify(evalBank);
+  assert.ok(auditSkillIRFiles(files).some((item) => item.includes("EVAL_PROJECTION_DRIFT")));
 });
 
 test("permission consistency audit and information dependencies use the same user-explicit meaning", () => {
@@ -457,7 +480,6 @@ test("semantic validator reports missing inputs and incomplete resolution withou
     "evals/capability-manifest.json": JSON.stringify(manifest),
     "evals/evals.json": evalText,
   });
-  assert.ok(issues.some((item) => item.includes("DESCRIPTION_INPUT_SCOPE_MISMATCH")));
   assert.ok(issues.some((item) => item.includes("INPUT_RESOLUTION_NOT_MODELED")));
   assert.equal(issues.some((item) => item.includes("TAILORING_WITHOUT_TARGET_SPEC")), false);
 });

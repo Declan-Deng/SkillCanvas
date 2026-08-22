@@ -117,19 +117,15 @@ function activeCapability(item: ScopedCapability) {
   return item.enabled !== false && item.status !== "not-needed" && item.kind !== "eval";
 }
 
-export function inferIssuePriority(message: string): IssuePriority {
-  if (/syntax|parse|invalid (?:json|yaml)|不是有效 JSON|无效 JSON|YAML|frontmatter|缺少.*(?:运行|评分)文件|引用指向不存在|实现文件不存在|空脚本|不可执行|runner.*(?:start|启动)|无法启动|unloadable|broken path|路径越界|动态执行/i.test(message)) return "P0";
-  if (/REQUIRED_TASK_INPUT_NOT_MODELED|DESCRIPTION_INPUT_SCOPE_MISMATCH|INPUT_(?:RESOLUTION_NOT_MODELED|SUBSTITUTION_WITHOUT_AUTHORITY)|GROUND_TRUTH_INPUT_SUBSTITUTION|INCOMPLETE_INPUT_RESOLUTION|REQUIREMENT_WORKFLOW_GAP|USER_PERMISSION_(?:RUNTIME|IR)_CONFLICT|能力|闭环|契约|不一致|冲突|没有映射|没有.*评测|没有从.*调用|没有.*链接|触发描述|总目标|工作流|状态模型|持久状态|工具依赖|产物评分器|输出.*模式|artifact/i.test(message)) return "P1";
-  if (/领域|知识|通用|示例|失败模式|质量|过短|不够|浅|资料/i.test(message)) return "P2";
-  return "P3";
-}
-
-export function makeStaticIssues(messages: string[]): PipelineIssue[] {
+// Legacy audits still emit human-readable blocker strings. They may describe
+// contract defects, but they are not allowed to infer execution severity from
+// wording. P0 is owned exclusively by the structured Bundle Validator.
+export function makeContractIssues(messages: string[]): PipelineIssue[] {
   return messages.map((message, index) => ({
-    id: stableId("static", message, index),
-    priority: inferIssuePriority(message),
-    type: inferIssuePriority(message) === "P0" ? "STATIC_BLOCKER" : "STATIC_CONTRACT_GAP",
-    source: "static",
+    id: stableId("contract", message, index),
+    priority: "P1",
+    type: "LEGACY_CONTRACT_BLOCKER",
+    source: "semantic",
     evidence: message,
     files: [],
   }));

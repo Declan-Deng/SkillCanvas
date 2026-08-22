@@ -10,8 +10,7 @@ import {
   constrainPatchPlan,
   estimateDomainValueDensity,
   inferEvalFamily,
-  inferIssuePriority,
-  makeStaticIssues,
+  makeContractIssues,
   normalizePatchPlan,
   optimizationPolicyFor,
   pruneBundleDeterministically,
@@ -19,10 +18,11 @@ import {
   validatePatchPlan,
 } from "../app/skill-pipeline-core.ts";
 
-test("P0 defects block semantic optimization and outrank quality issues", () => {
-  const issues = makeStaticIssues(["artifact_checker.py SyntaxError", "领域知识不够具体"]);
-  const policy = optimizationPolicyFor(issues);
-  assert.equal(inferIssuePriority("invalid JSON"), "P0");
+test("only structured execution issues can enter P0", () => {
+  const contractIssues = makeContractIssues(["artifact_checker.py SyntaxError", "invalid JSON", "领域知识不够具体"]);
+  assert.ok(contractIssues.every((issue) => issue.priority === "P1"));
+  const executionIssue = { id: "json-parse", priority: "P0", type: "P0_EXECUTION_BLOCKER", source: "static", evidence: "invalid JSON", files: ["evals/evals.json"] };
+  const policy = optimizationPolicyFor([executionIssue, ...contractIssues]);
   assert.equal(policy.priority, "P0");
   assert.equal(policy.allowSemanticOptimization, false);
   assert.deepEqual(policy.selected.map((item) => item.priority), ["P0"]);

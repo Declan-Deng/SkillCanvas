@@ -72,6 +72,10 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   ]);
 
   assert.match(page, /function finalizeSkillFiles\(/);
+  const projectionBoundary = page.slice(page.indexOf("const frozenIR = bindSkillIREvals"), page.indexOf("function auditSkillFiles"));
+  assert.match(projectionBoundary, /files\["SKILL\.md"\] = projectSkillMarkdown\(frozenIR\)/);
+  assert.match(projectionBoundary, /files\["evals\/evals\.json"\] = projectEvalBank\(frozenIR\)/);
+  assert.doesNotMatch(projectionBoundary, /ensure(?:Description|Productive|Information|Confirmed|Instruction|SkillSemantic)|reconcile(?:ConfirmedContent|ValidationVisibility|DataMutation)/);
   assert.match(page, /function auditSkillFiles\(/);
   assert.match(page, /function sanitizeSkillFiles\(/);
   assert.match(page, /function createSpecificEvals\(/);
@@ -109,7 +113,10 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /继续修复并启动/);
   assert.match(page, /while \(!validation\.executionReady/);
   assert.match(page, /validation\.issues\.filter\(\(issue\) => issue\.priority === "P0"\)/);
-  assert.match(page, /category: repairPolicy\.priority === "P0" \? "P0_EXECUTION_BLOCKER" : "P1_CONTRACT_BLOCKER"/);
+  assert.match(page, /async function runP1ContractRepairLoop\(/);
+  assert.match(page, /category: "P1_CONTRACT_BLOCKER"/);
+  assert.match(page, /if \(!initialContractRepair\.passed \|\| !bestBundleValidation\.contractReady \|\| staticPolicy\.priority === "P1"\)/);
+  assert.doesNotMatch(page, /const deterministicBlockers = staticValidation\.issues\.map/);
   assert.match(route, /evaluation\.category is P1_CONTRACT_BLOCKER/);
   assert.match(page, /\/api\/credentials/);
   assert.doesNotMatch(page, /window\.localStorage\.setItem\([^)]*credential/i);
