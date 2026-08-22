@@ -94,6 +94,16 @@ test("natural permission wording can authorize generated facts and quantities", 
   assert.doesNotMatch(reconcileContentPermissionText("未知不能变成已知；无法估算就省略量化。", permission), /未知不能变成已知|无法估算就省略/);
 });
 
+test("colloquial creation permission in the initial goal is compiled as explicit authority", () => {
+  const permission = resolveContentPermission({
+    __idea: "我要一个能够根据JD和我的简历base帮我大编新经历，从而完全符合对应岗位要求的skill",
+  });
+  assert.equal(permission.allowCreativeExpansion, true);
+  assert.equal(permission.allowFactualCreation, true);
+  assert.equal(permission.explicitRestriction, false);
+  assert.deepEqual(permission.sourceKeys, ["__idea"]);
+});
+
 test("negative permission wording still overrides flexible creation wording", () => {
   const permission = resolveContentPermission({
     "evidence-policy": "可以扩写，但不允许生成事实和量化数据",

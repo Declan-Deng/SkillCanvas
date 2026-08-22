@@ -24,6 +24,11 @@ export async function generateMetadata(): Promise<Metadata> {
   return {
     title,
     description,
+    icons: {
+      icon: [{ url: "/skillcanvas-icon.png", type: "image/png" }],
+      shortcut: "/skillcanvas-icon.png",
+      apple: [{ url: "/skillcanvas-icon.png", type: "image/png" }],
+    },
     openGraph: {
       title,
       description,

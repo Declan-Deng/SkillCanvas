@@ -163,6 +163,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /\["build", "repair", "eval-execute", "eval-grade", "eval-compare", "optimization-diagnose", "optimization-patch-plan", "optimization-research", "personalize", "optimization-evidence", "demo", "evaluate"\]\.includes\(mode\)/);
   assert.match(page, /请求在等待模型时中断/);
   assert.match(page, /只重跑 Optimization Loop/);
+  assert.match(page, /评测已完成，当前版本处于稳定上限/);
+  assert.match(page, /✓ 已保留最佳版/);
+  assert.match(page, /generationLoop\.status === "attention" && !optimizationStableAtCeiling/);
   assert.match(page, /正在运行 Optimization Loop/);
   assert.match(page, /generationLoop\.status === "running" \? "执行中"/);
   assert.match(page, /generation_loop_failed/);
@@ -218,6 +221,11 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /pruneBundleDeterministically/);
   assert.match(page, /BUILD LOOP · 负责生成并冻结初始架构/);
   assert.match(page, /OPTIMIZATION LOOP · 只做有证据的局部优化/);
+  assert.match(page, /查看已采纳的 \{knowledgePack\.atoms\.length\} 条知识明细/);
+  assert.match(page, /<details className="knowledge-atom-details">/);
+  assert.match(page, /Notification\.requestPermission\(\)/);
+  assert.match(page, /notifyGenerationLoopResult\(state\)/);
+  assert.match(page, /完成后通知我/);
   assert.match(page, /runIsolatedEvalHarness/);
   assert.match(page, /批量隔离执行漏返回用例，自动拆成单用例补跑/);
   assert.match(page, /批量隔离执行失败，自动拆成单用例补跑/);
@@ -260,6 +268,15 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /className="idea-source"/);
   assert.match(page, /看完 Demo，哪里还不够懂你？/);
   assert.doesNotMatch(page, /看完 Demo，哪里还不够像你？/);
+  assert.match(page, /Let‘s Start！/);
+  assert.doesNotMatch(page, /原文件不保存；解析文字会发送给你选择的模型/);
+  assert.doesNotMatch(page, /理解预演 · 不计入正式评测/);
+  assert.doesNotMatch(page, /discoveryPreview\.scenario/);
+  assert.doesNotMatch(page, /可以多选，也可以直接补充。你的反馈会进入后面的提问和 Skill。/);
+  assert.doesNotMatch(page, /总目标描述最终要完成的事情，下面的质检只判断有没有做好，不会反过来变成目标。/);
+  assert.match(page, /className="round-transition" key=\{`interview-round-\$\{interviewRoundIndex\}`\}/);
+  assert.match(css, /\.round-transition\s*\{[\s\S]*?round-content-enter 220ms var\(--ease-out\)/);
+  assert.match(css, /prefers-reduced-motion:[\s\S]*?\.round-transition\s*\{[\s\S]*?round-content-fade 160ms ease/);
   assert.match(page, /label: "校准真实使用"/);
   assert.match(page, /dimensions: \["实战任务", "触发语言", "偏好复用", "交付确认"\]/);
   assert.match(page, /第 \{interviewRoundIndex \+ 1\} 轮 · 最多 \{INTERVIEW_ROUND_META\.length\} 轮/);
@@ -412,7 +429,10 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(css, /grid-template-areas:\s*"icon name action" "icon state action"/);
   assert.doesNotMatch(css, /\.selection-note/);
   assert.match(css, /font-size:\s*17px/);
-  assert.match(css, /font-size:\s*clamp\(43px, 5\.2vw, 71px\)/);
+  assert.match(css, /font-size:\s*clamp\(46px, 5\.4vw, 74px\)/);
+  assert.match(css, /min-height:\s*100dvh/);
+  assert.match(css, /--coral:\s*#c94b38/);
+  assert.match(css, /brief-content-enter 420ms var\(--ease-out\)/);
   assert.doesNotMatch(css, /font-size:\s*21\.25px/);
 });
 

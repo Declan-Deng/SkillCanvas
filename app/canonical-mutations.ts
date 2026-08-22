@@ -58,38 +58,51 @@ function array(value: unknown) {
   return Array.isArray(value) ? value : [];
 }
 
+function canonicalMutationType(value: unknown) {
+  const raw = text(value).toLowerCase().replace(/[\s-]+/g, "_");
+  if (!raw) return "";
+  if (raw.includes(".")) return raw;
+  const direct = raw.match(/^(requirement|task|capability|input|output|constraint|knowledge|identity|state|eval_source)_(add|update|remove)$/);
+  if (direct) return `${direct[1].replace("eval_source", "eval-source")}.${direct[2]}`;
+  const reversed = raw.match(/^(add|update|remove)_(requirement|task|capability|input|output|constraint|knowledge|identity|state|eval_source)$/);
+  if (reversed) return `${reversed[2].replace("eval_source", "eval-source")}.${reversed[1]}`;
+  return raw.replaceAll("_", ".");
+}
+
 export function normalizeCanonicalMutations(value: unknown): CanonicalMutation[] {
   return array(value).slice(0, 12).flatMap((entry) => {
     const raw = record(entry);
     if (!raw) return [];
-    const type = text(raw.type);
-    const changes = record(raw.changes) || {};
+    const type = canonicalMutationType(raw.type || raw.action);
+    const changes = record(raw.changes) || record(raw.patch) || record(raw.updates) || {};
+    const targetId = (...keys: string[]) => text(keys.map((key) => raw[key]).find((candidate) => text(candidate)) || raw.targetId || raw.target_id || raw.target || raw.id);
+    const addedRecord = (key: string) => record(raw[key]) || record(raw.item) || record(raw.value);
     if (type === "identity.update") return [{ type, changes } as CanonicalMutation];
-    if (type === "requirement.add" && record(raw.requirement)) return [{ type, requirement: raw.requirement as SkillIRRequirement }];
-    if (type === "requirement.update" && text(raw.requirementId)) return [{ type, requirementId: text(raw.requirementId), changes } as CanonicalMutation];
-    if (type === "requirement.remove" && text(raw.requirementId)) return [{ type, requirementId: text(raw.requirementId) }];
-    if (type === "task.add" && record(raw.task)) return [{ type, task: raw.task as SkillIR["tasks"][number] }];
-    if (type === "task.update" && text(raw.taskId)) return [{ type, taskId: text(raw.taskId), changes } as CanonicalMutation];
-    if (type === "task.remove" && text(raw.taskId)) return [{ type, taskId: text(raw.taskId) }];
-    if (type === "capability.add" && record(raw.capability)) return [{ type, capability: raw.capability as SkillIRCapability }];
-    if (type === "capability.update" && text(raw.capabilityId)) return [{ type, capabilityId: text(raw.capabilityId), changes } as CanonicalMutation];
-    if (type === "capability.remove" && text(raw.capabilityId)) return [{ type, capabilityId: text(raw.capabilityId) }];
-    if (type === "input.add" && record(raw.input)) return [{ type, input: raw.input as SkillIR["inputs"][number] }];
-    if (type === "input.update" && text(raw.inputId)) return [{ type, inputId: text(raw.inputId), changes } as CanonicalMutation];
-    if (type === "input.remove" && text(raw.inputId)) return [{ type, inputId: text(raw.inputId) }];
-    if (type === "output.add" && record(raw.output)) return [{ type, output: raw.output as SkillIR["outputs"][number] }];
-    if (type === "output.update" && text(raw.outputId)) return [{ type, outputId: text(raw.outputId), changes } as CanonicalMutation];
-    if (type === "output.remove" && text(raw.outputId)) return [{ type, outputId: text(raw.outputId) }];
+    if (type === "requirement.add" && addedRecord("requirement")) return [{ type, requirement: addedRecord("requirement") as SkillIRRequirement }];
+    if (type === "requirement.update" && targetId("requirementId", "requirement_id")) return [{ type, requirementId: targetId("requirementId", "requirement_id"), changes } as CanonicalMutation];
+    if (type === "requirement.remove" && targetId("requirementId", "requirement_id")) return [{ type, requirementId: targetId("requirementId", "requirement_id") }];
+    if (type === "task.add" && addedRecord("task")) return [{ type, task: addedRecord("task") as SkillIR["tasks"][number] }];
+    if (type === "task.update" && targetId("taskId", "task_id")) return [{ type, taskId: targetId("taskId", "task_id"), changes } as CanonicalMutation];
+    if (type === "task.remove" && targetId("taskId", "task_id")) return [{ type, taskId: targetId("taskId", "task_id") }];
+    if (type === "capability.add" && addedRecord("capability")) return [{ type, capability: addedRecord("capability") as SkillIRCapability }];
+    if (type === "capability.update" && targetId("capabilityId", "capability_id")) return [{ type, capabilityId: targetId("capabilityId", "capability_id"), changes } as CanonicalMutation];
+    if (type === "capability.remove" && targetId("capabilityId", "capability_id")) return [{ type, capabilityId: targetId("capabilityId", "capability_id") }];
+    if (type === "input.add" && addedRecord("input")) return [{ type, input: addedRecord("input") as SkillIR["inputs"][number] }];
+    if (type === "input.update" && targetId("inputId", "input_id")) return [{ type, inputId: targetId("inputId", "input_id"), changes } as CanonicalMutation];
+    if (type === "input.remove" && targetId("inputId", "input_id")) return [{ type, inputId: targetId("inputId", "input_id") }];
+    if (type === "output.add" && addedRecord("output")) return [{ type, output: addedRecord("output") as SkillIR["outputs"][number] }];
+    if (type === "output.update" && targetId("outputId", "output_id")) return [{ type, outputId: targetId("outputId", "output_id"), changes } as CanonicalMutation];
+    if (type === "output.remove" && targetId("outputId", "output_id")) return [{ type, outputId: targetId("outputId", "output_id") }];
     if (type === "state.update") return [{ type, changes }];
-    if (type === "constraint.add" && record(raw.constraint)) return [{ type, constraint: raw.constraint as SkillIR["constraints"][number] }];
-    if (type === "constraint.update" && text(raw.constraintId)) return [{ type, constraintId: text(raw.constraintId), changes } as CanonicalMutation];
-    if (type === "constraint.remove" && text(raw.constraintId)) return [{ type, constraintId: text(raw.constraintId) }];
-    if (type === "knowledge.add" && record(raw.knowledge)) return [{ type, knowledge: raw.knowledge as SkillIR["knowledgeRequirements"][number] }];
-    if (type === "knowledge.update" && text(raw.knowledgeId)) return [{ type, knowledgeId: text(raw.knowledgeId), changes } as CanonicalMutation];
-    if (type === "knowledge.remove" && text(raw.knowledgeId)) return [{ type, knowledgeId: text(raw.knowledgeId) }];
-    if (type === "eval-source.add" && record(raw.testCase)) return [{ type, testCase: raw.testCase as Record<string, unknown> }];
-    if (type === "eval-source.update" && text(raw.caseId)) return [{ type, caseId: text(raw.caseId), changes }];
-    if (type === "eval-source.remove" && text(raw.caseId)) return [{ type, caseId: text(raw.caseId) }];
+    if (type === "constraint.add" && addedRecord("constraint")) return [{ type, constraint: addedRecord("constraint") as SkillIR["constraints"][number] }];
+    if (type === "constraint.update" && targetId("constraintId", "constraint_id")) return [{ type, constraintId: targetId("constraintId", "constraint_id"), changes } as CanonicalMutation];
+    if (type === "constraint.remove" && targetId("constraintId", "constraint_id")) return [{ type, constraintId: targetId("constraintId", "constraint_id") }];
+    if (type === "knowledge.add" && addedRecord("knowledge")) return [{ type, knowledge: addedRecord("knowledge") as SkillIR["knowledgeRequirements"][number] }];
+    if (type === "knowledge.update" && targetId("knowledgeId", "knowledge_id")) return [{ type, knowledgeId: targetId("knowledgeId", "knowledge_id"), changes } as CanonicalMutation];
+    if (type === "knowledge.remove" && targetId("knowledgeId", "knowledge_id")) return [{ type, knowledgeId: targetId("knowledgeId", "knowledge_id") }];
+    if (type === "eval-source.add" && addedRecord("testCase")) return [{ type, testCase: addedRecord("testCase") as Record<string, unknown> }];
+    if (type === "eval-source.update" && targetId("caseId", "case_id")) return [{ type, caseId: targetId("caseId", "case_id"), changes }];
+    if (type === "eval-source.remove" && targetId("caseId", "case_id")) return [{ type, caseId: targetId("caseId", "case_id") }];
     return [];
   });
 }

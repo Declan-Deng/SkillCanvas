@@ -84,6 +84,8 @@ test("compiler normalizes common workflow headings and adds deterministic priori
   assert.equal(hasExecutableWorkflowHeading(chineseWorkflow), true);
   assert.match(normalizeExecutableWorkflowHeading(chineseWorkflow), /^## Workflow$/m);
   assert.equal(hasExecutableWorkflowHeading("## 2、执行步骤\n\n如果输入缺失则先询问。"), true);
+  assert.equal(hasExecutableWorkflowHeading("## Executable workflow\n\n1. Resolve inputs, then execute."), true);
+  assert.match(normalizeExecutableWorkflowHeading("## Executable workflow\n\n1. Execute."), /^## Workflow$/m);
 
   const repaired = ensureInstructionPriorityOrder(`${chineseWorkflow}\n\n## Notes\n\n用户确认的偏好优先。`);
   assert.equal(hasInstructionPriorityOrder(repaired), true);

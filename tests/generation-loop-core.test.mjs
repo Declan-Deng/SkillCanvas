@@ -5,6 +5,7 @@ import {
   auditCapabilityClosure,
   artifactDeliveryRequested,
   decideGenerationGoalGate,
+  generationEvaluationAtCeiling,
   generationGoalSatisfied,
   inferArtifactPatterns,
   reconcileArtifactOutputContract,
@@ -128,4 +129,12 @@ test("generation goal requires closure, pass rate, usable quality, and measurabl
   assert.equal(generationGoalSatisfied({ evidence: candidate, baseline, closureScore: 100, blockers: 0, criticalSemanticIssues: 0 }), true);
   assert.equal(generationGoalSatisfied({ evidence: candidate, baseline, closureScore: 75, blockers: 0, criticalSemanticIssues: 0 }), false);
   assert.equal(generationGoalSatisfied({ evidence: candidate, baseline, closureScore: 100, blockers: 0, criticalSemanticIssues: 1 }), false);
+});
+
+test("a perfect baseline and bundle are a completed no-headroom result, not a quality warning", () => {
+  const baseline = summarizeGenerationEvidence(report([100, 100]));
+  const candidate = summarizeGenerationEvidence(report([100, 100]));
+  assert.equal(generationEvaluationAtCeiling({ evidence: candidate, baseline, closureScore: 100, blockers: 0, criticalSemanticIssues: 0 }), true);
+  assert.equal(generationEvaluationAtCeiling({ evidence: candidate, baseline, closureScore: 100, blockers: 1, criticalSemanticIssues: 0 }), false);
+  assert.equal(generationEvaluationAtCeiling({ evidence: summarizeGenerationEvidence(report([98, 100])), baseline, closureScore: 100, blockers: 0, criticalSemanticIssues: 0 }), false);
 });

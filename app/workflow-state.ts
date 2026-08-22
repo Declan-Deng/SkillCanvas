@@ -8,12 +8,12 @@ export const REQUIREMENT_DIMENSIONS = [
 export type WorkflowStepId = "brief" | "interview" | "blueprint" | "build" | "evaluate" | "ship";
 
 export const WORKFLOW_STEPS: Array<{ id: WorkflowStepId; label: string; eyebrow: string }> = [
-  { id: "brief", label: "说出想法", eyebrow: "01" },
-  { id: "interview", label: "预演并理解", eyebrow: "02" },
-  { id: "blueprint", label: "确认关键决定", eyebrow: "03" },
-  { id: "build", label: "生成并优化", eyebrow: "04" },
-  { id: "evaluate", label: "对照验证", eyebrow: "05" },
-  { id: "ship", label: "带走使用", eyebrow: "06" },
+  { id: "brief", label: "描述需求", eyebrow: "1" },
+  { id: "interview", label: "预演理解", eyebrow: "2" },
+  { id: "blueprint", label: "确认工作方式", eyebrow: "3" },
+  { id: "build", label: "生成并优化", eyebrow: "4" },
+  { id: "evaluate", label: "验证效果", eyebrow: "5" },
+  { id: "ship", label: "保存并使用", eyebrow: "6" },
 ];
 
 export function normalizeWorkflowStep(value: unknown): WorkflowStepId | null {

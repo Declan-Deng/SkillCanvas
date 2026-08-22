@@ -23,6 +23,7 @@ import {
 } from "./decision-ledger";
 import {
   compareGateBlockers,
+  countDuplicateAuthorRuntimeRules,
   demoteUnsupportedConfirmationClaims,
   demoteUnconfirmedQualityProxies,
   ensureInstructionPriorityOrder,
@@ -62,6 +63,7 @@ import {
 import {
   auditCapabilityClosure,
   decideGenerationGoalGate,
+  generationEvaluationAtCeiling,
   generationGoalSatisfied,
   artifactDeliveryRequested,
   inferArtifactPatterns,
@@ -418,7 +420,7 @@ type GenerationSemanticAudit = {
 
 type GenerationLoopState = {
   evaluationContractVersion: "2.7";
-  status: "idle" | "running" | "passed" | "attention";
+  status: "idle" | "running" | "passed" | "stable" | "attention";
   phase: "idle" | "contract" | "static" | "rollout" | "diagnose" | "patch" | "validate" | "complete";
   rounds: number;
   maxRounds: number;
@@ -653,6 +655,16 @@ const PROVIDERS: Record<ProviderId, { name: string; model: string; baseUrl: stri
   },
 };
 
+function ProviderLogo({ id }: { id: ProviderId }) {
+  const sources: Partial<Record<ProviderId, string>> = {
+    deepseek: "https://cdn.simpleicons.org/deepseek",
+    openai: "https://unpkg.com/@lobehub/icons-static-svg@1.94.0/icons/openai.svg",
+  };
+  return sources[id]
+    ? <img src={sources[id]} alt="" aria-hidden="true" />
+    : <span aria-hidden="true">{PROVIDERS[id].mark}</span>;
+}
+
 const RESEARCH_PROVIDERS: Record<ResearchProviderId, { name: string; mark: string; detail: string; baseUrl: string }> = {
   disabled: { name: "暂不联网", mark: "—", detail: "仍会识别知识缺口，但不会把模型常识伪装成来源知识", baseUrl: "" },
   firecrawl: { name: "Firecrawl", mark: "FC", detail: "搜索并提取网页正文，适合直接形成可引用知识", baseUrl: "https://api.firecrawl.dev" },
@@ -727,11 +739,11 @@ const INTERVIEW_ROUND_META = [
   },
 ] as const;
 
-const CONTEXT_FIELDS: Array<{ id: ContextFieldId; label: string; description: string; placeholder: string; tag: string }> = [
-  { id: "existingPrompt", label: "常用 Prompt、SOP 或工作方法", description: "常用方法不会被盲目照搬；AI 会提取可复用规则、步骤和限制。", placeholder: "粘贴你正在使用的 Prompt、操作步骤、检查清单……", tag: "提取方法" },
-  { id: "background", label: "背景知识与长期上下文", description: "补充术语、业务背景、受众、政策或其他必须知道的信息。", placeholder: "例如：产品背景、目标用户、专业术语、品牌规则、业务限制……", tag: "按需加载" },
-  { id: "idealOutput", label: "理想产出示例", description: "粘贴一份你觉得很好的结果。AI 会学习它的结构、粒度、语气和判断标准。", placeholder: "把理想的文章、报告、方案、代码或其他结果粘贴到这里……", tag: "最有价值" },
-  { id: "negativeOutput", label: "不满意的结果 / 反例", description: "告诉 AI 哪些内容看似正确，却不是你想要的。", placeholder: "粘贴反例，或写下你最不喜欢的做法……", tag: "防止跑偏" },
+const CONTEXT_FIELDS: Array<{ id: ContextFieldId; tabLabel: string; label: string; description: string; placeholder: string; tag: string; icon: string }> = [
+  { id: "existingPrompt", tabLabel: "方法 / SOP", label: "方法 / SOP", description: "粘贴你已经在使用的方法、步骤、检查清单或 Prompt。", placeholder: "把常用 Prompt、SOP、操作步骤或检查清单粘贴到这里……", tag: "提取可复用步骤", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/file-description.svg" },
+  { id: "idealOutput", tabLabel: "理想样例", label: "理想产出示例", description: "粘贴你觉得很好的结果、文章片段、报告、方案或代码。", placeholder: "把理想的文章、报告、方案、代码或其他结果粘贴到这里……", tag: "让 AI 知道“好”的样子", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/star.svg" },
+  { id: "negativeOutput", tabLabel: "避免什么", label: "你不希望出现什么", description: "粘贴反例，或者直接说明哪些表达、判断和做法会让你不满意。", placeholder: "粘贴反例，或写下你最不喜欢的做法……", tag: "告诉 AI 哪些不能做", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/shield-check.svg" },
+  { id: "background", tabLabel: "背景资料", label: "背景资料", description: "补充业务背景、目标用户、专业术语、规则或其他判断依据。", placeholder: "例如：产品背景、目标用户、专业术语、品牌规则、业务限制……", tag: "补足判断所需信息", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/folder.svg" },
 ];
 
 const DEFAULT_INTERVIEW_ROUNDS: InterviewRound[] = [
@@ -1175,6 +1187,28 @@ function createBuildTimeSkillContract(idea: string, answers: Record<string, stri
   };
 }
 
+function ensureCanonicalBundledResources(ir: SkillIR, files: Record<string, string>) {
+  if (!files["references/source-evidence.md"]?.trim()
+    || ir.resourcePlan.resources.some((item) => item.path === "references/source-evidence.md")) return ir;
+  return {
+    ...ir,
+    resourcePlan: {
+      ...ir.resourcePlan,
+      resources: [
+        ...ir.resourcePlan.resources,
+        {
+          capabilityId: ir.capabilities.find((item) => item.kind === "llm")?.id || ir.capabilities[0]?.id || "task-core",
+          kind: "reference" as const,
+          path: "references/source-evidence.md",
+          decision: "include" as const,
+          reason: "用户提供的范例或资料会改变运行时决策，必须从主工作流显式读取。",
+          consumerTaskIds: ir.tasks.map((item) => item.id),
+        },
+      ],
+    },
+  };
+}
+
 function createCanonicalSkillIR(input: {
   skillName: string;
   idea: string;
@@ -1197,7 +1231,7 @@ function createCanonicalSkillIR(input: {
   };
   const userEvidence = `${input.idea}\n${Object.values(input.answers).join("\n")}`;
   const identity = deriveSkillIdentity(input.idea, input.answers);
-  return compileSkillIR({
+  const ir = compileSkillIR({
     skillName: input.skillName,
     idea: input.idea,
     answers: input.answers,
@@ -1232,6 +1266,10 @@ function createCanonicalSkillIR(input: {
       `${userEvidence}\n${sourceEvidence}`,
     ),
   });
+  // Uploaded examples are implementation resources consumed by the primary
+  // semantic capability. Record the path in Canonical SkillIR so the runtime
+  // projector can route to it without a post-projection file edit.
+  return ensureCanonicalBundledResources(ir, files);
 }
 
 function compactThinkingPhrase(value: string) {
@@ -2775,7 +2813,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   files["evals/result.schema.json"] = createEvalResultSchema();
   files["evals/artifact_checker.py"] = createArtifactChecker();
   files["evals/run_evals.py"] = createEvalRunner();
-  const canonicalIR = bindSkillIREvals(canonicalIROverride || createCanonicalSkillIR({
+  const canonicalIR = bindSkillIREvals(ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
     skillName,
     idea,
     answers,
@@ -2783,7 +2821,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     loop: loopPlan,
     sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
     files,
-  }), canonicalIROverride ? projectEvalBank(canonicalIROverride) : files["evals/evals.json"]);
+  }), files), canonicalIROverride ? projectEvalBank(canonicalIROverride) : files["evals/evals.json"]);
   files["evals/skill-ir.json"] = JSON.stringify(canonicalIR, null, 2);
   files["evals/capability-manifest.json"] = createCapabilityManifest(capabilityPlan, files["evals/evals.json"], loopPlan, { idea, answers, sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`, skill: files["SKILL.md"], files }, canonicalIR);
   const generatedScriptPaths = Object.keys(files).filter((path) => path.startsWith("scripts/") && path.endsWith(".py"));
@@ -2815,7 +2853,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   // Freeze Canonical SkillIR last, then overwrite every compiler-owned
   // semantic artifact from that one source. No semantic repair is allowed
   // after this boundary.
-  const frozenIR = bindSkillIREvals(canonicalIROverride || createCanonicalSkillIR({
+  const frozenIR = bindSkillIREvals(ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
     skillName,
     idea,
     answers,
@@ -2823,7 +2861,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     loop: loopPlan,
     sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
     files,
-  }), canonicalIROverride ? projectEvalBank(canonicalIROverride) : files["evals/evals.json"] || "");
+  }), files), canonicalIROverride ? projectEvalBank(canonicalIROverride) : files["evals/evals.json"] || "");
   files["evals/skill-ir.json"] = JSON.stringify(frozenIR, null, 2);
   files["evals/capability-manifest.json"] = JSON.stringify(projectCapabilityManifest(frozenIR), null, 2);
   files["evals/evals.json"] = projectEvalBank(frozenIR);
@@ -2986,15 +3024,7 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
   let declaredStateScope = "none";
   try { declaredStateScope = (JSON.parse(files["evals/capability-manifest.json"] || "{}") as { state_model?: { scope?: string } }).state_model?.scope || "none"; } catch { /* malformed manifest is already reported */ }
   if (hasUnsupportedPersistenceConflict(allText, declaredStateScope)) blockers.push("不同文件对隐私数据是否保存存在冲突");
-  const markdownSentenceOwners = new Map<string, Set<string>>();
-  Object.entries(files).filter(([path]) => path === "SKILL.md" || path.startsWith("references/")).forEach(([path, content]) => {
-    content.split(/[。！？.!?\n]+/).map((sentence) => sentence.replace(/^[#>*\-\d.\s]+/, "").replace(/\s+/g, " ").trim().toLowerCase()).filter((sentence) => sentence.length >= 36).forEach((sentence) => {
-      const owners = markdownSentenceOwners.get(sentence) || new Set<string>();
-      owners.add(path);
-      markdownSentenceOwners.set(sentence, owners);
-    });
-  });
-  const duplicateRules = Array.from(markdownSentenceOwners.values()).filter((owners) => owners.size > 1).length;
+  const duplicateRules = countDuplicateAuthorRuntimeRules(files);
   if (duplicateRules >= 2) blockers.push(`${duplicateRules} 条运行时规则在多个文件重复，缺少唯一权威位置`);
   if (files["references/source-evidence.md"] && !/(?:page|页|source|来源|filename|文件)/i.test(files["references/source-evidence.md"])) warnings.push("资料证据缺少可追溯的文件或页码信息");
   const sensitive = sensitiveMatchCount(Object.values(files).join("\n"));
@@ -4053,10 +4083,37 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
   };
 }
 
+function stripCompiledKnowledgeSummary(summary: string) {
+  return summary
+    .replace(/\s*已将\s*[^。]*?来源知识[^。]*?按需加载[^。]*?专业判断手册。?/g, "")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+}
+
+function normalizedCompiledKnowledgeSummary(summary: string, domain?: string) {
+  const baseSummary = stripCompiledKnowledgeSummary(summary);
+  if (domain === undefined) return baseSummary;
+  return `${baseSummary}${baseSummary && !/[。.!！?？]$/.test(baseSummary) ? "。" : ""} 已将 ${domain || "当前领域"}的来源知识编译为按需加载的专业判断手册。`.trim();
+}
+
+function PlatformMark({ name }: { name: string }) {
+  const sources: Record<string, string> = {
+    Codex: "https://unpkg.com/@lobehub/icons-static-svg@1.94.0/icons/codex.svg",
+    "Claude Code": "https://cdn.simpleicons.org/claude",
+    Cursor: "https://cdn.simpleicons.org/cursor",
+    "GitHub Copilot": "https://cdn.simpleicons.org/githubcopilot",
+    "Gemini CLI": "https://cdn.simpleicons.org/googlegemini",
+    "通用 SKILL.md": "https://cdn.simpleicons.org/markdown",
+  };
+  return <img src={sources[name]} alt="" aria-hidden="true" />;
+}
+
 function attachCompiledKnowledgeCapability(plan: CapabilityPlan, pack: KnowledgePack) {
+  const baseSummary = stripCompiledKnowledgeSummary(plan.summary);
   if (!knowledgePackIsPublishable(pack)) {
     return {
       ...plan,
+      summary: baseSummary,
       items: plan.items.map((item) => item.path === "references/domain-playbook.md"
         ? { ...item, status: "not-needed", enabled: false }
         : item),
@@ -4102,7 +4159,7 @@ function attachCompiledKnowledgeCapability(plan: CapabilityPlan, pack: Knowledge
     : [...plan.items.filter((item) => item.path !== knowledgeItem.path), knowledgeItem];
   return {
     ...plan,
-    summary: `${plan.summary} 已将 ${pack.plan.domain || "当前领域"}的来源知识编译为按需加载的专业判断手册。`,
+    summary: normalizedCompiledKnowledgeSummary(baseSummary, pack.plan.domain || "当前领域"),
     items,
   };
 }
@@ -4318,6 +4375,7 @@ function reportClientGenerationLoopEvent(
 export default function Home() {
   const [sessionHydrated, setSessionHydrated] = useState(false);
   const [step, setStep] = useState<StepId>("brief");
+  const [briefSidebarOpen, setBriefSidebarOpen] = useState(false);
   const [idea, setIdea] = useState("");
   const [sourceNames, setSourceNames] = useState<string[]>([]);
   const [sourceWarnings, setSourceWarnings] = useState<string[]>([]);
@@ -4327,6 +4385,7 @@ export default function Home() {
   const [sourceReceipt, setSourceReceipt] = useState<SourceReceipt | null>(null);
   const [aiGenerationIssue, setAiGenerationIssue] = useState("");
   const [contextPanelOpen, setContextPanelOpen] = useState(false);
+  const [activeContextField, setActiveContextField] = useState<ContextFieldId>("idealOutput");
   const [interviewEvidenceOpen, setInterviewEvidenceOpen] = useState(false);
   const [contextNotes, setContextNotes] = useState<ContextNotes>({ idealOutput: "", negativeOutput: "", existingPrompt: "", background: "" });
   const [interviewRounds, setInterviewRounds] = useState<InterviewRound[]>(DEFAULT_INTERVIEW_ROUNDS);
@@ -4397,6 +4456,8 @@ export default function Home() {
   const [toast, setToast] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsClosing, setSettingsClosing] = useState(false);
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">("default");
+  const loopStartedAt = useRef(0);
   const [provider, setProvider] = useState<ProviderId>("deepseek");
   const [model, setModel] = useState(PROVIDERS.deepseek.model);
   const [availableModels, setAvailableModels] = useState<string[]>(PROVIDERS.deepseek.models.map((item) => item.id));
@@ -4596,7 +4657,7 @@ export default function Home() {
             parseCanonicalSkillIR(saved.files as Record<string, string>) || undefined,
           );
           setFiles(restoredFiles);
-          if ((saved.generationLoop as Partial<GenerationLoopState> | undefined)?.status === "passed") {
+          if (["passed", "stable"].includes((saved.generationLoop as Partial<GenerationLoopState> | undefined)?.status || "")) {
             setGenerationLoop((current) => ({ ...current, issues: removeResolvedFileObservations(current.issues, restoredFiles) }));
           }
         }
@@ -4674,6 +4735,12 @@ export default function Home() {
     } finally {
       setSessionHydrated(true);
     }
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, []);
+
+  useEffect(() => {
+    /* eslint-disable react-hooks/set-state-in-effect -- Browser permission is external state and must be read after hydration. */
+    setNotificationPermission("Notification" in window ? window.Notification.permission : "unsupported");
     /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
@@ -4808,6 +4875,14 @@ export default function Home() {
   const optimizationBlockedByBuild = generationLoop.status === "attention"
     && generationLoop.benchmarkRuns === 0
     && gateOutcomes.build.verdict !== "satisfied";
+  const optimizationStableAtCeiling = generationLoop.status === "stable"
+    || (generationLoop.status === "attention"
+      && generationLoop.minimalityChecked
+      && generationLoop.benchmarkRuns > 0
+      && generationLoop.baselineScore === 100
+      && generationLoop.bestScore === 100
+      && generationLoop.passRate === 100
+      && generationLoop.closureScore === 100);
   const selectedFileExplanation = useMemo(() => explainSkillFile(selectedFile, files[selectedFile] || "", files), [files, selectedFile]);
   const personalizedFeedbackOptions = evalRan
     ? feedbackOptions
@@ -4980,6 +5055,59 @@ export default function Home() {
 
   function closeSettings() {
     if (settingsOpen && !settingsClosing) setSettingsClosing(true);
+  }
+
+  async function requestCompletionNotifications() {
+    if (!("Notification" in window)) {
+      setNotificationPermission("unsupported");
+      setToast("当前浏览器不支持系统通知");
+      return;
+    }
+    if (window.Notification.permission === "denied") {
+      setNotificationPermission("denied");
+      setToast("通知已被浏览器阻止，请在当前网站的浏览器权限中重新开启");
+      return;
+    }
+    const permission = window.Notification.permission === "granted"
+      ? "granted"
+      : await window.Notification.requestPermission();
+    setNotificationPermission(permission);
+    if (permission !== "granted") {
+      setToast("没有开启通知；SkillCanvas 仍会在页面内保留完整结果");
+      return;
+    }
+    setToast("完成通知已开启，长时间 Loop 结束后会提醒你");
+    try {
+      const notification = new window.Notification("SkillCanvas 完成通知已开启", {
+        body: "Build / Optimization Loop 完成、暂停或失败时会在这里提醒你。",
+        tag: "skillcanvas-notification-ready",
+      });
+      notification.onclick = () => { window.focus(); notification.close(); };
+    } catch {
+      // Permission state remains authoritative even if the browser suppresses
+      // this one confirmation notification.
+    }
+  }
+
+  function notifyGenerationLoopResult(state: GenerationLoopState) {
+    if (!("Notification" in window) || window.Notification.permission !== "granted") return;
+    const elapsedSeconds = loopStartedAt.current ? Math.max(1, Math.round((Date.now() - loopStartedAt.current) / 1_000)) : 0;
+    const title = state.status === "passed" ? "Skill 优化已完成" : state.status === "stable" ? "Skill 已保留当前最佳版本" : "Skill 优化需要查看";
+    const result = state.status === "passed"
+      ? `当前最佳版本已通过回归门控${state.lift ? `，Skill Lift ${state.lift > 0 ? "+" : ""}${state.lift}` : ""}。`
+      : state.status === "stable"
+        ? "冻结评测全部通过，但没有候选证明额外提升；已安全保留当前最佳版本。"
+      : `${state.stopReason || "Loop 已停止并保留当前最佳版本。"}`;
+    try {
+      const notification = new window.Notification(title, {
+        body: `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220),
+        tag: "skillcanvas-generation-loop",
+      });
+      notification.onclick = () => { window.focus(); notification.close(); };
+    } catch {
+      // Page state and diagnostics remain the source of truth when a browser
+      // or operating system suppresses a notification.
+    }
   }
 
   function updateProvider(next: ProviderId) {
@@ -6208,6 +6336,7 @@ export default function Home() {
   }
 
   async function runOptimizationLoop(initialFiles: Record<string, string>, generationPlan: CapabilityPlan = capabilityPlan) {
+    loopStartedAt.current = Date.now();
     setBusyPhaseIndex(4);
     showLoopBusy("Build 已通过，正在固定能力边界并启动 Optimization Loop");
     setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "static", stopReason: "正在建立能力闭环" });
@@ -6287,6 +6416,7 @@ export default function Home() {
       };
       setGenerationLoop(state);
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "static", blockers: state.issues, reason: state.stopReason });
+      notifyGenerationLoopResult(state);
       return { files: bestFiles, state };
     }
     if (!initialContractRepair.passed || !bestBundleValidation.contractReady || staticPolicy.priority === "P1") {
@@ -6301,6 +6431,7 @@ export default function Home() {
       setGenerationLoop(state);
       setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "attention", phase: "bundle", rounds: initialStaticRepair.rounds + initialContractRepair.rounds + initialContractRepair.nestedP0Rounds, issues: state.issues, frozen: false });
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "contract", blockers: state.issues, reason: state.stopReason });
+      notifyGenerationLoopResult(state);
       return { files: bestFiles, state };
     }
     setBuildLoop({
@@ -6346,6 +6477,7 @@ export default function Home() {
       };
       setGenerationLoop(state);
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "rollout", blockers: state.issues, reason: state.stopReason });
+      notifyGenerationLoopResult(state);
       return { files: bestFiles, state };
     }
     if (trainCases.length < 2 || selectionCases.length < 2) {
@@ -6359,6 +6491,7 @@ export default function Home() {
       };
       setGenerationLoop(state);
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "rollout", reason: state.stopReason });
+      notifyGenerationLoopResult(state);
       return { files: bestFiles, state };
     }
 
@@ -6862,8 +6995,15 @@ export default function Home() {
     }
 
     const remainingCritical = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
-    const passed = generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: remainingCritical })
-      && blindResult.revealedWinner !== "left";
+    const qualityGoalSatisfied = generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: remainingCritical });
+    const passed = qualityGoalSatisfied && blindResult.revealedWinner !== "left";
+    const stableAtCeiling = !passed && generationEvaluationAtCeiling({
+      evidence: bestMetrics,
+      baseline: baselineMetrics,
+      closureScore: bestClosure.score,
+      blockers: bestAudit.blockers.length,
+      criticalSemanticIssues: remainingCritical,
+    });
     const remainingIssues = [
       ...(blindResult.revealedWinner === "left" ? [`匿名结果比较仍更偏好无 Skill 基线：${blindResult.evidence}`] : []),
       ...optimizationPolicyFor(bestPipelineIssues).selected.map((item) => `${item.priority} · ${item.evidence}`),
@@ -6872,7 +7012,7 @@ export default function Home() {
     ].filter(Boolean).slice(0, 8);
     const state: GenerationLoopState = {
       ...DEFAULT_GENERATION_LOOP,
-      status: passed ? "passed" : "attention",
+      status: passed ? "passed" : stableAtCeiling ? "stable" : "attention",
       phase: "complete",
       rounds: Math.min(GENERATION_GOAL_MAX_ROUNDS, acceptedPatches + rejectedPatches),
       baselineScore: baselineMetrics.score,
@@ -6890,11 +7030,16 @@ export default function Home() {
       blindWinner: blindResult.revealedWinner === "left" ? "baseline" : blindResult.revealedWinner === "tie" ? "tie" : "candidate",
       minimalityChecked: true,
       issues: remainingIssues,
-      stopReason: passed ? stopReason : remainingIssues.length ? `${stopReason}；仍有需要观察的问题` : stopReason,
+      stopReason: stableAtCeiling
+        ? "冻结评测已完整跑完：无 Skill 与当前版本均达到 100 分，保留任务全部通过且能力闭环完整。新候选没有证明额外提升，系统已回滚候选并保留当前最佳版本。"
+        : passed
+          ? stopReason
+          : remainingIssues.length ? `${stopReason}；仍有需要观察的问题` : stopReason,
     };
     showLocalBusy("精简检查已完成，正在固定通过验证的最佳版本");
     setGenerationLoop(state);
     reportClientGenerationLoopEvent("generation_loop_finished", { phase: "complete", round: state.rounds, accepted: state.status === "passed", beforeCount: state.baselineScore, afterCount: state.bestScore, reason: state.stopReason });
+    notifyGenerationLoopResult(state);
     return { files: bestFiles, state };
   }
   /* eslint-enable react-hooks/immutability */
@@ -7142,10 +7287,12 @@ export default function Home() {
           const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
           goalLoopError = message;
           reportClientGenerationLoopEvent("generation_loop_failed", { phase: "runtime", reason: message });
-          setGenerationLoop((current) => ({ ...current, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` }));
+          const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
+          setGenerationLoop(failedState);
+          notifyGenerationLoopResult(failedState);
         }
       } else {
-        setGenerationLoop({
+        const blockedState: GenerationLoopState = {
           ...DEFAULT_GENERATION_LOOP,
           status: "attention",
           phase: "complete",
@@ -7154,7 +7301,9 @@ export default function Home() {
           stopReason: contractRepair.validation.executionReady
             ? "P1 Contract Gate 未收敛，Bundle 未冻结，Optimization Loop 与 Eval 没有启动"
             : "P0 Execution Gate 未通过，P1 Contract Gate、Optimization Loop 与 Eval 没有启动",
-        });
+        };
+        setGenerationLoop(blockedState);
+        notifyGenerationLoopResult(blockedState);
       }
 
       setBusyPhaseIndex(9);
@@ -7194,6 +7343,7 @@ export default function Home() {
       const message = error instanceof Error ? error.message : "AI Skill 生成失败";
       setAiGenerationIssue(message);
       setBuildLoop((current) => ({ ...current, status: "attention", issues: [message] }));
+      notifyGenerationLoopResult({ ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: message });
       setToast(`${message}；没有生成模板 Skill`);
     } finally {
       finishBusy();
@@ -7235,7 +7385,9 @@ export default function Home() {
     } catch (error) {
       const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
       reportClientGenerationLoopEvent("generation_loop_failed", { phase: "runtime", reason: message });
-      setGenerationLoop((current) => ({ ...current, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` }));
+      const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
+      setGenerationLoop(failedState);
+      notifyGenerationLoopResult(failedState);
       setAiGenerationIssue(message);
       setRetryAction("rerun-optimization-loop");
       setToast(`${message}；当前 Skill 文件没有被覆盖`);
@@ -8096,7 +8248,7 @@ export default function Home() {
           <div className="demo-uncertainties"><span>仍无法确定</span>{skillDemo.uncertainties.length ? <ul>{skillDemo.uncertainties.map((item) => <li key={item}>{item}</li>)}</ul> : <p>本轮没有主动声明无法确定的事项。</p>}</div>
         </div>
         <div className="demo-conversation">
-          <div className="demo-conversation-heading"><div><span>继续试用这个 Skill</span><strong>围绕这份结果接着说</strong></div><small>保留当前 Demo 和最近 12 条消息</small></div>
+          <div className="demo-conversation-heading"><strong>围绕这份结果接着说</strong></div>
           {demoConversation.length > 0 && (
             <div className="demo-message-list" aria-live="polite">
               {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? "你" : "AI"}</span><p>{message.content}</p></div>)}
@@ -8116,7 +8268,7 @@ export default function Home() {
           </div>
           {demoChatError && <div className="demo-chat-error" role="alert"><span>{demoChatError}</span><button type="button" onClick={() => void sendDemoChatMessage()} disabled={demoChatBusy || !demoChatInput.trim()}>重试</button></div>}
         </div>
-        <div className="demo-actions"><small>{pendingReview ? "这份 Demo 已经保存；后续失败不会要求重新生成。" : "想验证稳定性，可以换一个相近但不同的场景再跑。"}</small><button className="secondary-button" onClick={runEvaluation} disabled={busy}>{pendingReview ? busy ? "正在完成评估…" : "继续完成评估" : "换个场景再试跑"}</button></div>
+        <div className="demo-actions">{pendingReview && <small>这份 Demo 已经保存；后续失败不会要求重新生成。</small>}<button className="secondary-button" onClick={runEvaluation} disabled={busy}>{pendingReview ? busy ? "正在完成评估…" : "继续完成评估" : "换个场景再试跑"}</button></div>
       </section>
     );
   }
@@ -8125,10 +8277,9 @@ export default function Home() {
     <main className="app-shell">
       <header className="topbar">
         <div className="brand-lockup">
-          <div className="brand-mark"><span>S</span></div>
           <div>
-            <div className="brand-name">SkillCanvas</div>
-            <div className="brand-sub">Personal skill studio</div>
+            <div className="brand-name brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</div>
+            <div className="brand-sub">YOUR <span>PERSONAL SKILL</span> STUDIO</div>
           </div>
         </div>
         <div className="topbar-center">
@@ -8137,18 +8288,21 @@ export default function Home() {
           <span className="saved-state" title="当前标签页会自动恢复；关闭标签页后清除，请在结束前下载">本标签页自动保存</span>
         </div>
         <div className="topbar-actions">
-          <button className="text-button" onClick={() => setToast("已打开新手指南")}>新手指南</button>
           <button className={`model-button ${connectionState === "ok" ? "connected" : hasApiKey ? "configured" : ""}`} onClick={openSettings}>
-            <span className="provider-mark">{PROVIDERS[provider].mark}</span>
+            <span className="provider-mark"><ProviderLogo id={provider} /></span>
             <span>{hasApiKey ? model : "连接模型"}</span>
             <span className="chevron">⌄</span>
           </button>
         </div>
       </header>
 
-      <div className="workspace-grid">
-        <aside className="step-rail">
-          <div className="rail-heading">创建流程</div>
+      <div className={`workspace-grid ${step === "brief" && !briefSidebarOpen ? "sidebar-collapsed" : "sidebar-expanded"}`}>
+        {step === "brief" && <button type="button" className={`sidebar-edge-toggle ${briefSidebarOpen ? "open" : ""}`} onClick={() => setBriefSidebarOpen((current) => !current)} aria-label={briefSidebarOpen ? "收起创建流程" : "展开创建流程"} aria-expanded={briefSidebarOpen}><span>{briefSidebarOpen ? "‹" : "›"}</span></button>}
+        <aside className="step-rail" aria-hidden={step === "brief" && !briefSidebarOpen}>
+          <div className="rail-heading">
+            <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chart-line.svg" alt="" aria-hidden="true" /></span>
+            <strong>创建进度</strong>
+          </div>
           <nav aria-label="Skill 创建步骤">
             {WORKFLOW_STEPS.map((item) => {
               const active = item.id === step;
@@ -8167,9 +8321,6 @@ export default function Home() {
             })}
           </nav>
 
-          <button className="rail-settings" onClick={openSettings}>
-            <span>⚙</span><span>模型与隐私</span>
-          </button>
         </aside>
 
         <section className="main-stage">
@@ -8178,12 +8329,7 @@ export default function Home() {
           )}
           {step === "brief" && (
             <div className="stage-content brief-stage">
-              <div className={`generation-mode-note ${aiGenerationIssue ? "error" : hasRealModel ? "ai" : "template"}`}>
-                <span>{aiGenerationIssue ? "!" : hasRealModel ? "AI" : "API"}</span>
-                <p><strong>{aiGenerationIssue ? "AI 没有完成这一步" : hasRealModel ? "结果驱动的理解已开启" : "需要连接模型才能开始"}</strong><small>{aiGenerationIssue || (hasRealModel ? `将使用 ${model} 先生成理解预演，再根据预演偏差动态追问；预演不会冒充正式 Skill 评测。` : "SkillCanvas 不会用固定问卷或静态样例冒充 AI 理解。")}</small></p>
-                <button type="button" onClick={openSettings}>{aiGenerationIssue ? "检查模型设置" : hasRealModel ? "查看模型" : "现在连接"}</button>
-              </div>
-              <h1><span className="headline-line">AI不懂你</span><br />SkillCanvas 来帮你</h1>
+              <h1><span className="headline-line">AI 不懂你</span><br /><span className="brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</span> 来帮你</h1>
 
               <div className="idea-composer">
                 <textarea
@@ -8195,11 +8341,10 @@ export default function Home() {
                 <div className="composer-footer">
                   <label className={`upload-button ${sourcesLoading ? "loading" : ""}`}>
                     <input type="file" multiple accept=".pdf,.md,.txt,.json,.csv,.html,.js,.ts,.tsx,.py" onChange={handleSources} disabled={sourcesLoading} />
-                    <span>{sourcesLoading ? "·" : "＋"}</span> {sourcesLoading ? "正在解析资料…" : "添加能代表你的资料（支持 PDF）"}
+                    <span>{sourcesLoading ? "·" : "＋"}</span> {sourcesLoading ? "正在解析资料…" : "添加你的资料"}
                   </label>
-                  <span className="privacy-note">原文件不保存；解析文字会发送给你选择的模型</span>
                   <button className="primary-button" onClick={startInterview} disabled={busy || sourcesLoading}>
-                    {sourcesLoading ? "等待资料解析" : busy ? "AI 正在先做一次…" : hasRealModel ? "先做一次给我看" : "连接模型后开始 AI 理解"}<span>→</span>
+                    {sourcesLoading ? "等待资料解析" : busy ? "AI 正在先做一次…" : hasRealModel ? "Let‘s Start！" : "连接模型后开始 AI 理解"}<span>→</span>
                   </button>
                 </div>
                 {(sourcesLoading || sourceReceipt) && (
@@ -8210,29 +8355,53 @@ export default function Home() {
                 )}
               </div>
 
+              <div className="starter-row">
+                <button onClick={() => setIdea("根据 JD 定制我的简历")}>根据 JD 定制我的简历</button>
+                <button onClick={() => setIdea("把我的写作习惯做成小红书 Skill")}>把我的写作习惯做成小红书 Skill</button>
+                <button onClick={() => setIdea("根据固定模板帮我做竞品分析")}>根据固定模板帮我做竞品分析</button>
+                <button onClick={() => setIdea("把我的旅行偏好变成长期规划助手")}>把我的旅行偏好变成长期规划助手</button>
+              </div>
+
               <div className={`context-builder ${contextPanelOpen ? "open" : ""}`}>
-                <button className="context-builder-toggle" type="button" aria-expanded={contextPanelOpen} onClick={() => setContextPanelOpen((current) => !current)}>
-                  <span>CTX</span>
-                  <div><strong>补充能让 AI 真正懂你的上下文</strong><small>常用 Prompt / SOP、业务背景、理想产出和反例；没有也可以跳过</small></div>
-                  <em>{contextFilledCount + sourceNames.length ? `已补充 ${contextFilledCount + sourceNames.length} 项` : "可选但很有价值"}</em>
+                <button className={`context-builder-toggle ${contextPanelOpen ? "expanded" : ""} ${contextFilledCount + sourceNames.length ? "" : "without-status"}`} type="button" aria-expanded={contextPanelOpen} onClick={() => setContextPanelOpen((current) => !current)}>
+                  {!contextPanelOpen && <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/books.svg" alt="" aria-hidden="true" /></span>}
+                  <div><strong>补充参考 <b>（可选）</b></strong><small>有现成方法、样例或偏好，可以让 Skill 更懂你</small></div>
+                  {!contextPanelOpen && contextFilledCount + sourceNames.length > 0 && <em>已补充 {contextFilledCount + sourceNames.length} 项</em>}
                   <i>{contextPanelOpen ? "⌃" : "⌄"}</i>
                 </button>
                 {contextPanelOpen && (
-                  <div className="context-fields">
-                    {CONTEXT_FIELDS.map((field) => (
-                      <label className="context-field" key={field.id}>
-                        <span><strong>{field.label}</strong><em>{field.tag}</em></span>
-                        <small>{field.description}</small>
-                        <textarea
-                          value={contextNotes[field.id]}
-                          maxLength={20_000}
-                          onChange={(event) => setContextNotes((current) => ({ ...current, [field.id]: event.target.value }))}
-                          placeholder={field.placeholder}
-                        />
-                        <i>{contextNotes[field.id].length.toLocaleString()} / 20,000</i>
-                      </label>
-                    ))}
-                    <div className="context-use-note"><span>如何进入 Skill</span><p>AI 会先从常用方法中提取步骤与限制，再结合背景、理想产出和反例做冲突检查；直接标识默认匿名化，空白资料不会生成占位文件。</p></div>
+                  <div className="context-panel">
+                    <div className="context-tabs" role="tablist" aria-label="补充参考类型">
+                      {CONTEXT_FIELDS.map((field) => (
+                        <button
+                          key={field.id}
+                          type="button"
+                          role="tab"
+                          aria-selected={activeContextField === field.id}
+                          className={activeContextField === field.id ? "active" : ""}
+                          onClick={() => setActiveContextField(field.id)}
+                        >
+                          <img src={field.icon} alt="" aria-hidden="true" />
+                          <strong>{field.tabLabel}</strong>
+                          <i>{activeContextField === field.id ? "⌃" : "⌄"}</i>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="context-fields">
+                      {CONTEXT_FIELDS.filter((field) => field.id === activeContextField).map((field) => (
+                        <label className="context-field" key={field.id}>
+                          <span><strong>{field.label}</strong><em>{field.tag}</em></span>
+                          <small>{field.description}</small>
+                          <textarea
+                            value={contextNotes[field.id]}
+                            maxLength={20_000}
+                            onChange={(event) => setContextNotes((current) => ({ ...current, [field.id]: event.target.value }))}
+                            placeholder={field.placeholder}
+                          />
+                          <i>{contextNotes[field.id].length.toLocaleString()} / 20,000</i>
+                        </label>
+                      ))}
+                    </div>
                   </div>
                 )}
               </div>
@@ -8250,11 +8419,6 @@ export default function Home() {
                 </div>
               )}
 
-              <div className="starter-row">
-                <button onClick={() => setIdea("帮我写小红书内容")}>帮我写小红书</button>
-                <button onClick={() => setIdea("帮我规划旅行")}>帮我规划旅行</button>
-                <button onClick={() => setIdea("帮我做产品分析")}>帮我做产品分析</button>
-              </div>
             </div>
           )}
 
@@ -8272,30 +8436,53 @@ export default function Home() {
               {discoveryPreview && (
                 <article className="discovery-preview-card">
                   <div className="discovery-preview-head">
-                    <div><span>理解预演 · 不计入正式评测</span><h3>{discoveryPreview.title}</h3><p>{discoveryPreview.scenario}</p></div>
-                    <button type="button" onClick={() => setDiscoveryPreviewExpanded((current) => !current)}>{discoveryPreviewExpanded ? "收起结果" : "展开结果"}<i>{discoveryPreviewExpanded ? "⌃" : "⌄"}</i></button>
-                  </div>
-                  <div className="discovery-preview-prompt"><span>AI 假设你可能会这样使用</span><p>{discoveryPreview.userPrompt}</p></div>
-                  {discoveryPreviewExpanded && <pre className="discovery-preview-output">{discoveryPreview.output}</pre>}
-                  <div className="discovery-preview-evidence">
-                    <div><span>它暂时理解到</span><ul>{discoveryPreview.learned.map((item) => <li key={item}>{item}</li>)}</ul></div>
-                    <div className="uncertain"><span>还不敢替你决定</span>{discoveryPreview.uncertainties.length ? <ul>{discoveryPreview.uncertainties.map((item) => <li key={item}>{item}</li>)}</ul> : <p>当前没有明显缺口，下面的问题会继续验证理解。</p>}</div>
-                  </div>
-                  <div className="discovery-preview-feedback">
-                    <div><strong>看完这次预演，哪里还不够懂你？</strong><small>{interviewRoundIndex > 0 ? "返回第一轮后可以修改；修改会重新生成后续问题。" : "可以多选，也可以直接补充。你的反馈会进入后面的提问和 Skill。"}</small></div>
-                    <div className="discovery-preview-options">
-                      <button type="button" className={previewFeedback.length === 0 && !previewFeedbackCustom.trim() ? "selected positive" : "positive"} disabled={interviewRoundIndex > 0} onClick={() => { invalidateFutureRounds(); setPreviewFeedback([]); setPreviewFeedbackCustom(""); setInterviewReadiness((current) => ({ ...current, canFinish: false })); }}>方向基本对，继续细化</button>
-                      {discoveryPreview.feedbackOptions.map((option) => <button type="button" className={previewFeedback.includes(option) ? "selected" : ""} aria-pressed={previewFeedback.includes(option)} disabled={interviewRoundIndex > 0} onClick={() => togglePreviewFeedback(option)} key={option}>{previewFeedback.includes(option) ? "✓ " : "+ "}{option}</button>)}
+                    <div className="discovery-preview-title">
+                      <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/file-description.svg" alt="" aria-hidden="true" /></span>
+                      <h3>{discoveryPreview.title}</h3>
+                      <em>本轮预演结果</em>
                     </div>
-                    <textarea
-                      value={previewFeedbackCustom}
-                      disabled={interviewRoundIndex > 0}
-                      maxLength={500}
-                      onChange={(event) => { invalidateFutureRounds(); setPreviewFeedbackCustom(event.target.value); setInterviewReadiness((current) => ({ ...current, canFinish: false })); }}
-                      placeholder="或者直接说：这个结果具体哪里不像你想要的……"
-                      aria-label="对理解预演的补充反馈"
-                    />
+                    <button type="button" aria-expanded={discoveryPreviewExpanded} aria-controls="discovery-preview-body" onClick={() => setDiscoveryPreviewExpanded((current) => !current)}>
+                      <span>{discoveryPreviewExpanded ? "收起结果" : "展开结果"}</span>
+                      <img className={discoveryPreviewExpanded ? "expanded" : ""} src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" />
+                    </button>
                   </div>
+                  {discoveryPreviewExpanded && <div className="discovery-preview-body" id="discovery-preview-body">
+                    <div className="discovery-preview-prompt">
+                      <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/user.svg" alt="" aria-hidden="true" /></span>
+                      <div><strong>你的原始需求</strong><p>{discoveryPreview.userPrompt}</p></div>
+                    </div>
+                    <div className="discovery-preview-output-card">
+                      <div><span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" /></span><strong>AI 当前生成预览</strong></div>
+                      <pre className="discovery-preview-output">{discoveryPreview.output}</pre>
+                    </div>
+                    <div className="discovery-preview-evidence">
+                      <div><span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/circle-check.svg" alt="" aria-hidden="true" />我已经理解</span><ul>{discoveryPreview.learned.map((item) => <li key={item}>{item}</li>)}</ul></div>
+                      <div className="uncertain"><span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/help-circle.svg" alt="" aria-hidden="true" />还需要你确认</span>{discoveryPreview.uncertainties.length ? <ul>{discoveryPreview.uncertainties.map((item) => <li key={item}>{item}</li>)}</ul> : <p>当前没有明显缺口，下面的问题会继续验证理解。</p>}</div>
+                    </div>
+                    <div className="discovery-preview-feedback">
+                      <div><strong>这版哪里还不像你？</strong></div>
+                      <div className="discovery-preview-options">
+                        <button type="button" className={previewFeedback.length === 0 && !previewFeedbackCustom.trim() ? "selected positive" : "positive"} disabled={interviewRoundIndex > 0} onClick={() => { invalidateFutureRounds(); setPreviewFeedback([]); setPreviewFeedbackCustom(""); setInterviewReadiness((current) => ({ ...current, canFinish: false })); }}>方向基本对，继续细化</button>
+                        {discoveryPreview.feedbackOptions.map((option) => <button type="button" className={previewFeedback.includes(option) ? "selected" : ""} aria-pressed={previewFeedback.includes(option)} disabled={interviewRoundIndex > 0} onClick={() => togglePreviewFeedback(option)} key={option}>{option}</button>)}
+                      </div>
+                      <textarea
+                        value={previewFeedbackCustom}
+                        disabled={interviewRoundIndex > 0}
+                        maxLength={500}
+                        onChange={(event) => { invalidateFutureRounds(); setPreviewFeedbackCustom(event.target.value); setInterviewReadiness((current) => ({ ...current, canFinish: false })); }}
+                        placeholder="直接告诉我哪里不对、需要补充什么，或哪些内容要保留……"
+                        aria-label="对理解预演的补充反馈"
+                      />
+                      {interviewRoundIndex === 0 && (
+                        <div className="discovery-preview-continue-row">
+                          <button className="discovery-preview-continue" type="button" onClick={() => void advanceInterview()} disabled={busy || !interviewReady}>
+                            <img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" />
+                            {busy ? "AI 正在细化…" : "继续细化"}
+                          </button>
+                        </div>
+                      )}
+                    </div>
+                  </div>}
                 </article>
               )}
 
@@ -8312,10 +8499,10 @@ export default function Home() {
 
               <div className={`understanding-evidence ${interviewEvidenceOpen ? "open" : ""}`}>
                 <button className="understanding-evidence-toggle" type="button" aria-expanded={interviewEvidenceOpen} onClick={() => setInterviewEvidenceOpen((current) => !current)}>
-                  <span>EX</span>
+                  <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/file-star.svg" alt="" aria-hidden="true" /></span>
                   <div><strong>给 AI 一个具体参照</strong><small>理想结果和反例能让 AI 看见你的标准，再把这些特征变成更准确的选择题。</small></div>
                   <em>{contextFilledCount + sourceNames.length ? `正在参考 ${contextFilledCount + sourceNames.length} 项上下文` : "还没有示例"}</em>
-                  <i>{interviewEvidenceOpen ? "⌃" : "⌄"}</i>
+                  <i><img className={interviewEvidenceOpen ? "expanded" : ""} src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" /></i>
                 </button>
                 {interviewEvidenceOpen && (
                   <div className="understanding-example-fields">
@@ -8342,7 +8529,6 @@ export default function Home() {
                       />
                     </div>
                     <div className="understanding-evidence-action">
-                      <p>AI 会对照示例的结构、信息粒度、证据方式和表达习惯，不会直接照抄内容。重新生成会清空本轮及后续回答。</p>
                       <button type="button" onClick={regenerateCurrentInterviewRound} disabled={busy}>让 AI 参考示例，重做本轮理解</button>
                     </div>
                   </div>
@@ -8359,16 +8545,17 @@ export default function Home() {
                     key={round.title}
                   >
                     <span>{index < highestRoundReached ? "✓" : index + 1}</span>
-                    <div><strong>{round.label}</strong><small>{index === interviewRoundIndex ? "正在填写" : index < highestRoundReached ? "可以返回修改" : "等待上一轮"}</small></div>
+                    <div><strong>{round.label}</strong></div>
                   </button>
                 ))}
               </div>
 
-              <div className="round-heading">
-                <div><span>第 {interviewRoundIndex + 1} 轮 · 最多 {INTERVIEW_ROUND_META.length} 轮</span><em className={`round-origin ${interviewRoundOrigins[interviewRoundIndex]}`}>AI 根据预演、资料和前序回答动态生成</em><h3>{INTERVIEW_ROUND_META[interviewRoundIndex].title}</h3><p>{INTERVIEW_ROUND_META[interviewRoundIndex].description}</p></div>
-                <strong>{currentAnsweredCount}/{questions.length}<small>本轮已回答</small></strong>
-              </div>
-              <div className="question-list">
+              <div className="round-transition" key={`interview-round-${interviewRoundIndex}`}>
+                <div className="round-heading">
+                  <div><h3>{INTERVIEW_ROUND_META[interviewRoundIndex].title}</h3></div>
+                  <strong>{currentAnsweredCount}/{questions.length}<small>本轮已回答</small></strong>
+                </div>
+                <div className="question-list">
                 {questions.map((question, index) => {
                   const currentAnswer = answers[question.id] || "";
                   const selectedOptions = question.options.filter((option) => question.selectionMode === "multiple"
@@ -8425,14 +8612,8 @@ export default function Home() {
                     </div>
                   );
                 })}
-              </div>
-
-              <div className="requirement-map">
-                <div><span>你的需求画像</span><strong>已回答 {coveredDimensionCount}/{REQUIREMENT_DIMENSIONS.length} 项{uncertainDimensionCount ? ` · ${uncertainDimensionCount} 项待 AI 判断` : ""}</strong></div>
-                <div className="dimension-chips">
-                  {REQUIREMENT_DIMENSIONS.map((dimension) => <span className={uncertainDimensions.has(dimension) ? "uncertain" : coveredDimensions.has(dimension) ? "covered" : ""} key={dimension}>{uncertainDimensions.has(dimension) ? "? " : coveredDimensions.has(dimension) ? "✓ " : "· "}{dimension}</span>)}
                 </div>
-                <p>这些选择会被整理成可确认的需求蓝图；AI 再据此判断真正需要的能力，并写入工作流、参考资料和专属效果检查。</p>
+
               </div>
               <div className="stage-footer">
                 <button className="secondary-button" onClick={() => interviewRoundIndex > 0 ? setInterviewRoundIndex(interviewRoundIndex - 1) : setStep("brief")}>{interviewRoundIndex > 0 ? "返回上一轮" : "返回修改一句话"}</button>
@@ -8448,11 +8629,8 @@ export default function Home() {
             <div className="stage-content blueprint-stage">
               <div className="stage-heading-row">
                 <div>
-                  <div className="stage-kicker">生成前先纠正误解</div>
                   <h2>这就是 AI 目前理解的你</h2>
-                  <p>你可以逐项修正。只有确认过的理解，才会进入专属 Skill。</p>
                 </div>
-                <span className="status-pill">{blueprint.length} 个理解模块 · {blueprint.filter((item) => item.status === "attention").length} 项待确认</span>
               </div>
               <div className="blueprint-grid">
                 {blueprint.map((section) => (
@@ -8483,7 +8661,6 @@ export default function Home() {
                 <div className="loop-goal">
                   <span>总目标</span>
                   <strong>{loopPlan.goal}</strong>
-                  <small>总目标描述最终要完成的事情，下面的质检只判断有没有做好，不会反过来变成目标。</small>
                 </div>
                 <div className="loop-columns">
                   <div className="loop-subgoals">
@@ -8517,40 +8694,9 @@ export default function Home() {
                   <div>
                     <span className="stage-kicker">AI 自动做技术判断</span>
                     <h3>这个 Skill 真正需要哪些能力</h3>
-                    <p>{capabilityPlan.summary}</p>
+                    <p>{normalizedCompiledKnowledgeSummary(capabilityPlan.summary, knowledgePackIsPublishable(knowledgePack) ? knowledgePack.plan.domain || "当前领域" : undefined)}</p>
                   </div>
                   <span className={`status-pill ${unresolvedMcpCount ? "attention" : "success"}`}>{unresolvedMcpCount ? `${unresolvedMcpCount} 个已选 MCP 待确认` : `${activeCapabilityCount} 项已选能力`}</span>
-                </div>
-                <div className="capability-architecture">
-                  <div><span>最终想实现</span><strong>{capabilityPlan.outcomeModel.ultimateGoal}</strong></div>
-                  <div><span>Skill 能直接控制</span><strong>{capabilityPlan.outcomeModel.controllableOutcomes.join("；")}</strong></div>
-                  <div><span>交付契约</span><strong>{capabilityPlan.outputContract.format} · {capabilityPlan.outputContract.mode}</strong></div>
-                  <div><span>运行时是否另存数据</span><strong>{capabilityPlan.stateModel.needed ? `${capabilityPlan.stateModel.scope} · ${capabilityPlan.stateModel.reason}` : capabilityPlan.items.some((item) => item.kind === "asset" && capabilityIsActive(item)) ? "不另存任务数据；可复用模板会随 Skill 文件保留" : "不另存任务数据"}</strong></div>
-                </div>
-                <div className="capability-plan-grid">
-                  {coreCapabilities.map((item) => (
-                    <article className={`capability-item ${item.status}`} key={item.id}>
-                      <div className="capability-item-top">
-                        <span className="capability-icon">{CAPABILITY_KIND_META[item.kind].icon}</span>
-                        <div><small>{CAPABILITY_KIND_META[item.kind].label}</small><strong>{item.name}</strong></div>
-                        <em>{item.status === "use-provided" && item.kind === "builtin-tool" ? "使用宿主工具" : item.status === "use-provided" && item.kind === "mcp" ? "使用已安装连接" : CAPABILITY_STATUS_LABELS[item.status]}</em>
-                      </div>
-                      <p><strong>负责：</strong>{item.requirement}<br />{item.reason}</p>
-                      {capabilityIsActive(item) && <div className="capability-contract"><span>何时用：{item.routingCondition}</span><span>输入：{item.input || "由当前任务提供"}</span><span>产出：{item.output || "可验证结果"}</span><span>归属：{item.layer === "runtime" ? "运行时" : item.layer === "evaluation" ? "评测" : "构建时"}{item.path ? ` · ${item.path}` : ""}</span></div>}
-                      <small className="capability-fallback">不可用时：{item.fallback}</small>
-                      {item.kind === "mcp" && item.status === "requires-setup" && (
-                        <div className="mcp-setup-panel">
-                          <div><strong>把“可能需要”变成明确选择</strong><p>只有你确认目标 Agent 已经安装并授权，Skill 才会写成可调用；否则可直接使用无 MCP 方案。</p></div>
-                          <label><span>MCP Server 名称</span><input value={mcpDrafts[item.id] || ""} onChange={(event) => setMcpDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder={item.connection?.server || "例如：Notion MCP、GitHub MCP"} /></label>
-                          {!!item.connection?.tools.length && <small>预计使用：{item.connection.tools.join("、")}</small>}
-                          <div className="mcp-setup-actions"><button onClick={() => confirmMcpCapability(item)}>我已安装并授权</button><button onClick={() => chooseMcpFallback(item)}>改用无 MCP 方案</button></div>
-                        </div>
-                      )}
-                      {item.kind === "mcp" && item.status === "use-provided" && item.connection?.verified && (
-                        <div className="mcp-confirmed"><span>✓</span><div><strong>已确认 {item.connection.server}</strong><small>将生成调用契约、运行前检查和不可用时的替代路径。</small></div><button onClick={() => editMcpCapability(item)}>修改</button></div>
-                      )}
-                    </article>
-                  ))}
                 </div>
                 <section className="tool-ability-picker">
                   <div className="tool-ability-heading">
@@ -8647,26 +8793,29 @@ export default function Home() {
                   {knowledgePack.plan.knowledgeGaps.length > 0 && <div className="knowledge-gap-row"><span>本次重点寻找</span>{knowledgePack.plan.knowledgeGaps.map((gap) => <em key={gap}>{gap}</em>)}</div>}
                   {knowledgePack.sources.length > 0 && (knowledgePack.diagnostics?.candidateCount || 0) > 0 && <div className="knowledge-validation-note">联网检索已完成。Knowledge Compiler 共检查 {knowledgePack.diagnostics?.candidateCount || 0} 条候选，保留 {knowledgePack.atoms.length} 条；权威来源有 {knowledgePack.diagnostics?.authoritativeSourceCount || 0} 个，其中 {knowledgePack.diagnostics?.authoritativeSourceUseCount || 0} 个已进入运行规则。{(knowledgePack.diagnostics?.validatorRejectedCount || 0) > 0 ? `${knowledgePack.diagnostics?.validatorRejectedCount || 0} 条已带着具体原因进入自动修复。` : "其余候选属于模型主动放弃的泛化或冲突建议。"}</div>}
                   {knowledgePack.atoms.length > 0 && (
-                    <div className="knowledge-atom-grid">
-                      {knowledgePack.atoms.map((atom) => (
-                        <article key={atom.id} className="knowledge-atom-card">
-                          <div className="knowledge-atom-top"><span>{atom.applicationMode === "enforced" ? "权威规则" : atom.applicationMode === "conditional" ? "有条件实践" : "参考洞察"}</span><b>{atom.dimension} · {Math.round(atom.confidence * 100)}%</b></div>
-                          <h3>{atom.title}</h3>
-                          <p>{atom.knowledge}</p>
-                          <dl><div><dt>什么时候使用</dt><dd>{atom.appliesWhen}</dd></div><div><dt>Skill 会怎么做</dt><dd>{atom.action}</dd></div></dl>
-                          <div className="knowledge-source-row">{atom.sourceUrls.map((url) => {
-                            const source = knowledgePack.sources.find((item) => item.url === url);
-                            const authorityLabel = source?.authorityTier === "official" ? "官方一手"
-                              : source?.authorityTier === "primary" ? "机构一手"
-                                : source?.authorityTier === "reputable_secondary" ? "专业二手"
-                                  : source?.authorityTier === "community" ? "社区来源"
-                                    : "待核来源";
-                            return <a key={url} href={url} target="_blank" rel="noreferrer" title={source?.authorityReason}><span>↗ {source?.title || new URL(url).hostname}</span><em>{authorityLabel}</em></a>;
-                          })}</div>
-                          <div className="knowledge-write-row"><span>将写入</span>{atom.writeTo.map((path) => <code key={path}>{path}</code>)}</div>
-                        </article>
-                      ))}
-                    </div>
+                    <details className="knowledge-atom-details">
+                      <summary><span>查看已采纳的 {knowledgePack.atoms.length} 条知识明细</span><em>默认收起，按需展开</em><i>⌄</i></summary>
+                      <div className="knowledge-atom-grid">
+                        {knowledgePack.atoms.map((atom) => (
+                          <article key={atom.id} className="knowledge-atom-card">
+                            <div className="knowledge-atom-top"><span>{atom.applicationMode === "enforced" ? "权威规则" : atom.applicationMode === "conditional" ? "有条件实践" : "参考洞察"}</span><b>{atom.dimension} · {Math.round(atom.confidence * 100)}%</b></div>
+                            <h3>{atom.title}</h3>
+                            <p>{atom.knowledge}</p>
+                            <dl><div><dt>什么时候使用</dt><dd>{atom.appliesWhen}</dd></div><div><dt>Skill 会怎么做</dt><dd>{atom.action}</dd></div></dl>
+                            <div className="knowledge-source-row">{atom.sourceUrls.map((url) => {
+                              const source = knowledgePack.sources.find((item) => item.url === url);
+                              const authorityLabel = source?.authorityTier === "official" ? "官方一手"
+                                : source?.authorityTier === "primary" ? "机构一手"
+                                  : source?.authorityTier === "reputable_secondary" ? "专业二手"
+                                    : source?.authorityTier === "community" ? "社区来源"
+                                      : "待核来源";
+                              return <a key={url} href={url} target="_blank" rel="noreferrer" title={source?.authorityReason}><span>↗ {source?.title || new URL(url).hostname}</span><em>{authorityLabel}</em></a>;
+                            })}</div>
+                            <div className="knowledge-write-row"><span>将写入</span>{atom.writeTo.map((path) => <code key={path}>{path}</code>)}</div>
+                          </article>
+                        ))}
+                      </div>
+                    </details>
                   )}
                   {knowledgePack.rejected.length > 0 && <details className="knowledge-rejected"><summary>为什么这 {knowledgePack.rejected.length} 条候选没有写入</summary><ul>{knowledgePack.rejected.map((item) => <li key={item}>{item}</li>)}</ul></details>}
                 </section>
@@ -8686,10 +8835,14 @@ export default function Home() {
                   })}
                 </div>
               </section>
-              <section className={`generation-loop-result ${generationLoop.status}`} aria-label="Optimization Loop 结果">
+              <section className={`generation-loop-result ${optimizationStableAtCeiling ? "stable" : generationLoop.status}`} aria-label="Optimization Loop 结果">
                 <div className="generation-loop-head">
-                  <div><span>OPTIMIZATION LOOP · 只做有证据的局部优化</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationBlockedByBuild ? "等待 Build Loop 修复完成后启动" : generationLoop.status === "attention" ? "当前证据不足以接受候选" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{generationLoop.stopReason}</p></div>
-                  <div className="generation-loop-actions"><em>{gateOutcomes.optimization.verdict === "satisfied" ? "✓ 已接受" : optimizationBlockedByBuild ? "未启动" : generationLoop.status === "attention" ? "证据不足" : generationLoop.status === "running" ? "执行中" : "未运行"}</em>{generationLoop.status === "attention" && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在重跑…" : optimizationBlockedByBuild ? "继续修复并启动" : "只重跑 Optimization Loop"}</button>}</div>
+                  <div><span>OPTIMIZATION LOOP · 只做有证据的局部优化</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationStableAtCeiling ? "评测已完成，当前版本处于稳定上限" : optimizationBlockedByBuild ? "等待 Build Loop 修复完成后启动" : generationLoop.status === "attention" ? "当前证据不足以接受候选" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{optimizationStableAtCeiling ? "无 Skill 与当前版本都达到评测上限，保留任务全部通过。候选没有证明额外提升，系统已自动回滚并保留当前最佳版本。" : generationLoop.stopReason}</p></div>
+                  <div className="generation-loop-actions">
+                    <em>{gateOutcomes.optimization.verdict === "satisfied" ? "✓ 已接受" : optimizationStableAtCeiling ? "✓ 已保留最佳版" : optimizationBlockedByBuild ? "未启动" : generationLoop.status === "attention" ? "证据不足" : generationLoop.status === "running" ? "执行中" : "未运行"}</em>
+                    <button type="button" className={`loop-notification-button ${notificationPermission}`} onClick={() => void requestCompletionNotifications()}>{notificationPermission === "granted" ? "✓ 完成通知已开启" : notificationPermission === "denied" ? "通知被阻止" : notificationPermission === "unsupported" ? "不支持通知" : "完成后通知我"}</button>
+                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在重跑…" : optimizationBlockedByBuild ? "继续修复并启动" : "只重跑 Optimization Loop"}</button>}
+                  </div>
                 </div>
                 {generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>证据类型</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "重复 held-out 比较" : "模型观察"}</strong><em>{gateOutcomes.optimization.sampleSize} 次 · 随机性证据</em></div>}
                 <div className="generation-loop-flow optimization-loop-flow">
@@ -8717,7 +8870,7 @@ export default function Home() {
                   <div><span>隔离试跑证据</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkRuns} 次 · 波动 ${generationLoop.bestStddev}` : "—"}</strong></div>
                   <div><span>匿名结果比较</span><strong>{generationLoop.blindWinner === "candidate" ? "当前版本胜" : generationLoop.blindWinner === "baseline" ? "无 Skill 基线胜" : generationLoop.blindWinner === "tie" ? "两者持平" : "—"}</strong></div>
                 </div>}
-                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>查看仍需观察的 {generationLoop.issues.length} 项</summary><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
+                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{optimizationStableAtCeiling ? `查看 ${generationLoop.issues.length} 条比较说明` : `查看仍需观察的 ${generationLoop.issues.length} 项`}</summary><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
               </section>
               <div className="editor-shell">
                 <div className="file-tree">
@@ -8765,7 +8918,7 @@ export default function Home() {
           {step === "evaluate" && (
             <div className="stage-content eval-stage">
               <div className="stage-heading-row">
-                <div><div className="stage-kicker">不是读规则打分，而是让它真的做一次</div><h2>它真的懂你吗？</h2><p>先让 Skill 完成一个代表性任务。你看到结果后，再决定下一轮具体改什么。</p></div>
+                <div><h2>它真的懂你吗？</h2><p>先让 Skill 完成一个代表性任务。你看到结果后，再决定下一轮具体改什么。</p></div>
                 {evalRan && <span className="status-pill success">第 {Math.max(1, demoRunCount)} 次试跑完成</span>}
               </div>
 
@@ -8776,12 +8929,6 @@ export default function Home() {
                 </div>
                 <b>已试跑 {demoRunCount} 次</b>
               </div>
-
-              <section className="eval-runtime-disclosure" aria-label="本轮评测能力边界">
-                <div><span>Demo 当前代表什么</span><strong>{gateOutcomes.demo.verdict === "observed" ? "一次执行已经被观察" : "尚未产生执行证据"}</strong><p>Demo 不使用“通过”结论；它只记录这个输入下实际产出了什么，稳定性由保留任务和重复试跑判断。</p></div>
-                <div><span>本轮怎么验证</span><strong>执行与评分上下文隔离</strong><p>执行结果先完成，再交给单独 Prompt 上下文评分；可能仍是同一 Provider/Model，不宣传成多模型裁判。</p></div>
-                <div><span>真实运行到哪里</span><strong>文件落盘 + 受限脚本测试</strong><p>要求文件的 case 会写入独立临时目录；生成的 Python 测试在禁网进程中运行。未配置的 Tool/MCP 不算已执行。</p></div>
-              </section>
 
               {generationLoop.benchmarkRuns > 0 && (
                 <section className={`user-proof-card ${generationLoop.blindWinner}`}>
@@ -8876,7 +9023,7 @@ export default function Home() {
               <div className="platform-grid">
                 {["Codex", "Claude Code", "Cursor", "GitHub Copilot", "Gemini CLI", "通用 SKILL.md"].map((name) => {
                   const selected = platforms.includes(name);
-                  return <button key={name} aria-pressed={selected} className={selected ? "selected" : ""} onClick={() => setPlatforms((current) => selected ? current.filter((item) => item !== name) : [...current, name])}><span className="platform-icon">{name.slice(0, 2).toUpperCase()}</span><strong>{name}</strong><small>{selected ? "已选择" : "点击添加"}</small><i>{selected ? "✓" : "+"}</i></button>;
+                  return <button key={name} aria-pressed={selected} className={selected ? "selected" : ""} onClick={() => setPlatforms((current) => selected ? current.filter((item) => item !== name) : [...current, name])}><span className="platform-icon"><PlatformMark name={name} /></span><strong>{name}</strong><small>{selected ? "已选择" : "点击添加"}</small><i>{selected ? "✓" : "+"}</i></button>;
                 })}
               </div>
               {bundleAudit.blockers.length > 0 && (
@@ -8930,8 +9077,12 @@ export default function Home() {
           <section className="settings-modal" aria-modal="true" role="dialog" aria-labelledby="model-settings-title">
             <div className="modal-head"><div><span className="stage-kicker">BYOK · Bring your own key</span><h2 id="model-settings-title">连接你的 AI 模型</h2></div><button className="close-button" aria-label="关闭模型设置" onClick={closeSettings}>×</button></div>
             <div className="privacy-banner"><span>⌁</span><p><strong>Key 不再写入浏览器存储</strong><small>保存后会按当前会话隔离并加密存放在服务端凭据库；页面、日志和生成的 Skill 都拿不到明文。可随时在下方清除。</small></p></div>
+            <section className={`completion-notification-setting ${notificationPermission}`}>
+              <div><span>◎</span><p><strong>长时间任务完成提醒</strong><small>Build / Optimization Loop 完成、暂停或失败时发送浏览器通知；结果仍会完整保留在当前页面。</small></p></div>
+              <button type="button" onClick={() => void requestCompletionNotifications()}>{notificationPermission === "granted" ? "✓ 已开启" : notificationPermission === "denied" ? "通知已被浏览器阻止" : notificationPermission === "unsupported" ? "当前浏览器不支持" : "开启通知"}</button>
+            </section>
             <div className="provider-options">
-              {(Object.keys(PROVIDERS) as ProviderId[]).map((id) => <button key={id} aria-pressed={provider === id} className={provider === id ? "selected" : ""} onClick={() => updateProvider(id)}><span>{PROVIDERS[id].mark}</span><strong>{PROVIDERS[id].name}</strong><i>{provider === id ? "●" : ""}</i></button>)}
+              {(Object.keys(PROVIDERS) as ProviderId[]).map((id) => <button key={id} aria-pressed={provider === id} className={provider === id ? "selected" : ""} onClick={() => updateProvider(id)}><span><ProviderLogo id={id} /></span><strong>{PROVIDERS[id].name}</strong><i>{provider === id ? "●" : ""}</i></button>)}
             </div>
             <label className="form-field"><span>API Key {credentialStored && <em className="stored-credential">已加密保存</em>}</span><input type="password" autoComplete="off" value={apiKey} onChange={(event) => { setApiKey(event.target.value); setConnectionState("idle"); setAiGenerationIssue(""); }} placeholder={credentialStored ? "已安全保存；输入新 Key 可替换" : provider === "deepseek" ? "sk-••••••••••••" : "输入你的 API Key"} /></label>
             <div className="model-picker-head"><div><strong>选择模型</strong><span>可以直接选，也可以填写自定义模型 ID</span></div><button type="button" onClick={loadModels} disabled={modelLoading}>{modelLoading ? "读取中…" : "从 API 读取模型"}</button></div>
@@ -9092,9 +9243,11 @@ export default function Home() {
             <div className="ai-progress-track"><span /></div>
             <div className="ai-progress-steps">
               {BUSY_STAGES[busyTask].stages.map((stageName, index) => (
-                <span className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName}>
-                  {index < busyStageIndex ? "✓" : index === busyStageIndex ? "●" : "·"} {stageName}
-                </span>
+                <div className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName}>
+                  <i aria-hidden="true">{index < busyStageIndex ? "✓" : index === busyStageIndex ? "●" : ""}</i>
+                  <span><strong>{stageName}</strong><small>{index < busyStageIndex ? "已完成" : index === busyStageIndex ? "进行中" : "待进行"}</small></span>
+                  {index < BUSY_STAGES[busyTask].stages.length - 1 && <img className="progress-step-arrow" src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-right.svg" alt="" aria-hidden="true" />}
+                </div>
               ))}
             </div>
             <small className={`ai-progress-note ${busyExecutionKind === "model" && busyElapsed >= 25 ? "slow" : ""}`}>{busyStatusNote}</small>

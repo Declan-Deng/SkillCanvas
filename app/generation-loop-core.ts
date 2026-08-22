@@ -268,3 +268,24 @@ export function generationGoalSatisfied(input: {
     && input.evidence.score >= 78
     && (lift >= 3 || input.evidence.score >= 88);
 }
+
+/** Distinguish a failed Optimization Gate from an exhausted comparison.
+ * When both the no-Skill baseline and the current bundle already sit at the
+ * exact evaluation ceiling, every held-out case passes, and the bundle has no
+ * contract/closure blocker, a strict-lift rule cannot accept a new candidate.
+ * That is a completed no-headroom result, not a quality warning. */
+export function generationEvaluationAtCeiling(input: {
+  evidence: GenerationEvidenceMetrics;
+  baseline: GenerationEvidenceMetrics;
+  closureScore: number;
+  blockers: number;
+  criticalSemanticIssues: number;
+}) {
+  return input.blockers === 0
+    && input.criticalSemanticIssues === 0
+    && input.closureScore === 100
+    && input.baseline.score === 100
+    && input.baseline.passRate === 100
+    && input.evidence.score === 100
+    && input.evidence.passRate === 100;
+}

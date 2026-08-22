@@ -783,10 +783,16 @@ export function projectSkillMarkdown(ir: SkillIR) {
   const checks = ir.runtimeContract?.completionChecks || [];
   const hasStateContract = ir.stateRequirement?.needed === true || ir.stateRequirement?.scope !== "none";
   const hasToolContract = ir.capabilities.some((item) => item.kind === "builtin-tool" || item.kind === "mcp");
+  const hasLoopContract = ir.resourcePlan.resources.some((item) => item.path === "references/loop-plan.md" && item.decision !== "exclude");
+  const hasDomainPlaybook = (ir.domainEvidence || []).length > 0;
+  const hasSourceEvidence = ir.resourcePlan.resources.some((item) => item.path === "references/source-evidence.md" && item.decision !== "exclude");
   const canonicalContracts = [
     "- [Output contract](references/output-contract.md)",
     ...(hasStateContract ? ["- [State contract](references/state-model.md)"] : []),
+    ...(hasLoopContract ? ["- [Loop control contract](references/loop-plan.md)"] : []),
     ...(hasToolContract ? ["- [Tool contracts](references/tooling.md)", "- [Machine-readable tool contracts](integrations/tool-contracts.json)"] : []),
+    ...(hasDomainPlaybook ? ["- [Evidence-grounded domain playbook](references/domain-playbook.md)"] : []),
+    ...(hasSourceEvidence ? ["- [User-provided source evidence](references/source-evidence.md)"] : []),
   ];
 
   const sections = [
@@ -798,7 +804,7 @@ export function projectSkillMarkdown(ir: SkillIR) {
     `## Input resolution contract\n\n${markdownList(ir.inputs.map((item) => item.resolution
       ? `**${item.name}:** ${item.missingBehavior} (mode: \`${item.resolution.mode}\`; authority: \`${item.resolution.authority}\`)`
       : `**${item.name}:** INVALID — resolution contract is missing`), "Use only the current request")}`,
-    `## Executable workflow\n\n${workflow.map((step, index) => {
+    `## Workflow\n\n${workflow.map((step, index) => {
       const capabilities = step.capabilityIds.map((id) => ir.capabilities.find((item) => item.id === id)).filter((item): item is SkillIRCapability => Boolean(item));
       const operations = capabilities.map((capability) => projectCapabilityRuntimeOperation(capability, ir.outputs));
       return `${index + 1}. **${step.action}**\n   - When: ${step.when}\n   - Input: ${step.input}\n   - Runtime operation: ${operations.join(" ") || "`REASON` — execute the declared action using resolved inputs."}\n   - Output: ${step.output}\n   - If unavailable: ${step.fallback}`;
@@ -821,6 +827,7 @@ export function projectToolContracts(ir: SkillIR) {
     availability: item.implementation.status,
     requirement: item.requirement,
     purpose: item.purpose,
+    scope: item.scope,
     activation_condition: item.activationCondition,
     routing_condition: item.routingCondition,
     input: item.input,

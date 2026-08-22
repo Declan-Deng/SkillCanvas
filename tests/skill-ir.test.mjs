@@ -12,12 +12,15 @@ import {
   projectCapabilityRuntimeOperation,
   projectEvalBank,
   projectSkillMarkdown,
+  projectToolContracts,
 } from "../app/skill-ir.ts";
 import {
   applySkillIRMutations,
+  normalizeCanonicalMutations,
   semanticSkillIRDigest,
   validateCanonicalSkillIR,
 } from "../app/canonical-mutations.ts";
+import { countDuplicateAuthorRuntimeRules, hasExecutableWorkflowHeading } from "../app/gate-rules.ts";
 
 function fixturePlan() {
   return {
@@ -107,6 +110,57 @@ test("Canonical SkillIR demotes unsupported hard rules and keeps one capability 
   assert.deepEqual(ir.tasks[0].capabilityIds.sort(), ["core-resume"]);
 });
 
+test("the canonical runtime projection always satisfies the workflow heading gate", () => {
+  const projected = projectSkillMarkdown(compile());
+  assert.match(projected, /^## Workflow$/m);
+  assert.equal(hasExecutableWorkflowHeading(projected), true);
+});
+
+test("canonical runtime projection links every compiler-owned knowledge resource", () => {
+  const ir = compile();
+  ir.domainEvidence = [{ rule: "Use evidence-backed terminology", evidence_type: "official_rule", confidence: 0.95 }];
+  ir.resourcePlan.resources.push({
+    capabilityId: "core-resume",
+    kind: "reference",
+    path: "references/source-evidence.md",
+    decision: "include",
+    reason: "user supplied evidence",
+    consumerTaskIds: ["task-core"],
+  });
+  const projected = projectSkillMarkdown(ir);
+  assert.match(projected, /\[Evidence-grounded domain playbook\]\(references\/domain-playbook\.md\)/);
+  assert.match(projected, /\[User-provided source evidence\]\(references\/source-evidence\.md\)/);
+});
+
+test("tool contracts preserve the canonical capability scope contract", () => {
+  const ir = compile();
+  const capability = ir.capabilities.find((item) => item.id === "core-resume");
+  capability.kind = "builtin-tool";
+  capability.scope = "conditional";
+  capability.activationCondition = "only when fresh external evidence is required";
+  capability.affects = ["knowledge-grounding"];
+  capability.mustNotAffect = ["default-output-contract"];
+  capability.implementation.status = "use-provided";
+  const contract = JSON.parse(projectToolContracts(ir)).tools[0];
+  assert.equal(contract.scope, capability.scope);
+  assert.equal(contract.activation_condition, capability.activationCondition);
+  assert.deepEqual(contract.affects, capability.affects);
+  assert.deepEqual(contract.must_not_affect, capability.mustNotAffect);
+});
+
+test("duplicate-rule gate ignores canonical projections but catches competing author-owned rules", () => {
+  const repeated = "When the necessary input is absent, stop the dependent operation and request only that missing input";
+  assert.equal(countDuplicateAuthorRuntimeRules({
+    "SKILL.md": repeated,
+    "references/tooling.md": repeated,
+    "references/output-contract.md": repeated,
+  }), 0);
+  assert.equal(countDuplicateAuthorRuntimeRules({
+    "SKILL.md": repeated,
+    "references/examples.md": repeated,
+  }), 1);
+});
+
 test("canonical mutation survives projection and changes the semantic digest", () => {
   const baseline = compile();
   const mutation = {
@@ -130,6 +184,17 @@ test("canonical mutation survives projection and changes the semantic digest", (
   assert.match(projectSkillMarkdown(candidate), /已有足够输入时直接生成，不重复追问/);
   assert.ok(candidate.runtimeContract.workflow.length > 0);
   assert.ok(candidate.constraints.some((item) => item.id === "constraint-confirmed-direct-first"));
+});
+
+test("canonical mutation normalization accepts common provider aliases without weakening target validation", () => {
+  const normalized = normalizeCanonicalMutations([
+    { type: "input_update", targetId: "input-target-jd", patch: { required: true } },
+    { action: "update_requirement", target_id: "requirement-goal", updates: { hard: true } },
+  ]);
+  assert.deepEqual(normalized, [
+    { type: "input.update", inputId: "input-target-jd", changes: { required: true } },
+    { type: "requirement.update", requirementId: "requirement-goal", changes: { hard: true } },
+  ]);
 });
 
 test("runtime projector emits kind-specific executable protocols", () => {

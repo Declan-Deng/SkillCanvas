@@ -65,13 +65,17 @@ export async function POST(request: Request) {
     : event.startsWith("repair_gate")
       ? "repair-gate"
       : "personalization";
+  const diagnosticReason = [
+    entry.reason,
+    entry.blockers.length ? `blockers: ${entry.blockers.join("；")}` : "",
+  ].filter(Boolean).join(" | ").slice(0, 1_200);
   recordAiDiagnostic(event === "generation_loop_failed" || event.startsWith("ai_client") ? "error" : "info", {
     event: entry.event,
     mode: diagnosticMode,
     phase: typeof body.phase === "string" ? body.phase : undefined,
     attempt: entry.round,
     elapsedMs: cleanNumber(body.elapsedMs),
-    reason: entry.reason || entry.blockers.join("；") || undefined,
+    reason: diagnosticReason || undefined,
   });
   await persistDiagnostic(tenant.tenantId, {
     timestamp: new Date().toISOString(),
@@ -81,7 +85,7 @@ export async function POST(request: Request) {
     phase: typeof body.phase === "string" ? body.phase : undefined,
     attempt: entry.round,
     elapsedMs: cleanNumber(body.elapsedMs),
-    reason: entry.reason || entry.blockers.join("；") || undefined,
+    reason: diagnosticReason || undefined,
   }).catch(() => undefined);
   console.info(JSON.stringify(entry));
   return Response.json({ ok: true }, { headers: { "Cache-Control": "no-store" } });

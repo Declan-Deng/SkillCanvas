@@ -56,7 +56,7 @@ export function buildGateOutcome(input: {
 }
 
 export function optimizationGateOutcome(input: {
-  status: "idle" | "running" | "passed" | "attention";
+  status: "idle" | "running" | "passed" | "stable" | "attention";
   benchmarkRuns: number;
   passRate: number;
   lift: number;
@@ -72,7 +72,11 @@ export function optimizationGateOutcome(input: {
     evidenceStrength: input.benchmarkRuns > 1 ? "repeated-held-out" : input.benchmarkRuns === 1 ? "single-observation" : "none",
     reproducibility: input.benchmarkRuns ? "stochastic" : "not-applicable",
     evaluator: "model-context-isolated",
-    claim: satisfied ? "当前候选在冻结保留任务与回归条件下优于可接受基线" : "当前证据尚不能接受该候选",
+    claim: satisfied
+      ? "当前候选在冻结保留任务与回归条件下优于可接受基线"
+      : input.status === "stable"
+        ? "冻结评测已完成；当前版本处于评测上限，没有候选证明额外提升"
+        : "当前证据尚不能接受该候选",
     sampleSize: input.benchmarkRuns,
     evidenceRefs: [
       input.contractDigest ? `contract:${input.contractDigest}` : "",

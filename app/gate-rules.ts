@@ -12,6 +12,37 @@ export type GateBlockerDiff = {
   improvedWithoutRegression: boolean;
 };
 
+const CANONICAL_PROJECTION_REFERENCES = new Set([
+  "references/domain-playbook.md",
+  "references/loop-plan.md",
+  "references/output-contract.md",
+  "references/state-model.md",
+  "references/tooling.md",
+]);
+
+/**
+ * Detect duplicated author-owned runtime prose. Canonical reference files are
+ * deliberately excluded: they are deterministic views of the same SkillIR,
+ * so shared wording there is projection evidence, not competing authority.
+ */
+export function countDuplicateAuthorRuntimeRules(files: Record<string, string>) {
+  const sentenceOwners = new Map<string, Set<string>>();
+  Object.entries(files)
+    .filter(([path]) => (path === "SKILL.md" || path.startsWith("references/")) && !CANONICAL_PROJECTION_REFERENCES.has(path))
+    .forEach(([path, content]) => {
+      content
+        .split(/[。！？.!?\n]+/)
+        .map((sentence) => sentence.replace(/^[#>*\-\d.\s]+/, "").replace(/\s+/g, " ").trim().toLowerCase())
+        .filter((sentence) => sentence.length >= 36)
+        .forEach((sentence) => {
+          const owners = sentenceOwners.get(sentence) || new Set<string>();
+          owners.add(path);
+          sentenceOwners.set(sentence, owners);
+        });
+    });
+  return Array.from(sentenceOwners.values()).filter((owners) => owners.size > 1).length;
+}
+
 export function evalPromptIsTooShort(item: EvalContractLike) {
   return (item.prompt || "").trim().length < MIN_EXECUTABLE_EVAL_PROMPT_CHARS;
 }
@@ -28,7 +59,7 @@ function markerIndexAfter(text: string, pattern: RegExp, after: number) {
   return match ? after + match.index : -1;
 }
 
-const WORKFLOW_HEADING = /^##\s+(?:\d+[.)、]\s*)?(?:workflow(?:\s+and\s+(?:branches|decisions))?|procedure|runtime\s+workflow|execution(?:\s+(?:workflow|steps))?|steps|instructions|工作流|工作流程|执行流程|执行步骤|运行流程|操作流程|处理流程|具体步骤|工作步骤)\s*[：:]?\s*$/im;
+const WORKFLOW_HEADING = /^##\s+(?:\d+[.)、]\s*)?(?:workflow(?:\s+and\s+(?:branches|decisions))?|executable\s+workflow|procedure|runtime\s+workflow|execution(?:\s+(?:workflow|steps))?|steps|instructions|工作流|工作流程|执行流程|执行步骤|运行流程|操作流程|处理流程|具体步骤|工作步骤)\s*[：:]?\s*$/im;
 
 export function hasExecutableWorkflowHeading(text: string) {
   return WORKFLOW_HEADING.test(text);
