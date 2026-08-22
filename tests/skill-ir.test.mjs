@@ -9,9 +9,15 @@ import {
   deriveTaskInputContract,
   ensureSkillSemanticClosure,
   projectCapabilityManifest,
+  projectCapabilityRuntimeOperation,
   projectEvalBank,
   projectSkillMarkdown,
 } from "../app/skill-ir.ts";
+import {
+  applySkillIRMutations,
+  semanticSkillIRDigest,
+  validateCanonicalSkillIR,
+} from "../app/canonical-mutations.ts";
 
 function fixturePlan() {
   return {
@@ -99,6 +105,65 @@ test("Canonical SkillIR demotes unsupported hard rules and keeps one capability 
   assert.equal(generated?.ruleType, "proxy_metric");
   assert.deepEqual(ir.resourcePlan.resources, []);
   assert.deepEqual(ir.tasks[0].capabilityIds.sort(), ["core-resume"]);
+});
+
+test("canonical mutation survives projection and changes the semantic digest", () => {
+  const baseline = compile();
+  const mutation = {
+    type: "requirement.add",
+    requirement: {
+      id: "confirmed-direct-first",
+      statement: "已有足够输入时直接生成，不重复追问",
+      provenance: "user_explicit",
+      source: "personalization.demo-feedback",
+      confidence: 1,
+      modality: "MUST",
+      ruleType: "preference",
+      failureCost: "medium",
+      hard: true,
+      mappedCapabilityIds: [baseline.capabilities.find((item) => item.kind === "llm").id],
+    },
+  };
+  const candidate = applySkillIRMutations(baseline, [mutation]).ir;
+  assert.equal(validateCanonicalSkillIR(candidate).valid, true);
+  assert.notEqual(semanticSkillIRDigest(candidate), semanticSkillIRDigest(baseline));
+  assert.match(projectSkillMarkdown(candidate), /已有足够输入时直接生成，不重复追问/);
+  assert.ok(candidate.runtimeContract.workflow.length > 0);
+  assert.ok(candidate.constraints.some((item) => item.id === "constraint-confirmed-direct-first"));
+});
+
+test("runtime projector emits kind-specific executable protocols", () => {
+  const base = {
+    id: "cap",
+    name: "Capability",
+    scope: "conditional",
+    activationCondition: "when requested",
+    requirement: "complete the declared operation",
+    purpose: "produce a verified result",
+    input: "records",
+    output: "results",
+    fallback: "stop the dependent step",
+    routingCondition: "when requested",
+    affects: ["runtime-workflow"],
+    mustNotAffect: [],
+    implementation: { path: "SKILL.md", layer: "runtime", status: "generate" },
+    necessity: { successLift: "high", bareModelReliable: false, deterministicNeed: false, realResourceAvailable: true, externalDependency: false, decision: "include", reason: "required" },
+    dependencies: [],
+    evidenceRequirements: [],
+    evalCaseIds: [],
+  };
+  const operation = (kind, changes = {}) => projectCapabilityRuntimeOperation({ ...base, kind, ...changes });
+  assert.match(operation("llm"), /`REASON`/);
+  assert.match(operation("reference", { implementation: { ...base.implementation, path: "references/playbook.md" } }), /`READ\(`references\/playbook\.md`\)`/);
+  assert.match(operation("script", { implementation: { ...base.implementation, path: "scripts/compute.py" } }), /`RUN\(`scripts\/compute\.py`, contract\)`[\s\S]*exit status/);
+  assert.match(operation("builtin-tool"), /`VERIFY_HOST → CALL`/);
+  assert.match(operation("mcp", { connection: { server: "calendar", tools: ["create_event"], verified: true } }), /`VERIFY_SERVER → CALL_MCP`[\s\S]*calendar[\s\S]*create_event/);
+  assert.match(operation("asset", { implementation: { ...base.implementation, path: "assets/template.docx" } }), /`COPY\/FILL\/TRANSFORM\(`assets\/template\.docx`\)`/);
+  const artifact = projectCapabilityRuntimeOperation(
+    { ...base, kind: "script", implementation: { ...base.implementation, path: "scripts/export.py" } },
+    [{ id: "out", name: "Report", mode: "artifact", requiredSections: [], artifactPatterns: ["outputs/*.pdf"], producerCapabilityIds: ["cap"], validation: ["PDF opens"] }],
+  );
+  assert.match(artifact, /`SERIALIZE → VALIDATE`[\s\S]*`outputs\/\*\.pdf`[\s\S]*PDF opens/);
 });
 
 test("canonical compiler deduplicates adaptive answers and keeps script parameters out of task inputs", () => {

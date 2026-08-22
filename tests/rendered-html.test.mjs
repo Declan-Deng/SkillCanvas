@@ -248,7 +248,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /里面具体有什么/);
   assert.match(page, /确认并生成下一版 Demo/);
   assert.match(page, /已经采用的建议/);
-  assert.match(page, /applyConfirmedPersonalizationFeedback/);
+  assert.match(page, /feedbackRequirementMutations/);
+  assert.match(page, /applyCanonicalCandidate/);
   assert.match(page, /const \[mutationHistory, setMutationHistory\]/);
   assert.match(page, /function commitSkillMutation\(/);
   assert.match(page, /validatePersonalizationCandidate/);
@@ -336,14 +337,14 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /ai_content_invalid_json/);
   assert.match(route, /attempt <= 2/);
   assert.match(route, /Every attempt owns its timeout|const controller = new AbortController\(\);[\s\S]*?for \(let attempt|for \(let attempt[\s\S]*?const controller = new AbortController/);
-  assert.match(route, /small exact find-and-replace edits/);
-  assert.match(route, /"createdFiles"/);
+  assert.match(route, /All semantic changes MUST be CanonicalMutation objects/);
+  assert.match(route, /"canonicalMutations"/);
   assert.doesNotMatch(route, /模型没有返回可用内容/);
   assert.match(route, /mode === "optimization-plan"/);
   assert.match(route, /mode === "optimization-evidence"/);
   assert.match(route, /real multi-case evidence for text-space Skill optimization/);
   assert.match(route, /Treat rejected-history entries as negative optimization feedback/);
-  assert.match(route, /Return at most 4 focused edits/);
+  assert.match(route, /Return at most 4 focused mutations/);
   assert.match(route, /mode === "optimize"/);
   assert.match(route, /mode === "demo"/);
   assert.match(route, /mode === "personalize"/);
@@ -557,23 +558,24 @@ test("repairs invalid JSON backslash escapes returned by a model", async () => {
 test("applies compact optimization edits without replacing the whole bundle", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const start = page.indexOf("function applyOptimizationEdits");
-  const end = page.indexOf("function normalizeCapabilityPlan");
+  const end = page.indexOf("function applyCanonicalCandidate");
   assert.ok(start >= 0 && end > start);
   const executable = page.slice(start, end)
     .replace("function applyOptimizationEdits(currentFiles: Record<string, string>, response: OptimizationEditResponse)", "function applyOptimizationEdits(currentFiles, response)")
     .replace("const changedPaths = new Set<string>();", "const changedPaths = new Set();")
     .replaceAll(" as Record<string, unknown>", "");
-  const apply = new Function(`const isSafeSkillFilePath = (path) => path === "SKILL.md" || /^(agents|references)\\//.test(path); ${executable}; return applyOptimizationEdits;`)();
-  const current = { "SKILL.md": "# Skill\n\nOld workflow\n", "agents/openai.yaml": "name: old\n" };
+  const apply = new Function(`const isImplementationBytePath = (path) => /^(scripts|assets)\\//.test(path); ${executable}; return applyOptimizationEdits;`)();
+  const current = { "SKILL.md": "# Skill\n\nOld workflow\n", "scripts/check.py": "old implementation\n" };
   const result = apply(current, {
-    edits: [{ path: "SKILL.md", find: "Old workflow", replacement: "Improved workflow" }],
-    createdFiles: { "references/checklist.md": "# Checklist\n" },
+    edits: [{ path: "scripts/check.py", find: "old implementation", replacement: "improved implementation" }],
+    createdFiles: { "assets/checklist.md": "# Checklist\n" },
   });
-  assert.equal(result.files["SKILL.md"], "# Skill\n\nImproved workflow\n");
-  assert.equal(result.files["references/checklist.md"], "# Checklist\n");
-  assert.deepEqual(result.changedPaths.sort(), ["SKILL.md", "references/checklist.md"]);
+  assert.equal(result.files["scripts/check.py"], "improved implementation\n");
+  assert.equal(result.files["assets/checklist.md"], "# Checklist\n");
+  assert.deepEqual(result.changedPaths.sort(), ["assets/checklist.md", "scripts/check.py"]);
   assert.equal(current["SKILL.md"], "# Skill\n\nOld workflow\n");
-  assert.throws(() => apply({ "SKILL.md": "same same" }, { edits: [{ path: "SKILL.md", find: "same", replacement: "new" }] }), /修改位置不够准确/);
+  assert.throws(() => apply({ "scripts/check.py": "same same" }, { edits: [{ path: "scripts/check.py", find: "same", replacement: "new" }] }), /修改位置不够准确/);
+  assert.deepEqual(apply(current, { edits: [{ path: "SKILL.md", find: "Old workflow", replacement: "hidden" }] }).changedPaths, []);
 });
 
 test("an ambiguous optimization patch is replanned instead of crashing the Loop", async () => {

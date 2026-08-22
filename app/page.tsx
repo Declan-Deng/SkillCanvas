@@ -53,7 +53,6 @@ import {
   runtimeFileMentions,
 } from "./gate-rules";
 import {
-  applyConfirmedPersonalizationFeedback,
   confirmedPersonalizationConflicts,
   extractConfirmedPersonalizationFeedback,
   feedbackAppearsInRuntimeFiles,
@@ -92,6 +91,15 @@ import {
   type PipelineIssue,
 } from "./skill-pipeline-core";
 import { classifyBundleIssue, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
+import {
+  applySkillIRMutations,
+  feedbackRequirementMutations,
+  isImplementationBytePath,
+  normalizeCanonicalMutations,
+  parseCanonicalSkillIR,
+  semanticSkillIRDigest,
+  validateCanonicalSkillIR,
+} from "./canonical-mutations";
 import {
   buildInformationDependencies,
   buildRequirementProvenance,
@@ -490,11 +498,21 @@ type OptimizationPlan = {
 };
 
 type OptimizationEditResponse = {
+  canonicalMutations?: unknown;
+  implementationFiles?: Record<string, unknown>;
   edits?: unknown;
   createdFiles?: Record<string, unknown>;
   updatedFiles?: Record<string, unknown>;
   summary?: string;
   consumedDecisionIds?: string[];
+};
+
+type CanonicalRepairResponse = {
+  canonicalMutations?: unknown;
+  implementationFiles?: Record<string, unknown>;
+  updatedFiles?: Record<string, unknown>;
+  summary?: string;
+  resolved?: unknown;
 };
 
 type OptimizationStatus = "idle" | "analyzing" | "ready" | "optimizing" | "reevaluating" | "complete" | "error";
@@ -2556,7 +2574,7 @@ function createExpandedGoal(idea: string, answers: Record<string, string>, hasSo
   return `${capabilityPlan.outcomeModel.ultimateGoal || `在“${scenario}”场景下完成“${task}”`}。运行时先读取${inputs}，${sourceClause}，按照“${contentPolicy}”处理内容；可控的中间结果包括：${controllable}；最终交付${output}。${externalBoundary}`;
 }
 
-function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answers: Record<string, string>, sourceEvidence = "", capabilityPlan: CapabilityPlan = DEFAULT_CAPABILITY_PLAN, loopPlan: LoopPlan = deriveLoopPlan(idea, answers, capabilityPlan)) {
+function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answers: Record<string, string>, sourceEvidence = "", capabilityPlan: CapabilityPlan = DEFAULT_CAPABILITY_PLAN, loopPlan: LoopPlan = deriveLoopPlan(idea, answers, capabilityPlan), canonicalIROverride?: SkillIR) {
   capabilityPlan = ensureTaskCapabilities(capabilityPlan, idea, answers);
   capabilityPlan = reconcileCapabilityPlanWithFeedback(capabilityPlan, extractConfirmedPersonalizationFeedback(rawFiles["SKILL.md"] || ""));
   loopPlan = reconcileLoopPlanState(loopPlan, capabilityPlan);
@@ -2757,7 +2775,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   files["evals/result.schema.json"] = createEvalResultSchema();
   files["evals/artifact_checker.py"] = createArtifactChecker();
   files["evals/run_evals.py"] = createEvalRunner();
-  const canonicalIR = bindSkillIREvals(createCanonicalSkillIR({
+  const canonicalIR = bindSkillIREvals(canonicalIROverride || createCanonicalSkillIR({
     skillName,
     idea,
     answers,
@@ -2765,7 +2783,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     loop: loopPlan,
     sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
     files,
-  }), files["evals/evals.json"]);
+  }), canonicalIROverride ? projectEvalBank(canonicalIROverride) : files["evals/evals.json"]);
   files["evals/skill-ir.json"] = JSON.stringify(canonicalIR, null, 2);
   files["evals/capability-manifest.json"] = createCapabilityManifest(capabilityPlan, files["evals/evals.json"], loopPlan, { idea, answers, sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`, skill: files["SKILL.md"], files }, canonicalIR);
   const generatedScriptPaths = Object.keys(files).filter((path) => path.startsWith("scripts/") && path.endsWith(".py"));
@@ -2797,7 +2815,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   // Freeze Canonical SkillIR last, then overwrite every compiler-owned
   // semantic artifact from that one source. No semantic repair is allowed
   // after this boundary.
-  const frozenIR = bindSkillIREvals(createCanonicalSkillIR({
+  const frozenIR = bindSkillIREvals(canonicalIROverride || createCanonicalSkillIR({
     skillName,
     idea,
     answers,
@@ -2805,7 +2823,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     loop: loopPlan,
     sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
     files,
-  }), files["evals/evals.json"] || "");
+  }), canonicalIROverride ? projectEvalBank(canonicalIROverride) : files["evals/evals.json"] || "");
   files["evals/skill-ir.json"] = JSON.stringify(frozenIR, null, 2);
   files["evals/capability-manifest.json"] = JSON.stringify(projectCapabilityManifest(frozenIR), null, 2);
   files["evals/evals.json"] = projectEvalBank(frozenIR);
@@ -3594,7 +3612,7 @@ function applyOptimizationEdits(currentFiles: Record<string, string>, response: 
     const path = typeof edit.path === "string" ? edit.path.trim() : "";
     const find = typeof edit.find === "string" ? edit.find : "";
     const replacement = typeof edit.replacement === "string" ? edit.replacement : "";
-    if (!isSafeSkillFilePath(path) || !find || typeof nextFiles[path] !== "string") continue;
+    if (!isImplementationBytePath(path) || !find || typeof nextFiles[path] !== "string") continue;
     const firstIndex = nextFiles[path].indexOf(find);
     if (firstIndex < 0 || nextFiles[path].indexOf(find, firstIndex + find.length) >= 0) {
       throw new Error(`AI 给出的“${path}”修改位置不够准确，已保留原文件，请重试优化`);
@@ -3604,7 +3622,7 @@ function applyOptimizationEdits(currentFiles: Record<string, string>, response: 
   }
 
   for (const [path, content] of Object.entries(response.createdFiles || {})) {
-    if (!isSafeSkillFilePath(path) || typeof content !== "string" || !content.trim() || path in currentFiles) continue;
+    if (!isImplementationBytePath(path) || typeof content !== "string" || !content.trim() || path in currentFiles) continue;
     nextFiles[path] = content;
     changedPaths.add(path);
   }
@@ -3612,13 +3630,55 @@ function applyOptimizationEdits(currentFiles: Record<string, string>, response: 
   // Keep compatibility with providers that ignore the compact-edit contract once.
   if (!changedPaths.size) {
     for (const [path, content] of Object.entries(response.updatedFiles || {})) {
-      if (!isSafeSkillFilePath(path) || typeof content !== "string" || !content.trim() || currentFiles[path] === content) continue;
+      if (!isImplementationBytePath(path) || typeof content !== "string" || !content.trim() || currentFiles[path] === content) continue;
       nextFiles[path] = content;
       changedPaths.add(path);
     }
   }
 
   return { files: nextFiles, changedPaths: Array.from(changedPaths) };
+}
+
+function applyCanonicalCandidate(input: {
+  currentFiles: Record<string, string>;
+  rawMutations: unknown;
+  implementationFiles?: Record<string, unknown>;
+  idea: string;
+  answers: Record<string, string>;
+  sourceEvidence: string;
+  capabilityPlan: CapabilityPlan;
+  loopPlan: LoopPlan;
+}) {
+  const currentIR = parseCanonicalSkillIR(input.currentFiles);
+  if (!currentIR) throw new Error("Canonical SkillIR 无法解析，语义修改必须先通过 P0 JSON 修复");
+  const mutations = normalizeCanonicalMutations(input.rawMutations);
+  if (!mutations.length && !Object.keys(input.implementationFiles || {}).length) throw new Error("模型没有返回 CanonicalMutation 或 implementation bytes");
+  const mutated = applySkillIRMutations(currentIR, mutations);
+  const irValidation = validateCanonicalSkillIR(mutated.ir);
+  if (!irValidation.valid) throw new Error(`CanonicalMutation 未通过 IR Validator：${irValidation.issues.join("；")}`);
+  const implementationFiles = Object.fromEntries(Object.entries(input.implementationFiles || {}).filter((entry): entry is [string, string] => (
+    isImplementationBytePath(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1].trim())
+  )));
+  const candidateFiles = finalizeSkillFiles(
+    { ...input.currentFiles, ...implementationFiles },
+    input.idea,
+    input.answers,
+    input.sourceEvidence,
+    input.capabilityPlan,
+    input.loopPlan,
+    mutated.ir,
+  );
+  const baselineDigest = semanticSkillIRDigest(currentIR);
+  const candidateDigest = semanticSkillIRDigest(candidateFiles);
+  return {
+    files: candidateFiles,
+    mutations,
+    changedTargets: mutated.changedTargets,
+    implementationPaths: Object.keys(implementationFiles),
+    baselineDigest,
+    candidateDigest,
+    materialDiff: baselineDigest !== candidateDigest || Object.keys(implementationFiles).some((path) => input.currentFiles[path] !== implementationFiles[path]),
+  };
 }
 
 function normalizeCapabilityPlan(value: unknown): CapabilityPlan | null {
@@ -4533,6 +4593,7 @@ export default function Home() {
             Array.isArray(saved.sourceInsights) ? serializeSourceInsights(saved.sourceInsights as SourceInsight[]) : "",
             restoredPlan,
             restoredLoop,
+            parseCanonicalSkillIR(saved.files as Record<string, string>) || undefined,
           );
           setFiles(restoredFiles);
           if ((saved.generationLoop as Partial<GenerationLoopState> | undefined)?.status === "passed") {
@@ -4798,7 +4859,7 @@ export default function Home() {
       || blocker === "产物评分器被绑定到没有真实文件产物的用例"
     ));
     if (!compilerFixable) return;
-    const normalizedFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, capabilityPlan, loopPlan);
+    const normalizedFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, capabilityPlan, loopPlan, parseCanonicalSkillIR(files) || undefined);
     const changed = Object.keys({ ...files, ...normalizedFiles }).some((path) => files[path] !== normalizedFiles[path]);
     if (!changed) return;
     const normalizedAudit = auditSkillFiles(normalizedFiles, demoAnswers);
@@ -5407,6 +5468,7 @@ export default function Home() {
         answers: interviewEvidence,
         capabilityPlan,
         loopPlan,
+        skillIR: parseCanonicalSkillIR(files),
         skill: files,
         evaluation: target,
         dimension: target.label,
@@ -5447,6 +5509,7 @@ export default function Home() {
         answers: interviewEvidence,
         capabilityPlan,
         loopPlan,
+        skillIR: parseCanonicalSkillIR(files),
         skill: files,
         evaluation: before,
         dimension: before.label,
@@ -5455,8 +5518,21 @@ export default function Home() {
         rejectedHistory,
       });
       const applied = applyOptimizationEdits(files, optimized);
-      if (!applied.changedPaths.length) throw new Error("AI 没有生成有效的文件修改");
-      const optimizedFiles = finalizeSkillFiles(applied.files, idea, demoAnswers, sourceInsightText, capabilityPlan, loopPlan);
+      const canonicalCandidate = applyCanonicalCandidate({
+        currentFiles: files,
+        rawMutations: optimized.canonicalMutations,
+        implementationFiles: {
+          ...optimized.implementationFiles,
+          ...Object.fromEntries(applied.changedPaths.map((path) => [path, applied.files[path]])),
+        },
+        idea,
+        answers: demoAnswers,
+        sourceEvidence: sourceInsightText,
+        capabilityPlan,
+        loopPlan,
+      });
+      if (!canonicalCandidate.materialDiff) throw new Error("候选修改在 Canonical Projection 后没有语义或实现变化，已停止无效评测");
+      const optimizedFiles = canonicalCandidate.files;
       const allPaths = new Set([...Object.keys(files), ...Object.keys(optimizedFiles)]);
       const changedFiles = Array.from(allPaths).filter((path) => files[path] !== optimizedFiles[path]);
       if (!changedFiles.length) throw new Error("所选方案没有产生可验证的文件变化");
@@ -5964,7 +6040,8 @@ export default function Home() {
       )));
       rounds += 1;
       if (Object.keys(replacements).length) {
-        currentFiles = finalizeSkillFiles({ ...currentFiles, ...replacements }, idea, demoAnswers, sourceInsightText, generationPlan, loopPlan);
+        const mergedFiles = { ...currentFiles, ...replacements };
+        currentFiles = finalizeSkillFiles(mergedFiles, idea, demoAnswers, sourceInsightText, generationPlan, loopPlan, parseCanonicalSkillIR(mergedFiles) || undefined);
       }
       showLocalBusy("修复结果已返回，正在重新执行同一组确定性检查");
       validation = await validateBundle(currentFiles);
@@ -5984,7 +6061,39 @@ export default function Home() {
 
   function collectP1ContractState(files: Record<string, string>, answers: Record<string, string>, generationPlan: CapabilityPlan, validation: BundleStaticValidation) {
     const audit = auditSkillFiles(files, answers);
-    const closure = auditCapabilityClosure(files, generationPlan.items);
+    const canonicalIR = parseCanonicalSkillIR(files);
+    const closureCapabilities: CapabilityItem[] = canonicalIR?.capabilities.map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      name: item.name,
+      path: item.implementation.path,
+      layer: item.implementation.layer,
+      requirement: item.requirement,
+      purpose: item.purpose,
+      reason: item.necessity.reason,
+      status: item.implementation.status,
+      input: item.input,
+      output: item.output,
+      fallback: item.fallback,
+      routingCondition: item.routingCondition,
+      deterministicAdvantage: item.necessity.deterministicNeed ? "确定性实现可重复验证" : "由运行契约控制",
+      evaluationCriteria: item.evidenceRequirements,
+      scope: item.scope,
+      activationCondition: item.activationCondition,
+      affects: item.affects,
+      mustNotAffect: item.mustNotAffect,
+      connection: item.connection,
+      enabled: item.necessity.decision !== "exclude",
+      necessity: {
+        successLift: item.necessity.successLift,
+        bareModelReliable: item.necessity.bareModelReliable,
+        deterministicNeed: item.necessity.deterministicNeed,
+        realResourceAvailable: item.necessity.realResourceAvailable,
+        externalDependency: item.necessity.externalDependency,
+        decision: item.necessity.decision,
+      },
+    })) || generationPlan.items;
+    const closure = auditCapabilityClosure(files, closureCapabilities);
     const crossArtifact = auditCrossArtifactConsistency(files);
     const issues: PipelineIssue[] = [
       ...bundleIssuesToPipelineIssues(validation.issues.filter((issue) => issue.priority === "P1")),
@@ -6024,15 +6133,15 @@ export default function Home() {
       setBuildLoop((current) => ({ ...current, status: "repairing", phase: "bundle", rounds, issues: blockers.slice(0, 8) }));
       setGenerationLoop((current) => ({ ...current, status: "running", phase: "static", stopReason: `P1 Contract Gate 第 ${rounds + 1}/${BUILD_REPAIR_MAX_ROUNDS} 轮：修复契约矛盾、闭环和跨文件语义` }));
       reportClientGenerationLoopEvent("generation_loop_phase", { phase: "contract-repair", round: rounds + 1, blockers, reason: `P1 Contract Gate 发现 ${state.issues.length} 项契约阻断` });
-      let repairedResult: { updatedFiles?: Record<string, unknown> } = {};
+      let repairedResult: CanonicalRepairResponse = {};
       try {
-        repairedResult = await callAI<{ updatedFiles?: Record<string, unknown> }>("repair", {
+        repairedResult = await callAI<CanonicalRepairResponse>("repair", {
           idea,
           sourceText: input.sourceText,
           answers: input.answers,
           capabilityPlan: input.generationPlan,
           loopPlan,
-          skillIR: input.skillIR,
+          skillIR: parseCanonicalSkillIR(currentFiles) || input.skillIR,
           skill: currentFiles,
           evaluation: {
             priority: "P1",
@@ -6049,13 +6158,28 @@ export default function Home() {
         if (rounds >= BUILD_REPAIR_MAX_ROUNDS) break;
         continue;
       }
-      const replacements = Object.fromEntries(Object.entries(repairedResult.updatedFiles || {}).filter((entry): entry is [string, string] => (
-        isSafeSkillFilePath(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1].trim())
-      )));
       rounds += 1;
-      if (!Object.keys(replacements).length) break;
-      const nextFiles = finalizeSkillFiles({ ...currentFiles, ...replacements }, idea, input.answers, input.sourceText, input.generationPlan, loopPlan);
-      if (!Object.keys({ ...currentFiles, ...nextFiles }).some((path) => currentFiles[path] !== nextFiles[path])) break;
+      let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate>;
+      try {
+        canonicalCandidate = applyCanonicalCandidate({
+          currentFiles,
+          rawMutations: repairedResult.canonicalMutations,
+          implementationFiles: repairedResult.implementationFiles,
+          idea,
+          answers: input.answers,
+          sourceEvidence: input.sourceText,
+          capabilityPlan: input.generationPlan,
+          loopPlan,
+        });
+      } catch (error) {
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason: error instanceof Error ? error.message : "CanonicalMutation 无法应用" });
+        continue;
+      }
+      if (!canonicalCandidate.materialDiff) {
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason: "CanonicalMutation 经投影后没有产生语义变化，已在 Eval 前拒绝" });
+        continue;
+      }
+      const nextFiles = canonicalCandidate.files;
       const staticRepair = await runP0StaticRepairLoop(nextFiles, input.generationPlan);
       nestedP0Rounds += staticRepair.rounds;
       currentFiles = staticRepair.files;
@@ -6066,7 +6190,7 @@ export default function Home() {
         phase: "contract-repair",
         round: rounds,
         accepted: validation.executionReady && nextSignature !== signature,
-        updatedPaths: Object.keys(replacements),
+        updatedPaths: [...canonicalCandidate.changedTargets, ...canonicalCandidate.implementationPaths],
         reason: validation.executionReady ? `P1 契约问题由 ${blockers.length} 项降至 ${state.issues.length} 项` : "修复引入 P0，已转回 Execution Gate",
       });
       if (!validation.executionReady || !state.issues.length) break;
@@ -6115,17 +6239,21 @@ export default function Home() {
       const evalVersion = String((JSON.parse(initialFiles["evals/evals.json"] || "{}") as { version?: unknown }).version || "");
       const evalHasRepresentativeFixture = /本用例携带的代表性输入材料如下/.test(initialFiles["evals/evals.json"] || "");
       if (evalVersion !== "2.7" || Boolean(evaluationAnswers.__previewInput?.trim()) !== evalHasRepresentativeFixture) {
+        const migratedEvalBank = createSpecificEvals(deriveSkillIdentity(idea, evaluationAnswers).name, idea, evaluationAnswers, loopPlan, generationPlan);
+        const existingIR = parseCanonicalSkillIR(initialFiles);
         compilerInputFiles = finalizeSkillFiles({
           ...initialFiles,
-          "evals/evals.json": createSpecificEvals(deriveSkillIdentity(idea, evaluationAnswers).name, idea, evaluationAnswers, loopPlan, generationPlan),
-        }, idea, evaluationAnswers, contextBundle, generationPlan, loopPlan);
+          "evals/evals.json": migratedEvalBank,
+        }, idea, evaluationAnswers, contextBundle, generationPlan, loopPlan, existingIR ? bindSkillIREvals(existingIR, migratedEvalBank) : undefined);
         reportClientGenerationLoopEvent("generation_loop_phase", { phase: "eval-contract-migration", reason: `评测契约 ${evalVersion || "legacy"} → 2.7：优先复用真实 Demo 输入，并为可确定补齐的关键决策生成隔离分支 fixture；没有核心 fixture 时只验证最小输入请求` });
       }
     } catch {
+      const migratedEvalBank = createSpecificEvals(deriveSkillIdentity(idea, evaluationAnswers).name, idea, evaluationAnswers, loopPlan, generationPlan);
+      const existingIR = parseCanonicalSkillIR(initialFiles);
       compilerInputFiles = finalizeSkillFiles({
         ...initialFiles,
-        "evals/evals.json": createSpecificEvals(deriveSkillIdentity(idea, evaluationAnswers).name, idea, evaluationAnswers, loopPlan, generationPlan),
-      }, idea, evaluationAnswers, contextBundle, generationPlan, loopPlan);
+        "evals/evals.json": migratedEvalBank,
+      }, idea, evaluationAnswers, contextBundle, generationPlan, loopPlan, existingIR ? bindSkillIREvals(existingIR, migratedEvalBank) : undefined);
     }
     const initialStaticRepair = await runP0StaticRepairLoop(compilerInputFiles, generationPlan);
     let optimizerSkillIR: unknown = {};
@@ -6189,10 +6317,12 @@ export default function Home() {
     const requiredCapabilityIds = harnessVerifiableCapabilityIds(generationPlan);
     let heldOutCoverage = heldOutCapabilityCoverage(evalBank, requiredCapabilityIds);
     if (heldOutCoverage.missing.length) {
+      const migratedEvalBank = createSpecificEvals(deriveSkillIdentity(idea, evaluationAnswers).name, idea, evaluationAnswers, loopPlan, generationPlan);
+      const existingIR = parseCanonicalSkillIR(bestFiles);
       bestFiles = finalizeSkillFiles({
         ...bestFiles,
-        "evals/evals.json": createSpecificEvals(deriveSkillIdentity(idea, evaluationAnswers).name, idea, evaluationAnswers, loopPlan, generationPlan),
-      }, idea, evaluationAnswers, contextBundle, generationPlan, loopPlan);
+        "evals/evals.json": migratedEvalBank,
+      }, idea, evaluationAnswers, contextBundle, generationPlan, loopPlan, existingIR ? bindSkillIREvals(existingIR, migratedEvalBank) : undefined);
       fullEvalBank = parseAndSplitEvalCases(bestFiles["evals/evals.json"] || "");
       evalBank = harnessRunnableEvalBank(fullEvalBank, generationPlan);
       heldOutCoverage = heldOutCapabilityCoverage(evalBank, requiredCapabilityIds);
@@ -6430,7 +6560,7 @@ export default function Home() {
           budget: DEFAULT_MUTATION_BUDGET,
           requiredDecisionIds,
         });
-        if (validation.valid && constrainedPlan.operations.length) {
+        if (validation.valid && (constrainedPlan.operations.length || constrainedPlan.canonicalMutations.length)) {
           try {
             preparedPatch = applyPatchPlan(bestFiles, constrainedPlan);
           } catch (error) {
@@ -6460,29 +6590,51 @@ export default function Home() {
         break;
       }
       const applied = preparedPatch;
-      if (!applied.changedPaths.length) {
-        stopReason = "候选修改没有落到真实文件，已保留当前最佳版本";
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "patch", round, accepted: false, reason: stopReason });
-        break;
+      let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate>;
+      try {
+        canonicalCandidate = applyCanonicalCandidate({
+          currentFiles: bestFiles,
+          rawMutations: patchPlan.canonicalMutations,
+          implementationFiles: Object.fromEntries(applied.changedPaths.map((path) => [path, applied.files[path]])),
+          idea,
+          answers: evaluationAnswers,
+          sourceEvidence: sourceInsightText,
+          capabilityPlan: generationPlan,
+          loopPlan,
+        });
+      } catch (error) {
+        rejectedPatches += 1;
+        const reason = error instanceof Error ? error.message : "CanonicalMutation 无法应用";
+        rejectedHistory.push({ round, reason, files: applied.changedPaths });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "canonical-mutation", round, accepted: false, updatedPaths: applied.changedPaths, reason });
+        continue;
       }
-      const candidateFiles = finalizeSkillFiles(applied.files, idea, evaluationAnswers, sourceInsightText, generationPlan, loopPlan);
+      if (!canonicalCandidate.materialDiff) {
+        rejectedPatches += 1;
+        const reason = "Patch was erased by canonical projection：语义 digest 与 implementation bytes 均未变化，已在 Eval 前拒绝";
+        rejectedHistory.push({ round, reason, files: applied.changedPaths });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "canonical-mutation", round, accepted: false, updatedPaths: applied.changedPaths, reason });
+        continue;
+      }
+      const candidateFiles = canonicalCandidate.files;
+      const candidateChangedPaths = [...new Set([...canonicalCandidate.changedTargets, ...applied.changedPaths])];
       const candidateBundleValidation = await validateBundle(candidateFiles);
       if (!candidateBundleValidation.executionReady) {
         rejectedPatches += 1;
         const reason = `候选版本产生 P0 执行阻断，已在语义与 Eval 前自动回滚：${candidateBundleValidation.issues.filter((issue) => issue.priority === "P0").map((issue) => issue.message).join("；")}`;
-        rejectedHistory.push({ round, reason, files: applied.changedPaths });
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "static-regression", round, accepted: false, updatedPaths: applied.changedPaths, reason });
+        rejectedHistory.push({ round, reason, files: [...canonicalCandidate.changedTargets, ...applied.changedPaths] });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "static-regression", round, accepted: false, updatedPaths: [...canonicalCandidate.changedTargets, ...applied.changedPaths], reason });
         continue;
       }
-      const candidateClosure = auditCapabilityClosure(candidateFiles, generationPlan.items);
+      const candidateClosure = collectP1ContractState(candidateFiles, evaluationAnswers, generationPlan, candidateBundleValidation).closure;
       const candidateAudit = auditSkillFiles(candidateFiles, evaluationAnswers);
       const candidateCrossArtifact = auditCrossArtifactConsistency(candidateFiles);
       const candidateStaticPolicy = optimizationPolicyFor([...makeContractIssues(candidateAudit.blockers), ...candidateCrossArtifact.issues]);
       if (candidateStaticPolicy.priority === "P0") {
         rejectedPatches += 1;
         const reason = `候选版本产生 P0，已在语义评测前回滚：${candidateStaticPolicy.selected.map((item) => item.evidence).join("；")}`;
-        rejectedHistory.push({ round, reason, files: applied.changedPaths });
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "static-regression", round, accepted: false, updatedPaths: applied.changedPaths, reason });
+        rejectedHistory.push({ round, reason, files: candidateChangedPaths });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "static-regression", round, accepted: false, updatedPaths: candidateChangedPaths, reason });
         continue;
       }
 
@@ -6496,8 +6648,8 @@ export default function Home() {
         candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 1 });
       } catch {
         rejectedPatches += 1;
-        rejectedHistory.push({ round, reason: "候选版本未完成全部诊断任务或独立保留任务", files: applied.changedPaths });
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: false, updatedPaths: applied.changedPaths, reason: "候选证据不完整" });
+        rejectedHistory.push({ round, reason: "候选版本未完成全部诊断任务或独立保留任务", files: candidateChangedPaths });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: false, updatedPaths: candidateChangedPaths, reason: "候选证据不完整" });
         continue;
       }
       const candidateEvidence = candidateHarness.evidence;
@@ -6527,7 +6679,7 @@ export default function Home() {
           candidateScore: summarizeGenerationEvidence(candidateEvidence).score,
           reasons: [reason],
           regressions: [],
-          changedFiles: applied.changedPaths,
+          changedFiles: candidateChangedPaths,
           evidence: candidateEvidence,
           consumedDecisionIds: patchPlan.consumedDecisionIds,
         });
@@ -6535,13 +6687,13 @@ export default function Home() {
         rejectedHistory.push({
           round,
           reason,
-          files: applied.changedPaths,
+          files: candidateChangedPaths,
           decisionId: recorded.entry.id,
           evidenceDigest: recorded.entry.evidenceDigest,
           textualFeedback: candidateEvidence.textualFeedback,
           failedCases: candidateEvidence.failedCases,
         });
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "diagnose", round, accepted: false, updatedPaths: applied.changedPaths, reason: "候选语义检查不完整" });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "diagnose", round, accepted: false, updatedPaths: candidateChangedPaths, reason: "候选语义检查不完整" });
         continue;
       }
       const candidatePipelineIssues = includeHeldOutFailureEvidence(collectPipelineIssues(candidateSemantic, candidateClosure, candidateCrossArtifact, candidateAudit, candidateBundleValidation), candidateEvidence);
@@ -6561,7 +6713,7 @@ export default function Home() {
       gate.accepted = gate.reasons.length === 0;
       const newFiles = applied.changedPaths.filter((path) => !(path in bestFiles)).length;
       const tokenDelta = Object.values(candidateFiles).join("\n").length - Object.values(bestFiles).join("\n").length;
-      const utility = candidateUtility({ qualityGain: gate.scoreDelta, regressionCount: gate.regressions.length + Math.max(0, candidateCrossArtifact.issues.length - bestCrossArtifact.issues.length), changedFiles: applied.changedPaths.length, newFiles, tokenDelta });
+      const utility = candidateUtility({ qualityGain: gate.scoreDelta, regressionCount: gate.regressions.length + Math.max(0, candidateCrossArtifact.issues.length - bestCrossArtifact.issues.length), changedFiles: candidateChangedPaths.length, newFiles, tokenDelta });
       if (!gate.accepted || utility <= 0) {
         rejectedPatches += 1;
         const reason = [...gate.reasons, ...gate.regressions, ...(utility <= 0 ? [`综合效用 ${utility} 未覆盖回归、复杂度和 token 成本`] : [])].join("；");
@@ -6579,7 +6731,7 @@ export default function Home() {
           candidateScore: candidateMetrics.score,
           reasons: gate.reasons.length ? gate.reasons : [reason],
           regressions: [...gate.regressions, ...(utility <= 0 ? [`综合效用 ${utility} 未覆盖修改成本`] : [])],
-          changedFiles: applied.changedPaths,
+          changedFiles: candidateChangedPaths,
           evidence: candidateEvidence,
           consumedDecisionIds: patchPlan.consumedDecisionIds,
         });
@@ -6587,13 +6739,13 @@ export default function Home() {
         rejectedHistory.push({
           round,
           reason,
-          files: applied.changedPaths,
+          files: candidateChangedPaths,
           decisionId: recorded.entry.id,
           evidenceDigest: recorded.entry.evidenceDigest,
           textualFeedback: candidateEvidence.textualFeedback,
           failedCases: candidateEvidence.failedCases,
         });
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: false, updatedPaths: applied.changedPaths, reason, utility });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: false, updatedPaths: candidateChangedPaths, reason, utility });
         continue;
       }
 
@@ -6601,7 +6753,7 @@ export default function Home() {
       try {
         acceptedBaselineBlind = await runBlindHarnessComparison(baselineHarness, candidateHarness);
       } catch {
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "compare", round, accepted: true, updatedPaths: applied.changedPaths, reason: "候选相对当前最佳已通过；无 Skill 基线复核暂时不可用，保留上一轮基线证据" });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "compare", round, accepted: true, updatedPaths: candidateChangedPaths, reason: "候选相对当前最佳已通过；无 Skill 基线复核暂时不可用，保留上一轮基线证据" });
       }
       const acceptedDecision = recordGenerationDecision({
         round,
@@ -6616,7 +6768,7 @@ export default function Home() {
         candidateScore: summarizeGenerationEvidence(candidateEvidence).score,
         reasons: [`独立保留任务提升 ${gate.scoreDelta} 分`, `综合效用 ${utility}`],
         regressions: gate.regressions,
-        changedFiles: applied.changedPaths,
+        changedFiles: candidateChangedPaths,
         evidence: candidateEvidence,
         consumedDecisionIds: patchPlan.consumedDecisionIds,
       });
@@ -6633,7 +6785,7 @@ export default function Home() {
       trainingEvidence = candidateTrainingEvidence;
       bestMetrics = summarizeGenerationEvidence(bestEvidence);
       acceptedPatches += 1;
-      reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: true, updatedPaths: applied.changedPaths, beforeCount: bestMetrics.score - gate.scoreDelta, afterCount: bestMetrics.score, reason: `独立保留任务提升 ${gate.scoreDelta} 分；综合效用 ${utility}`, utility });
+      reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: true, updatedPaths: candidateChangedPaths, beforeCount: bestMetrics.score - gate.scoreDelta, afterCount: bestMetrics.score, reason: `独立保留任务提升 ${gate.scoreDelta} 分；综合效用 ${utility}`, utility });
       setFiles(bestFiles);
       const criticalIssues = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
       if (generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: criticalIssues })) {
@@ -6645,7 +6797,22 @@ export default function Home() {
 
     setBusyPhaseIndex(9);
     showLocalBusy("正在删除重复声明和不可达内容；任何质量退化都会自动保留原版");
-    const pruneResult = pruneBundleDeterministically(bestFiles);
+    const rawPruneResult = pruneBundleDeterministically(bestFiles);
+    const projectedPrunedFiles = finalizeSkillFiles(
+      rawPruneResult.files,
+      idea,
+      evaluationAnswers,
+      contextBundle,
+      generationPlan,
+      loopPlan,
+      parseCanonicalSkillIR(bestFiles) || undefined,
+    );
+    const projectedPrunePaths = Object.keys({ ...bestFiles, ...projectedPrunedFiles }).filter((path) => bestFiles[path] !== projectedPrunedFiles[path]);
+    const pruneResult = {
+      files: projectedPrunedFiles,
+      changedPaths: projectedPrunePaths,
+      deletedPaths: rawPruneResult.deletedPaths.filter((path) => !(path in projectedPrunedFiles)),
+    };
     if (pruneResult.changedPaths.length) {
       setGenerationLoop((current) => ({ ...current, phase: "validate", stopReason: "精简冗余：正在验证删减候选，不会直接覆盖当前最佳版本" }));
       const prunedFiles = pruneResult.files;
@@ -7048,7 +7215,7 @@ export default function Home() {
     setAiGenerationIssue("");
     try {
       const generationPlan = ensureTaskCapabilities(capabilityPlan, idea, demoAnswers);
-      const reconciledFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, generationPlan, loopPlan);
+      const reconciledFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, generationPlan, loopPlan, parseCanonicalSkillIR(files) || undefined);
       setCapabilityPlan(generationPlan);
       const result = await runOptimizationLoop(reconciledFiles, generationPlan);
       const nextAudit = auditSkillFiles(result.files, demoAnswers);
@@ -7353,7 +7520,7 @@ export default function Home() {
     try {
       const repairPlan = ensureTaskCapabilities(capabilityPlan, idea, demoAnswers);
       setCapabilityPlan(repairPlan);
-      let repairedFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, repairPlan, loopPlan);
+      let repairedFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, repairPlan, loopPlan, parseCanonicalSkillIR(files) || undefined);
       let repairedAudit = auditSkillFiles(repairedFiles, demoAnswers);
       let repairRounds = 0;
       let repairSummary = "确定性编译器已重建不合格评测并统一用户确认的内容权限。";
@@ -7402,9 +7569,9 @@ export default function Home() {
         setBusyPhaseIndex(round === 1 ? 1 : 2);
         setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "repairing", phase: "bundle", rounds: repairRounds, issues: roundBlockers });
 
-        let result: { updatedFiles?: Record<string, unknown>; summary?: string; resolved?: unknown };
+        let result: CanonicalRepairResponse;
         try {
-          result = await callAI<{ updatedFiles?: Record<string, unknown>; summary?: string; resolved?: unknown }>("repair", {
+          result = await callAI<CanonicalRepairResponse>("repair", {
             idea,
             sourceText: contextBundle,
             answers: interviewEvidence,
@@ -7420,7 +7587,7 @@ export default function Home() {
               files: repairedFiles,
             }),
             skill: repairedFiles,
-            evaluation: { blockers: roundBlockers, warnings: repairedAudit.warnings },
+            evaluation: { priority: "P1", category: "P1_CONTRACT_BLOCKER", repairRoute: "semantic-contract", blockers: roundBlockers, warnings: repairedAudit.warnings },
           });
         } catch (error) {
           requestFailure = error instanceof Error ? error.message : "模型修复请求没有完成";
@@ -7434,22 +7601,41 @@ export default function Home() {
           break;
         }
 
-        const replacements = Object.fromEntries(Object.entries(result.updatedFiles || {}).filter((entry): entry is [string, string] => (
-          isSafeSkillFilePath(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1].trim())
-        )));
-        const updatedPaths = Object.keys(replacements);
-        if (!updatedPaths.length) {
+        let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate>;
+        try {
+          canonicalCandidate = applyCanonicalCandidate({
+            currentFiles: repairedFiles,
+            rawMutations: result.canonicalMutations,
+            implementationFiles: result.implementationFiles,
+            idea,
+            answers: demoAnswers,
+            sourceEvidence: sourceInsightText,
+            capabilityPlan: repairPlan,
+            loopPlan,
+          });
+        } catch (error) {
           reportClientRepairEvent("repair_gate_stalled", {
             round,
             beforeCount: roundBlockers.length,
             afterCount: roundBlockers.length,
             blockers: roundBlockers,
-            reason: "模型没有返回可应用的完整文件",
+            reason: error instanceof Error ? error.message : "CanonicalMutation 无法应用",
+          });
+          break;
+        }
+        const updatedPaths = [...canonicalCandidate.changedTargets, ...canonicalCandidate.implementationPaths];
+        if (!canonicalCandidate.materialDiff) {
+          reportClientRepairEvent("repair_gate_stalled", {
+            round,
+            beforeCount: roundBlockers.length,
+            afterCount: roundBlockers.length,
+            blockers: roundBlockers,
+            reason: "修复在 Canonical Projection 后没有产生语义或实现变化",
           });
           break;
         }
 
-        const nextFiles = finalizeSkillFiles({ ...repairedFiles, ...replacements }, idea, demoAnswers, sourceInsightText, repairPlan, loopPlan);
+        const nextFiles = canonicalCandidate.files;
         const nextAudit = auditSkillFiles(nextFiles, demoAnswers);
         const gateDiff = compareGateBlockers(roundBlockers, nextAudit.blockers);
         const accepted = nextAudit.blockers.length === 0 || gateDiff.improvedWithoutRegression;
@@ -7599,29 +7785,43 @@ export default function Home() {
       );
       setBusyPhaseIndex(1);
       let candidateFiles: Record<string, string> | null = null;
+      let candidateTargets: string[] = [];
       let modelSummary = "";
       let verificationIssue = "";
       for (let attempt = 0; attempt < 2; attempt += 1) {
-        const optimized = await callAI<{ updatedFiles?: Record<string, unknown>; summary?: string }>("personalize", {
+        const workingFiles = candidateFiles || baselineFiles;
+        const workingIR = parseCanonicalSkillIR(workingFiles);
+        if (!workingIR) throw new Error("当前 Skill 缺少可变更的 Canonical SkillIR");
+        const optimized = await callAI<CanonicalRepairResponse>("personalize", {
           idea,
           sourceText: contextBundle,
           answers: interviewEvidence,
           capabilityPlan: effectiveCapabilityPlan,
           loopPlan,
-          skill: candidateFiles || baselineFiles,
+          skillIR: workingIR,
+          skill: workingFiles,
           demo: skillDemo,
           feedback,
           verificationIssue,
           rejectedHistory: previousDecisionFeedback,
         });
-        const replacements = Object.fromEntries(Object.entries(optimized.updatedFiles || {}).filter((entry): entry is [string, string] => (
-          isSafeSkillFilePath(entry[0]) && typeof entry[1] === "string" && entry[1].trim().length > 0
-        )));
-        if (!Object.keys(replacements).length) {
-          verificationIssue = "没有返回任何可应用的完整文件；必须把每条用户建议写进会影响运行行为的文件。";
+        const deterministicFeedbackMutations = attempt === 0 ? feedbackRequirementMutations(workingIR, feedback) : [];
+        const canonicalCandidate = applyCanonicalCandidate({
+          currentFiles: workingFiles,
+          rawMutations: [...deterministicFeedbackMutations, ...normalizeCanonicalMutations(optimized.canonicalMutations)],
+          implementationFiles: optimized.implementationFiles,
+          idea,
+          answers: demoAnswers,
+          sourceEvidence: sourceInsightText,
+          capabilityPlan: effectiveCapabilityPlan,
+          loopPlan,
+        });
+        if (!canonicalCandidate.materialDiff) {
+          verificationIssue = "候选在 Canonical Projection 后没有产生可验证变化；必须修改 Requirement、Task、Input、Output、Capability、Constraint 或 Eval Source。";
           continue;
         }
-        candidateFiles = finalizeSkillFiles({ ...(candidateFiles || baselineFiles), ...replacements }, idea, demoAnswers, sourceInsightText, effectiveCapabilityPlan, loopPlan);
+        candidateFiles = canonicalCandidate.files;
+        candidateTargets = [...new Set([...candidateTargets, ...canonicalCandidate.changedTargets, ...canonicalCandidate.implementationPaths])];
         if (typeof optimized.summary === "string" && optimized.summary.trim()) modelSummary = optimized.summary.trim().slice(0, 600);
         const uncovered = feedback.filter((item) => !feedbackAppearsInRuntimeFiles(candidateFiles!, item));
         reportClientPersonalizationCheck({
@@ -7630,13 +7830,13 @@ export default function Home() {
           feedbackCount: feedback.length,
           uncoveredCount: uncovered.length,
           accepted: uncovered.length === 0,
-          updatedPaths: Object.keys(replacements),
+          updatedPaths: candidateTargets,
         });
         if (!uncovered.length) break;
         verificationIssue = `上一版仍没有把这些要求落实到运行规则：${uncovered.join("；")}。不要只改总结或评测说明；请修改对应输入、工作流分支、输出字段或验收规则。`;
       }
       if (!candidateFiles) throw new Error("AI 没有生成能回应这些反馈的 Skill 修改");
-      const updatedFiles = applyConfirmedPersonalizationFeedback(candidateFiles, feedback);
+      const updatedFiles = candidateFiles;
       const changedFiles = Object.keys(updatedFiles).filter((path) => updatedFiles[path] !== baselineFiles[path]);
       if (!changedFiles.length) throw new Error("这一轮没有产生可验证的 Skill 变化");
 

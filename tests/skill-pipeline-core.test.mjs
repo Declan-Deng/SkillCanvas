@@ -111,11 +111,12 @@ test("planner must stay inside impact and mutation budgets", () => {
     impact: {
       scope: "conditional",
       affectedCapabilities: ["host-image-generation"],
-      affectedArtifacts: ["evals/evals.json"],
+      affectedArtifacts: ["input.update:input-query"],
       mustNotAffect: ["default-output-contract"],
       regressionFamilies: ["capability", "integration"],
     },
-    operations: [{ action: "edit", path: "evals/evals.json", find: "bad", replacement: "good" }],
+    canonicalMutations: [{ type: "input.update", inputId: "input-query", changes: { required: false } }],
+    operations: [],
   });
   assert.ok(plan);
   const files = { "SKILL.md": "stable", "evals/evals.json": "bad" };
@@ -126,7 +127,8 @@ test("planner must stay inside impact and mutation budgets", () => {
     capabilities: [{ id: "host-image-generation", kind: "builtin-tool", scope: "conditional", mustNotAffect: ["default-output-contract"] }],
   });
   assert.equal(validation.valid, true);
-  assert.equal(applyPatchPlan(files, plan).files["evals/evals.json"], "good");
+  assert.equal(plan.canonicalMutations[0].type, "input.update");
+  assert.deepEqual(applyPatchPlan(files, plan).files, files);
 
   const invalid = validatePatchPlan({
     plan: { ...plan, impact: { ...plan.impact, scope: "global" } },
@@ -151,20 +153,21 @@ test("invalid planner output is safely narrowed before asking the user to retry"
       operations: ["evals/capability-manifest.json", "SKILL.md", "references/a.md", "references/b.md", "references/c.md"].map((path) => ({ action: "edit", path, find: "x", replacement: "y" })),
     },
   });
-  assert.equal(constrained.operations.length, 3);
+  assert.equal(constrained.operations.length, 0);
   assert.equal(constrained.operations.some((item) => item.path === "evals/capability-manifest.json"), false);
-  assert.deepEqual(constrained.operations.map((item) => item.path), ["SKILL.md", "references/a.md", "references/b.md"]);
+  assert.deepEqual(constrained.operations.map((item) => item.path), []);
 });
 
-test("planner must acknowledge decision-ledger feedback before a repeated patch can execute", () => {
+test("planner must acknowledge decision-ledger feedback before a repeated canonical mutation can execute", () => {
   const files = { "SKILL.md": "old behavior" };
   const issue = { id: "shared-gap", priority: "P1", type: "WORKFLOW_GAP", source: "semantic", evidence: "missing route", files: ["SKILL.md"] };
   const missing = normalizePatchPlan({
     strategy: "repair_implementation",
     issueIds: [issue.id],
     consumedDecisionIds: [],
-    impact: { scope: "global", affectedArtifacts: ["SKILL.md"], regressionFamilies: ["capability"] },
-    operations: [{ action: "edit", path: "SKILL.md", find: "old behavior", replacement: "new behavior" }],
+    impact: { scope: "global", affectedArtifacts: ["requirement.update:req-1"], regressionFamilies: ["capability"] },
+    canonicalMutations: [{ type: "requirement.update", requirementId: "req-1", changes: { statement: "new behavior" } }],
+    operations: [],
   });
   assert.ok(missing);
   assert.equal(validatePatchPlan({ plan: missing, issues: [issue], files, capabilities: [], requiredDecisionIds: ["rollback-1"] }).valid, false);

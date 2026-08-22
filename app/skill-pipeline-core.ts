@@ -1,3 +1,5 @@
+import { COMPILER_OWNED_SEMANTIC_PATHS, isImplementationBytePath, normalizeCanonicalMutations, type CanonicalMutation } from "./canonical-mutations.ts";
+
 export type IssuePriority = "P0" | "P1" | "P2" | "P3";
 export type CapabilityScope = "global" | "task-specific" | "conditional" | "optional";
 export type EvalFamily = "trigger" | "capability" | "grounding" | "integration";
@@ -62,6 +64,7 @@ export type PatchPlan = {
   issueIds: string[];
   consumedDecisionIds: string[];
   operations: PatchOperation[];
+  canonicalMutations: CanonicalMutation[];
   protectedArtifacts: string[];
   impact: PatchImpact;
 };
@@ -385,14 +388,16 @@ export function normalizePatchPlan(value: unknown): PatchPlan | null {
     if (!action || !path) return [];
     return [{ action, path, find: typeof item.find === "string" ? item.find : undefined, replacement: typeof item.replacement === "string" ? item.replacement : undefined, content: typeof item.content === "string" ? item.content : undefined }];
   });
+  const canonicalMutations = normalizeCanonicalMutations(raw.canonicalMutations);
   const scope = ["global", "task-specific", "conditional", "optional"].includes(String(rawImpact.scope)) ? rawImpact.scope as CapabilityScope : "task-specific";
   const regressionFamilies = list(rawImpact.regressionFamilies).filter((item): item is EvalFamily => ["trigger", "capability", "grounding", "integration"].includes(item));
-  if (!operations.length || !list(raw.issueIds).length) return null;
+  if ((!operations.length && !canonicalMutations.length) || !list(raw.issueIds).length) return null;
   return {
     strategy: typeof raw.strategy === "string" ? raw.strategy.trim().slice(0, 160) : "targeted_patch",
     issueIds: list(raw.issueIds, 12),
     consumedDecisionIds: list(raw.consumedDecisionIds, 12),
     operations,
+    canonicalMutations,
     protectedArtifacts: list(raw.protectedArtifacts, 12),
     impact: {
       scope,
@@ -423,10 +428,14 @@ export function validatePatchPlan(input: {
   if (selectedPriority && input.plan.issueIds.some((id) => input.issues.find((item) => item.id === id)?.priority !== selectedPriority)) errors.push(`当前只能修复最高优先级 ${selectedPriority}`);
   const changedPaths = new Set(input.plan.operations.map((item) => item.path));
   const newFiles = input.plan.operations.filter((item) => item.action === "create" && !(item.path in input.files));
+  const newCapabilities = input.plan.canonicalMutations.filter((item) => item.type === "capability.add");
   if (changedPaths.size > budget.maxArtifactsModified) errors.push(`本轮修改 ${changedPaths.size} 个文件，超过 ${budget.maxArtifactsModified} 个文件的预算`);
   if (newFiles.length > budget.maxNewFiles) errors.push(`本轮新增 ${newFiles.length} 个文件，超过 ${budget.maxNewFiles} 个文件的预算`);
+  if (newCapabilities.length > budget.maxNewCapabilities) errors.push(`本轮新增 ${newCapabilities.length} 项能力，超过 ${budget.maxNewCapabilities} 项能力的预算`);
   if (input.plan.operations.some((item) => input.plan.protectedArtifacts.includes(item.path))) errors.push("Patch Plan 试图修改受保护文件");
   input.plan.operations.forEach((operation) => {
+    if (COMPILER_OWNED_SEMANTIC_PATHS.has(operation.path)) errors.push(`语义文件 ${operation.path} 必须通过 CanonicalMutation 修改，不能使用 FilePatch`);
+    if (!isImplementationBytePath(operation.path)) errors.push(`FilePatch 只允许修改 scripts/* 或 assets/* implementation bytes：${operation.path}`);
     if (operation.action === "edit" && (!(operation.path in input.files) || !operation.find || typeof operation.replacement !== "string")) errors.push(`编辑操作 ${operation.path} 缺少唯一查找文本或目标文件`);
     if (operation.action === "create" && (!operation.content?.trim() || operation.path in input.files)) errors.push(`创建操作 ${operation.path} 不是一个新且非空的文件`);
     if (operation.action === "delete" && (operation.path === "SKILL.md" || !(operation.path in input.files))) errors.push(`删除操作 ${operation.path} 不安全或文件不存在`);
@@ -455,6 +464,7 @@ export function constrainPatchPlan(input: {
   const selectedPaths = new Set<string>();
   let newFileCount = 0;
   const operations = input.plan.operations.filter((operation) => {
+    if (!isImplementationBytePath(operation.path)) return false;
     if (protectedSet.has(operation.path)) return false;
     const isNewFile = operation.action === "create" && !(operation.path in input.files);
     if (!selectedPaths.has(operation.path) && selectedPaths.size >= budget.maxArtifactsModified) return false;
@@ -467,6 +477,7 @@ export function constrainPatchPlan(input: {
     ...input.plan,
     protectedArtifacts,
     operations,
+    canonicalMutations: input.plan.canonicalMutations,
     impact: {
       ...input.plan.impact,
       affectedArtifacts: input.plan.impact.affectedArtifacts.filter((path) => selectedPaths.has(path)),
