@@ -57,6 +57,8 @@ export function buildGateOutcome(input: {
 
 export function optimizationGateOutcome(input: {
   status: "idle" | "running" | "passed" | "stable" | "attention";
+  caseCount: number;
+  repeatsPerCase: number;
   benchmarkRuns: number;
   passRate: number;
   lift: number;
@@ -69,7 +71,7 @@ export function optimizationGateOutcome(input: {
     gateId: "optimization-held-out",
     kind: "comparative-validation",
     verdict: input.status === "running" ? "running" : satisfied ? "satisfied" : input.status === "idle" ? "not-run" : "unsatisfied",
-    evidenceStrength: input.benchmarkRuns > 1 ? "repeated-held-out" : input.benchmarkRuns === 1 ? "single-observation" : "none",
+    evidenceStrength: input.repeatsPerCase > 1 ? "repeated-held-out" : input.benchmarkRuns > 0 ? "single-observation" : "none",
     reproducibility: input.benchmarkRuns ? "stochastic" : "not-applicable",
     evaluator: "model-context-isolated",
     claim: satisfied
@@ -77,10 +79,12 @@ export function optimizationGateOutcome(input: {
       : input.status === "stable"
         ? "冻结评测已完成；当前版本处于评测上限，没有候选证明额外提升"
         : "当前证据尚不能接受该候选",
-    sampleSize: input.benchmarkRuns,
+    sampleSize: input.caseCount,
     evidenceRefs: [
       input.contractDigest ? `contract:${input.contractDigest}` : "",
       input.benchmarkRuns ? `runs:${input.benchmarkRuns}` : "",
+      input.caseCount ? `cases:${input.caseCount}` : "",
+      input.repeatsPerCase ? `repeats-per-case:${input.repeatsPerCase}` : "",
       input.benchmarkRuns ? `pass-rate:${input.passRate}` : "",
       input.benchmarkRuns ? `skill-lift:${input.lift >= 0 ? "+" : ""}${input.lift}` : "",
       input.blindWinner !== "not-run" ? `blind-winner:${input.blindWinner}` : "",

@@ -131,6 +131,9 @@ test("separates execution and grading, enforces frozen assertions, and aggregate
   assert.ok(gradesOne && gradesTwo);
   const report = buildHarnessReport({ contract, configuration: "candidate", executions: [...runOne, ...runTwo], grades: [...gradesOne, ...gradesTwo] });
   assert.equal(report.benchmark.runs, 4);
+  assert.equal(report.benchmark.cases, 2);
+  assert.equal(report.benchmark.repeatsPerCase, 2);
+  assert.equal(report.benchmark.repeatScoreStddev, 7.1);
   assert.equal(report.benchmark.score.mean, 85);
   assert.ok(report.benchmark.score.stddev > 0);
   assert.equal(report.evidence.cases.every((item) => item.passed), true);
@@ -160,6 +163,18 @@ test("failed-case context reaches the optimizer without leaking held-out prompts
   assert.equal(report.evidence.failedCases[0].caseId, "core-1");
   assert.equal("inputPrompt" in report.evidence.failedCases[0], false);
   assert.match(report.evidence.failedCases[0].failureSummary, /岗位要求/);
+});
+
+test("recomputes absolute quality from dimensions instead of trusting a model total", () => {
+  const contract = freezeEvalContract(cases());
+  const executions = normalizeHarnessExecutions({ value: executionPayload(1), contract, configuration: "candidate", runIndex: 1, durationMs: 900 });
+  assert.ok(executions);
+  const payload = gradePayload(70);
+  payload.grades.forEach((grade) => { grade.score = 100; });
+  const grades = normalizeHarnessGrades({ value: payload, contract, executions });
+  assert.ok(grades);
+  assert.equal(grades[0].score, 70);
+  assert.equal(grades[1].score, 70);
 });
 
 test("resolved repeated-run failures remain variance evidence instead of current patch blockers", () => {

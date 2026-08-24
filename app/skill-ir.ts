@@ -1,4 +1,5 @@
 import {
+  confirmedAnswerEvidenceText,
   hasContentPermissionConflict,
   reconcileContentPermissionText,
   resolveContentPermission,
@@ -94,6 +95,7 @@ export type SkillIR = {
     source: "user" | "source" | "runtime";
     availableAtBuild: boolean;
     missingBehavior: string;
+    representations?: string[];
     resolution: {
       mode: "ask" | "infer-and-label" | "continue-without";
       authority: SkillIRProvenance;
@@ -406,10 +408,43 @@ function splitInputCandidates(value: string) {
   )).map((part) => part.trim()))).slice(0, 12);
 }
 
+function splitDeclaredInputCandidates(value: string) {
+  return unique(splitList(value).flatMap((item) => splitTopLevel(item, new Set(["，", ","])).flatMap((part) => (
+    /[（(【[]/.test(part)
+      ? [part]
+      : part.split(/\s*(?:并且|并|以及|与|和)\s*/i)
+  )).map((part) => part.trim()).filter(Boolean))).slice(0, 12);
+}
+
 export type DerivedTaskInput = SkillIR["inputs"][number];
 
 const VAGUE_INPUT_STRATEGY = /^(?:通常|一般|有时|可能)?(?:只有)?(?:一句|简单想法)|会提供(?:文件|链接|资料|案例)|需要\s*AI\s*(?:主动)?追问|有固定模板或数据|不确定|请\s*AI\s*判断/i;
 const INPUT_REPRESENTATION_OPTION = /^(?:纯文本(?:粘贴)?|文本粘贴|(?:上传|提供)?\s*(?:PDF|Word|DOCX|Excel|XLSX|CSV|JSON|Markdown|MD|图片|截图|扫描件|音频|录音|视频|文档|文件)|结构化(?:表格|文件|数据)(?:（[^）]+）|\([^)]*\))?|网页链接|URL|邮件|聊天记录)(?:（[^）]+）|\([^)]*\))?$/i;
+
+function inputRepresentations(value: string) {
+  const representations: string[] = [];
+  const add = (name: string) => { if (!representations.includes(name)) representations.push(name); };
+  if (/粘贴|纯文本|文本/i.test(value)) add("text");
+  if (/\bPDF\b/i.test(value)) add("pdf");
+  if (/\b(?:Word|DOCX?)\b/i.test(value)) add("word");
+  if (/\b(?:Excel|XLSX?|CSV)\b|结构化表格/i.test(value)) add("structured-file");
+  if (/\b(?:URL|https?)\b|网页链接/i.test(value)) add("url");
+  if (/图片|截图|扫描件/i.test(value)) add("image");
+  if (/音频|录音/i.test(value)) add("audio");
+  if (/视频/i.test(value)) add("video");
+  if (/上传|文件|文档/i.test(value) && !representations.some((item) => ["pdf", "word", "structured-file", "image", "audio", "video"].includes(item))) add("file");
+  return representations;
+}
+
+function semanticInputName(value: string) {
+  const cleaned = value
+    .replace(/^(?:直接|通过|请)?\s*(?:粘贴|上传|提供|输入|附上|导入|发送|给出)\s*/i, "")
+    .replace(/\b(?:PDF|Word|DOCX?|Excel|XLSX?|CSV|JSON|Markdown|MD)\b/gi, "")
+    .replace(/(?:纯文本|文本|文件|文档|网页链接|URL)$/i, "")
+    .replace(/^[\s、，,；;]+|[\s、，,；;]+$/g, "")
+    .trim();
+  return cleaned.length >= 2 ? cleaned : value.trim();
+}
 
 const INPUT_CONCEPTS: Array<{ concept: string; name: string; pattern: RegExp; requiredByDefault: boolean }> = [
   { concept: "task-specification", name: "目标、任务要求或验收标准", pattern: /目标任务|任务说明|需求说明|目标对象|目标结果|验收要求|验收标准|任务规范|target specification|task requirements?|acceptance criteria/i, requiredByDefault: true },
@@ -509,27 +544,32 @@ export function deriveTaskInputContract(input: {
   const answers = input.answers || {};
   const description = descriptionFromSkill(input.skillText || "");
   const capabilityInputs = input.capabilityInputs || [];
-  const explicitInputPolicy = Object.values(answers).join("\n");
+  const explicitInputPolicy = confirmedAnswerEvidenceText(answers);
   const declaredInputEvidence = `${input.idea}\n${answers.inputs || ""}\n${answers.workflow || ""}\n${answers["output-format"] || ""}\n${description}`;
   const semanticInputEvidence = `${input.idea}\n${answers.workflow || ""}\n${answers["output-format"] || ""}\n${description}`;
-  const specs = new Map<string, { name: string; required: boolean }>();
-  const add = (concept: string, name: string, required: boolean) => {
+  const specs = new Map<string, { name: string; required: boolean; representations: string[] }>();
+  const add = (concept: string, name: string, required: boolean, representations: string[] = []) => {
     const overlapping = [...specs.entries()].find(([, existing]) => inputNamesOverlap(existing.name, name));
     const targetConcept = overlapping?.[0] || concept;
     const existing = specs.get(targetConcept);
-    specs.set(targetConcept, { name: existing?.name || name, required: Boolean(existing?.required || required) });
+    specs.set(targetConcept, {
+      name: existing?.name || name,
+      required: Boolean(existing?.required || required),
+      representations: unique([...(existing?.representations || []), ...representations]),
+    });
   };
 
-  const declaredAnswerInputs = splitList(answers.inputs || "").filter((value) => value.length >= 2 && !VAGUE_INPUT_STRATEGY.test(value));
+  const declaredAnswerInputs = splitDeclaredInputCandidates(answers.inputs || "").filter((value) => value.length >= 2 && !VAGUE_INPUT_STRATEGY.test(value));
   const representationOptions = declaredAnswerInputs.filter((value) => INPUT_REPRESENTATION_OPTION.test(value));
   const mergeRepresentationOptions = representationOptions.length >= 2 && representationOptions.length === declaredAnswerInputs.length;
   if (mergeRepresentationOptions) {
-    add("source-material", `完成任务所依据的原始材料（支持：${representationOptions.join("、")}，任选一种）`, true);
+    add("source-material", "完成任务所依据的原始材料", true, representationOptions.flatMap(inputRepresentations));
   }
   declaredAnswerInputs.filter((value) => !mergeRepresentationOptions || !representationOptions.includes(value)).forEach((value) => {
-    const concept = conceptForInput(value);
+    const semanticName = semanticInputName(value);
+    const concept = conceptForInput(semanticName);
     const definition = INPUT_CONCEPTS.find((item) => item.concept === concept);
-    add(concept, definition?.name || value, true);
+    add(concept, definition?.name || semanticName, true, inputRepresentations(value));
   });
 
   capabilityInputs.flatMap(splitInputCandidates).filter((value) => {
@@ -567,6 +607,7 @@ export function deriveTaskInputContract(input: {
       source: "user" as const,
       availableAtBuild: false,
       missingBehavior: missingBehaviorForInput(spec.name, resolution, missingBehavior),
+      representations: spec.representations,
       resolution,
     };
   });
@@ -645,7 +686,12 @@ function fallbackNecessity(item: CapabilityInput): SkillIRCapability["necessity"
   const externalDependency = item.kind === "builtin-tool" || item.kind === "mcp";
   const bareModelReliable = item.kind === "llm" || (item.kind === "reference" && !/官方|规范|标准|来源|schema|api|字段|术语|反例|失败模式/i.test(`${item.requirement} ${item.purpose}`));
   const realResourceAvailable = item.kind === "llm" || item.kind === "eval" || ["generate", "use-provided"].includes(item.status);
-  const decision = item.kind === "llm" || item.kind === "eval" || deterministicNeed || (externalDependency && item.status !== "not-needed") || (!bareModelReliable && realResourceAvailable)
+  const concreteRoute = Boolean((item.activationCondition || item.routingCondition || "").trim())
+    && !/^(?:当前任务需要该能力时|需要时|when needed|if needed)$/i.test((item.activationCondition || item.routingCondition || "").trim());
+  const observable = Boolean(item.evaluationCriteria?.some((criterion) => criterion.trim()));
+  const honestFallback = Boolean(item.fallback?.trim()) && !/^(?:无|没有|none|n\/?a|not applicable)$/i.test(item.fallback.trim());
+  const externalReady = externalDependency && item.status !== "not-needed" && concreteRoute && observable && honestFallback;
+  const decision = item.kind === "llm" || item.kind === "eval" || deterministicNeed || externalReady || (!bareModelReliable && realResourceAvailable && concreteRoute)
     ? "include" as const
     : "exclude" as const;
   return {
@@ -657,6 +703,75 @@ function fallbackNecessity(item: CapabilityInput): SkillIRCapability["necessity"
     decision,
     reason: item.reason || item.deterministicAdvantage || "由资源必要性分析决定",
   };
+}
+
+function normalizedOutcomePhrase(value: string) {
+  return value.replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "").toLowerCase();
+}
+
+function isDeclaredUncontrollable(value: string, uncontrollable: string[]) {
+  if (/外部(?:结果|反馈|决定)?|不可控|无法保证|不能保证|不受.{0,12}控制|由.{0,16}(?:决定|审批|确认)|uncontrollable|external outcome|cannot guarantee/i.test(value)) return true;
+  const candidate = normalizedOutcomePhrase(value);
+  return uncontrollable.some((boundary) => {
+    const normalizedBoundary = normalizedOutcomePhrase(boundary);
+    return candidate.length >= 4 && normalizedBoundary.length >= 4
+      && (candidate.includes(normalizedBoundary) || normalizedBoundary.includes(candidate));
+  });
+}
+
+/** Completion evidence must be observable within the Skill run. Business goals
+ * may mention external results, but those results remain boundaries rather than
+ * success assertions or release gates. */
+export function normalizeOutcomeModel(outcome: PlanInput["outcomeModel"]): PlanInput["outcomeModel"] {
+  const declaredUncontrollable = unique(outcome.uncontrollableOutcomes || []);
+  const externalFromControllable = unique(outcome.controllableOutcomes || []).filter((item) => isDeclaredUncontrollable(item, declaredUncontrollable));
+  const externalFromIndicators = unique(outcome.observableIndicators || []).filter((item) => isDeclaredUncontrollable(item, declaredUncontrollable));
+  const uncontrollableOutcomes = unique([...declaredUncontrollable, ...externalFromControllable, ...externalFromIndicators]);
+  return {
+    ultimateGoal: outcome.ultimateGoal.trim(),
+    controllableOutcomes: unique(outcome.controllableOutcomes || []).filter((item) => !isDeclaredUncontrollable(item, uncontrollableOutcomes)),
+    uncontrollableOutcomes,
+    observableIndicators: unique(outcome.observableIndicators || []).filter((item) => !isDeclaredUncontrollable(item, uncontrollableOutcomes)),
+  };
+}
+
+function hasConcreteCapabilityBranch(item: SkillIRCapability) {
+  const route = `${item.activationCondition} ${item.routingCondition}`.trim();
+  return Boolean(route) && !/^(?:(?:当前任务需要该能力时|需要时|when needed|if needed)\s*){1,2}$/i.test(route);
+}
+
+function hasHonestCapabilityFallback(item: SkillIRCapability) {
+  return Boolean(item.fallback.trim()) && !/^(?:无|没有|none|n\/?a|not applicable)[。.!！]?$/i.test(item.fallback.trim());
+}
+
+function capabilityPassesNecessityGate(item: SkillIRCapability, domainEvidence: unknown[]) {
+  if (item.kind === "llm" || item.kind === "eval") return true;
+  if (item.necessity.decision === "exclude" || !hasConcreteCapabilityBranch(item) || !hasHonestCapabilityFallback(item)) return false;
+  if (!item.evidenceRequirements.length) return false;
+  if (item.kind === "script") return item.necessity.deterministicNeed && item.necessity.realResourceAvailable;
+  if (item.kind === "reference") {
+    const isUserSource = /source-evidence\.md$/i.test(item.implementation.path) && item.implementation.status === "use-provided";
+    return isUserSource || (domainEvidence.length > 0 && item.necessity.realResourceAvailable && item.necessity.successLift !== "low");
+  }
+  if (item.kind === "asset") return item.necessity.realResourceAvailable && item.necessity.successLift !== "low";
+  if (item.kind === "builtin-tool" || item.kind === "mcp") {
+    return item.necessity.externalDependency && item.implementation.status !== "not-needed";
+  }
+  return false;
+}
+
+function runtimeContractText(value: string, fallback: string) {
+  if (/(?:\d+\s*条\s*(?:权威规则|有条件实践|较弱证据|参考洞察).*){2,}|\d+\s*条\s*较弱证据|(?:生成阶段|已从|编译).{0,24}\d+\s*(?:个|条|份).{0,16}(?:网页来源|来源|候选)/i.test(value)) {
+    return /知识|规则|实践|证据|来源/i.test(value)
+      ? "使用与当前条件匹配且达到证据门槛的专业知识"
+      : fallback;
+  }
+  const cleaned = value
+    .replace(/(?:使用|采用|从|基于)\s*\d+\s*(?:条|个|份)\s*(?:权威规则|有条件实践|较弱证据|参考洞察|网页来源|来源|候选)(?:[、，,；;和与以及\s]*\d+\s*(?:条|个|份)\s*(?:权威规则|有条件实践|较弱证据|参考洞察|网页来源|来源|候选))*/gi, "使用与当前条件匹配且达到证据门槛的专业知识")
+    .replace(/生成阶段已从\s*\d+\s*个网页来源编译出/gi, "已有来源支持的")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  return cleaned || fallback;
 }
 
 function artifactProducer(item: SkillIRCapability) {
@@ -698,6 +813,7 @@ export function compileSkillIR(input: {
   description?: string;
 }): SkillIR {
   const contentPermission = resolveContentPermission(input.answers);
+  const domainEvidence = Array.isArray(input.domainEvidence) ? input.domainEvidence : [];
   const capabilities: SkillIRCapability[] = input.plan.items.filter(activeCapability).map((item) => {
     const necessity = item.necessity ? { ...item.necessity, reason: item.reason || item.deterministicAdvantage || "由资源必要性分析决定" } : fallbackNecessity(item);
     const scope = item.scope || (item.kind === "llm" ? "task-specific" : /当|如果|若|when|if/i.test(item.activationCondition || item.routingCondition) ? "conditional" : "task-specific");
@@ -707,11 +823,13 @@ export function compileSkillIR(input: {
       name: item.name,
       scope,
       activationCondition: item.activationCondition || item.routingCondition || (scope === "global" ? "每次运行" : "当前任务需要该能力时"),
-      requirement: item.requirement,
-      purpose: item.purpose,
+      requirement: runtimeContractText(item.requirement, "完成当前能力负责的任务要求"),
+      purpose: runtimeContractText(item.purpose, "产生可观察且可验证的任务结果"),
       input: item.input,
       output: item.output,
-      fallback: item.fallback,
+      fallback: /^(?:无|没有|none|n\/?a|not applicable)[。.!！]?$/i.test(item.fallback?.trim() || "")
+        ? "停止依赖该能力的步骤，说明当前缺少的条件，并继续不依赖它的可逆部分"
+        : item.fallback,
       routingCondition: item.routingCondition,
       affects: unique(item.affects || (item.kind === "eval" ? ["evaluation"] : ["runtime-workflow"])),
       mustNotAffect: unique(item.mustNotAffect || []),
@@ -722,7 +840,7 @@ export function compileSkillIR(input: {
       evalCaseIds: [],
       ...(item.connection ? { connection: item.connection } : {}),
     };
-  });
+  }).filter((item) => capabilityPassesNecessityGate(item, domainEvidence));
   const capabilityIds = new Set(capabilities.map((item) => item.id));
   const semanticCapabilityIds = capabilities.filter((item) => item.kind === "llm").map((item) => item.id);
   const seenRequirements = new Set<string>();
@@ -773,26 +891,31 @@ export function compileSkillIR(input: {
     hard: true,
     mappedCapabilityIds: semanticCapabilityIds,
   }];
+  const outcomeModel = normalizeOutcomeModel(input.plan.outcomeModel);
+  const completionChecks = unique([
+    ...outcomeModel.observableIndicators,
+    ...input.plan.outputContract.validation,
+  ]).filter((item) => !isDeclaredUncontrollable(item, outcomeModel.uncontrollableOutcomes));
   const ir: SkillIR = {
     schemaVersion: "1.0",
     compiler: "skillcanvas",
     identity: {
       skillName: input.skillName,
       intent: input.idea.trim(),
-      stableGoal: input.loop.goal || input.plan.outcomeModel.ultimateGoal || input.idea.trim(),
-      summary: input.plan.summary,
+      stableGoal: input.loop.goal || outcomeModel.ultimateGoal || input.idea.trim(),
+      summary: runtimeContractText(input.plan.summary, "按已确认目标执行任务并交付可检查结果"),
       description: input.description?.trim() || `用于用户要求“${input.idea.trim()}”或提供相关材料继续处理时；执行已确认工作流并交付可检查结果。`,
     },
-    outcomeModel: input.plan.outcomeModel,
+    outcomeModel,
     tasks: [{
       id: taskId,
-      intent: input.plan.outcomeModel.ultimateGoal || input.idea.trim(),
+      intent: outcomeModel.ultimateGoal || input.idea.trim(),
       activationCondition: trigger,
       requiredInputIds: inputs.filter((item) => item.required).map((item) => item.id),
       optionalInputIds: inputs.filter((item) => !item.required).map((item) => item.id),
       outputIds: [outputId],
       capabilityIds: capabilities.filter((item) => item.kind !== "eval").map((item) => item.id),
-      successIndicators: unique(input.plan.outcomeModel.observableIndicators),
+      successIndicators: outcomeModel.observableIndicators,
     }],
     requirements,
     capabilities,
@@ -853,7 +976,7 @@ export function compileSkillIR(input: {
       cases: [],
     },
     informationDependencies: input.informationDependencies || [],
-    domainEvidence: input.domainEvidence || [],
+    domainEvidence,
     scopeProvenance: input.scopeProvenance || [],
     validationVisibility: {
       internal: ["schema", "static", "dependency", "security", "runtime-smoke", "semantic-closure", "behavior", "regression"],
@@ -878,10 +1001,7 @@ export function compileSkillIR(input: {
         output: item.output,
         fallback: item.fallback,
       })),
-      completionChecks: unique([
-        ...input.plan.outcomeModel.observableIndicators,
-        ...input.plan.outputContract.validation,
-      ]),
+      completionChecks,
     },
     controlModel: {
       mode: input.loop.mode,
@@ -902,6 +1022,12 @@ function yamlString(value: string) {
 
 function markdownList(values: string[], empty: string) {
   return values.length ? values.map((value) => `- ${value}`).join("\n") : `- ${empty}`;
+}
+
+function projectedInputName(input: SkillIR["inputs"][number]) {
+  return input.representations?.length
+    ? `${input.name}（支持：${input.representations.join("、")}）`
+    : input.name;
 }
 
 export function projectCapabilityRuntimeOperation(capability: SkillIRCapability, outputs: SkillIR["outputs"] = []) {
@@ -968,7 +1094,7 @@ export function projectSkillMarkdown(ir: SkillIR) {
     `## Goal\n\n${ir.identity.stableGoal}\n\nControllable outcomes:\n${markdownList(ir.outcomeModel.controllableOutcomes, ir.identity.intent)}\n\nDo not promise uncontrollable outcomes:\n${markdownList(ir.outcomeModel.uncontrollableOutcomes, "No additional external outcome is claimed.")}`,
     `## When to use\n\n${markdownList(ir.tasks.map((item) => item.activationCondition), ir.identity.intent)}`,
     `## Instruction priority\n\n${priority.map((item, index) => `${index + 1}. ${item}`).join("\n")}`,
-    `## Inputs\n\n### Required\n\n${markdownList(requiredInputs.map((item) => item.name), "Current task request")}\n\n### Optional\n\n${markdownList(optionalInputs.map((item) => item.name), "No optional inputs")}`,
+    `## Inputs\n\n### Required\n\n${markdownList(requiredInputs.map(projectedInputName), "Current task request")}\n\n### Optional\n\n${markdownList(optionalInputs.map(projectedInputName), "No optional inputs")}`,
     `## Input resolution contract\n\n${markdownList(ir.inputs.map((item) => item.resolution
       ? `**${item.name}:** ${item.missingBehavior} (mode: \`${item.resolution.mode}\`; authority: \`${item.resolution.authority}\`)`
       : `**${item.name}:** INVALID — resolution contract is missing`), "Use only the current request")}`,

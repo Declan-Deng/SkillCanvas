@@ -9,6 +9,7 @@ import {
   deriveTaskInputContract,
   ensureSkillIREvalCoverage,
   ensureSkillSemanticClosure,
+  normalizeOutcomeModel,
   projectCapabilityManifest,
   projectCapabilityRuntimeOperation,
   projectEvalBank,
@@ -337,9 +338,95 @@ test("alternative input representations compile as one any-of source contract", 
   const required = inputs.filter((item) => item.required);
   assert.equal(required.length, 1);
   assert.equal(required[0].concept, "source-material");
-  assert.match(required[0].name, /任选一种/);
-  assert.match(required[0].name, /纯文本粘贴/);
-  assert.match(required[0].name, /Excel\/CSV/);
+  assert.deepEqual(required[0].representations, ["text", "structured-file"]);
+  assert.match(projectSkillMarkdown({ ...compile(), inputs, tasks: [{ ...compile().tasks[0], requiredInputIds: [required[0].id], optionalInputIds: [] }] }), /支持：text、structured-file/);
+});
+
+test("compound input declarations become atomic logical dependencies with separate representations", () => {
+  const inputs = deriveTaskInputContract({
+    idea: "根据目标规范转换现有材料",
+    answers: { inputs: "直接粘贴目标规范文本，并上传现有材料PDF" },
+  });
+  assert.equal(inputs.length, 2);
+  assert.equal(inputs.every((item) => item.required), true);
+  assert.deepEqual(inputs.map((item) => item.representations), [["text"], ["pdf"]]);
+  assert.ok(inputs.some((item) => /目标规范/.test(item.name)));
+  assert.ok(inputs.some((item) => item.concept === "source-material"));
+});
+
+test("uncontrollable outcomes never become runtime success or completion checks", () => {
+  const normalized = normalizeOutcomeModel({
+    ultimateGoal: "提高现实世界中的成功机会",
+    controllableOutcomes: ["交付可检查的结果", "外部平台最终采纳（不可控）"],
+    uncontrollableOutcomes: ["无法保证第三方采纳"],
+    observableIndicators: ["输出覆盖验收要求", "第三方最终采纳（外部结果）"],
+  });
+  assert.deepEqual(normalized.controllableOutcomes, ["交付可检查的结果"]);
+  assert.deepEqual(normalized.observableIndicators, ["输出覆盖验收要求"]);
+  assert.ok(normalized.uncontrollableOutcomes.some((item) => /第三方最终采纳/.test(item)));
+
+  const plan = fixturePlan();
+  plan.outcomeModel = normalized;
+  plan.outputContract.validation.push("第三方最终采纳（外部结果）");
+  const ir = compileSkillIR({
+    skillName: "generic-task",
+    idea: "完成一个可检查任务",
+    answers: {},
+    plan,
+    loop: { mode: "hybrid", goal: "提高成功机会", maxRounds: 3, stopConditions: ["完成"], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "完成一个可检查任务", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  });
+  assert.equal(ir.runtimeContract.completionChecks.some((item) => /第三方最终采纳/.test(item)), false);
+});
+
+test("capability necessity gate removes decorative resources without an executable branch", () => {
+  const plan = fixturePlan();
+  plan.items.splice(1, 0, {
+    id: "decorative-tool",
+    kind: "builtin-tool",
+    name: "Decorative tool",
+    path: "integrations/tool-contracts.json",
+    layer: "runtime",
+    requirement: "可能使用一个工具",
+    purpose: "让能力看起来更全面",
+    reason: "工具可能有帮助",
+    status: "use-provided",
+    input: "当前任务",
+    output: "工具结果",
+    fallback: "无",
+    routingCondition: "需要时",
+    activationCondition: "需要时",
+    deterministicAdvantage: "无",
+    evaluationCriteria: [],
+    enabled: true,
+  });
+  const ir = compileSkillIR({
+    skillName: "generic-task",
+    idea: "完成当前任务",
+    answers: {},
+    plan,
+    loop: { mode: "hybrid", goal: "完成任务", maxRounds: 3, stopConditions: ["完成"], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "完成当前任务", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  });
+  assert.equal(ir.capabilities.some((item) => item.id === "decorative-tool"), false);
+  assert.equal(ir.tasks[0].capabilityIds.includes("decorative-tool"), false);
+});
+
+test("runtime projection removes build telemetry while preserving evidence-aware behavior", () => {
+  const plan = fixturePlan();
+  plan.summary = "已从 12 个网页来源编译出专业知识";
+  plan.items[0].requirement = "使用 2 条权威规则、3 条有条件实践，并把 7 条较弱证据作为参考洞察";
+  const ir = compileSkillIR({
+    skillName: "generic-task",
+    idea: "完成当前任务",
+    answers: {},
+    plan,
+    loop: { mode: "hybrid", goal: "完成任务", maxRounds: 3, stopConditions: ["完成"], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "完成当前任务", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  });
+  const projected = projectSkillMarkdown(ir);
+  assert.doesNotMatch(projected, /12 个网页来源|2 条权威规则|3 条有条件实践|7 条较弱证据/);
+  assert.match(projected, /达到证据门槛的专业知识/);
 });
 
 test("a required task input never inherits a meaningless not-applicable missing policy", () => {

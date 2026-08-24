@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   buildInformationDependencies,
   buildRequirementProvenance,
+  confirmedAnswerEvidenceText,
   contentGroundingRubric,
   contentPolicyEvalExpectations,
   downgradeUngroundedHardConstraints,
@@ -13,6 +14,7 @@ import {
   hardNegativePrompts,
   reconcileContentPermissionText,
   realisticFailureFixtures,
+  normalizeAnswerEvidence,
   reconcileValidationVisibility,
   resolveContentPermission,
   semanticGateAudit,
@@ -172,6 +174,32 @@ test("requirements carry provenance and generator proposals stay soft", () => {
     hard: false,
     source: "generator capability proposal",
   });
+});
+
+test("preview fixtures and hydration state never become reusable requirements", () => {
+  const answers = {
+    inputs: "任务规范；原始材料",
+    "good-example": "先给结论再给依据",
+    __previewTask: "系统选择的预演任务",
+    __previewInput: "系统拼出的预演输入",
+    __previewFeedback: "以后先输出可用初稿",
+    __idea: "会话恢复用目标副本",
+  };
+  const normalized = normalizeAnswerEvidence(answers);
+  assert.equal(normalized.find((item) => item.key === "__previewTask")?.evidenceClass, "preview_fixture");
+  assert.equal(normalized.find((item) => item.key === "__idea")?.evidenceClass, "session_internal");
+  assert.equal(normalized.find((item) => item.key === "__previewFeedback")?.evidenceClass, "user_confirmed");
+  assert.doesNotMatch(confirmedAnswerEvidenceText(answers), /系统选择的预演任务|系统拼出的预演输入|会话恢复用目标副本/);
+  assert.match(confirmedAnswerEvidenceText(answers), /以后先输出可用初稿/);
+
+  const records = buildRequirementProvenance({
+    idea: "完成当前任务",
+    answers,
+    sourceEvidence: "",
+    capabilityRequirements: [],
+  });
+  assert.equal(records.some((item) => /previewTask|previewInput|__idea/.test(item.id)), false);
+  assert.equal(records.some((item) => item.source === "preview.confirmed-feedback"), true);
 });
 
 test("information dependencies only prohibit factual creation when the user explicitly asked for that restriction", () => {

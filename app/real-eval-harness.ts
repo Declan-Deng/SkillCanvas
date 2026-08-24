@@ -64,8 +64,13 @@ export type HarnessGrade = {
 export type HarnessBenchmark = {
   configuration: HarnessConfiguration;
   contractDigest: string;
+  /** Total graded executions across all cases and repeats. */
   runs: number;
   cases: number;
+  /** Number of independent executions of each frozen case. */
+  repeatsPerCase: number;
+  /** Mean within-case score deviation. Null means stability was not measured. */
+  repeatScoreStddev: number | null;
   score: { mean: number; stddev: number; min: number; max: number };
   passRate: number;
   meanDurationMs: number;
@@ -348,10 +353,13 @@ export function normalizeHarnessGrades(input: {
       }).slice(0, 6) : [],
       overall: clean(rawEvalFeedback.overall, 900),
     };
-    // A visually perfect score must never coexist with a failed frozen
-    // assertion. Keep the score useful for ranking while making the hard gate
-    // visible in every aggregate metric.
-    const score = passed ? clampScore(item.score) : Math.min(79, clampScore(item.score));
+    // Recompute the total locally from the five frozen dimensions. Trusting a
+    // model-authored overall score caused unrelated runs to cluster at an
+    // arbitrary anchor (commonly 85) even when their dimension evidence
+    // differed. A failed frozen assertion still caps the quality score because
+    // subjective strengths cannot compensate for a contract failure.
+    const dimensionScore = Math.round(mean(dimensions.map((dimension) => dimension.score)));
+    const score = passed ? dimensionScore : Math.min(79, dimensionScore);
     const failedAssertions = allAssertions.filter((assertion) => !assertion.passed);
     const failureReason = !triggerPassed
       ? `触发结果应为 ${contractCase.shouldTrigger ? "触发" : "不触发"}，实际相反`
@@ -411,11 +419,21 @@ export function buildHarnessReport(input: {
     };
   });
   const scoreStats = stats(input.grades.map((item) => item.score));
+  const repeatsPerCase = input.contract.cases.length
+    ? Math.max(0, Math.round(input.grades.length / input.contract.cases.length))
+    : 0;
+  const withinCaseStddevs = input.contract.cases.map((contractCase) =>
+    stats(input.grades.filter((item) => item.caseId === contractCase.id).map((item) => item.score)).stddev,
+  );
   const benchmark: HarnessBenchmark = {
     configuration: input.configuration,
     contractDigest: input.contract.digest,
     runs: input.grades.length,
     cases: input.contract.cases.length,
+    repeatsPerCase,
+    repeatScoreStddev: repeatsPerCase > 1
+      ? Math.round(mean(withinCaseStddevs) * 10) / 10
+      : null,
     score: scoreStats,
     passRate: input.grades.length ? Math.round((input.grades.filter((item) => item.passed).length / input.grades.length) * 100) : 0,
     meanDurationMs: Math.round(mean(input.executions.map((item) => item.durationMs))),

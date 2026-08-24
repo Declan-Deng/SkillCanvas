@@ -1,5 +1,14 @@
 export type RequirementProvenance = "user_explicit" | "user_example" | "source_grounded" | "domain_inferred" | "generator_default";
 
+export type AnswerEvidenceClass = "user_confirmed" | "user_example" | "preview_fixture" | "session_internal";
+
+export type NormalizedAnswerEvidence = {
+  key: string;
+  value: string;
+  evidenceClass: AnswerEvidenceClass;
+  requirementEligible: boolean;
+};
+
 export type ProvenanceRecord = {
   id: string;
   requirement: string;
@@ -143,6 +152,35 @@ function normalized(value: string) {
   return value.replace(/[\s`*_#>"'“”‘’：:，,。.!！?？；;、()（）[\]【】]/g, "").toLowerCase();
 }
 
+/** Keep interview decisions, examples, preview fixtures, and hydration state in
+ * separate evidence lanes. Preview output may help synthesize Eval fixtures,
+ * but it must never silently become a reusable user requirement. Explicit
+ * feedback about that preview remains a confirmed user decision. */
+export function normalizeAnswerEvidence(answers: Record<string, string>): NormalizedAnswerEvidence[] {
+  return Object.entries(answers).flatMap(([key, rawValue]) => {
+    const value = typeof rawValue === "string" ? rawValue.trim() : "";
+    if (!value) return [];
+    if (/^__preview(?:Task|Input)$/i.test(key)) {
+      return [{ key, value, evidenceClass: "preview_fixture" as const, requirementEligible: false }];
+    }
+    if (key === "__previewFeedback") {
+      return [{ key, value, evidenceClass: "user_confirmed" as const, requirementEligible: true }];
+    }
+    if (/^__/.test(key)) {
+      return [{ key, value, evidenceClass: "session_internal" as const, requirementEligible: false }];
+    }
+    const evidenceClass: AnswerEvidenceClass = /example|示例/i.test(key) ? "user_example" : "user_confirmed";
+    return [{ key, value, evidenceClass, requirementEligible: true }];
+  });
+}
+
+export function confirmedAnswerEvidenceText(answers: Record<string, string>) {
+  return normalizeAnswerEvidence(answers)
+    .filter((item) => item.requirementEligible)
+    .map((item) => item.value)
+    .join("\n");
+}
+
 function evidenceSupports(line: string, evidence: string) {
   const haystack = normalized(evidence);
   if (!haystack) return false;
@@ -181,14 +219,22 @@ export function buildRequirementProvenance(input: {
 }): ProvenanceRecord[] {
   const records: ProvenanceRecord[] = [];
   if (input.idea.trim()) records.push({ id: "goal", requirement: input.idea.trim(), provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" });
-  Object.entries(input.answers).filter(([, value]) => value?.trim()).forEach(([key, value]) => {
-    records.push({ id: `answer-${key}`, requirement: value.trim().slice(0, 400), provenance: /example|示例/i.test(key) ? "user_example" : "user_explicit", modality: "MUST", hard: true, source: `interview.${key}` });
+  normalizeAnswerEvidence(input.answers).filter((item) => item.requirementEligible).forEach((item) => {
+    const safeKey = item.key.replace(/^__/, "").replace(/[^a-z0-9_-]+/gi, "-") || "confirmed";
+    records.push({
+      id: `answer-${safeKey}`,
+      requirement: item.value.slice(0, 400),
+      provenance: item.evidenceClass === "user_example" ? "user_example" : "user_explicit",
+      modality: "MUST",
+      hard: true,
+      source: item.key === "__previewFeedback" ? "preview.confirmed-feedback" : `interview.${item.key}`,
+    });
   });
   if (input.sourceEvidence.trim()) records.push({ id: "uploaded-sources", requirement: "只把已解析资料中的可追溯内容当作来源证据", provenance: "source_grounded", modality: "MUST", hard: true, source: "uploaded source evidence" });
   input.capabilityRequirements.forEach((item, index) => {
     const requirement = item.requirement?.trim();
     if (!requirement) return;
-    const supported = evidenceSupports(requirement, `${input.idea}\n${Object.values(input.answers).join("\n")}\n${input.sourceEvidence}`);
+    const supported = evidenceSupports(requirement, `${input.idea}\n${confirmedAnswerEvidenceText(input.answers)}\n${input.sourceEvidence}`);
     records.push({
       id: `capability-${item.id || index + 1}`,
       requirement,

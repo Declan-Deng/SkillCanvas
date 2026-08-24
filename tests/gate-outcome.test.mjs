@@ -13,6 +13,8 @@ test("each stage exposes a different evidence contract instead of one generic pa
   const build = buildGateOutcome({ status: "passed", frozen: true, blockers: [], checks: ["json", "paths"] });
   const optimization = optimizationGateOutcome({
     status: "passed",
+    caseCount: 3,
+    repeatsPerCase: 2,
     benchmarkRuns: 6,
     passRate: 88,
     lift: 9,
@@ -27,10 +29,28 @@ test("each stage exposes a different evidence contract instead of one generic pa
   assert.equal(build.reproducibility, "deterministic");
   assert.equal(optimization.kind, "comparative-validation");
   assert.equal(optimization.evidenceStrength, "repeated-held-out");
+  assert.equal(optimization.sampleSize, 3);
   assert.equal(optimization.reproducibility, "stochastic");
   assert.equal(demo.kind, "execution-observation");
   assert.equal(demo.verdict, "observed");
   assert.notEqual(demo.verdict, build.verdict);
+});
+
+test("multiple cases are not mislabeled as repeated evidence", () => {
+  const optimization = optimizationGateOutcome({
+    status: "attention",
+    caseCount: 6,
+    repeatsPerCase: 1,
+    benchmarkRuns: 6,
+    passRate: 100,
+    lift: 0,
+    contractDigest: "single-run-contract",
+    blindWinner: "tie",
+    issues: [],
+  });
+  assert.equal(optimization.evidenceStrength, "single-observation");
+  assert.equal(optimization.sampleSize, 6);
+  assert.ok(optimization.evidenceRefs.includes("repeats-per-case:1"));
 });
 
 test("Demo quality is not capped to compensate for weak evidence", () => {
