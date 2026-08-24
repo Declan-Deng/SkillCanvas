@@ -55,6 +55,8 @@ export type HarnessGrade = {
   failureReason: string;
   dimensions: DimensionGrade[];
   assertions: AssertionGrade[];
+  claims: Array<{ claim: string; type: "factual" | "process" | "quality"; verified: boolean; evidence: string }>;
+  evalFeedback: { suggestions: Array<{ assertion?: string; reason: string }>; overall: string };
   textualFeedback: TextualGradientFeedback;
   failedCase?: Pick<FailedCaseEvidence, "caseId" | "failureSummary" | "observedEvidence">;
 };
@@ -83,6 +85,12 @@ export type BlindComparison = {
   winner: "A" | "B" | "tie";
   confidence: number;
   evidence: string;
+  qualityScores: { A: number; B: number } | null;
+  rubric: {
+    criteria: Array<{ id: string; label: string; kind: "content" | "structure" }>;
+    A: { criterionScores: Record<string, number>; criterionEvidence: Record<string, string>; overallScore: number; perfectScoreQualified: boolean; strengths: string[]; weaknesses: string[] };
+    B: { criterionScores: Record<string, number>; criterionEvidence: Record<string, string>; overallScore: number; perfectScoreQualified: boolean; strengths: string[]; weaknesses: string[] };
+  } | null;
   caseResults: Array<{ caseId: string; winner: "A" | "B" | "tie"; evidence: string }>;
 };
 
@@ -317,6 +325,29 @@ export function normalizeHarnessGrades(input: {
     const triggerPassed = execution.triggered === contractCase.shouldTrigger;
     const assertionsPassed = allAssertions.every((assertion) => assertion.passed);
     const passed = item.passed === true && triggerPassed && assertionsPassed;
+    const claims = Array.isArray(item.claims) ? item.claims.flatMap((claim) => {
+      if (!claim || typeof claim !== "object") return [];
+      const detail = claim as Record<string, unknown>;
+      const statement = clean(detail.claim, 500);
+      const type = ["factual", "process", "quality"].includes(String(detail.type))
+        ? detail.type as "factual" | "process" | "quality"
+        : "quality";
+      return statement ? [{ claim: statement, type, verified: detail.verified === true, evidence: clean(detail.evidence, 700) }] : [];
+    }).slice(0, 12) : [];
+    const rawEvalFeedback = item.evalFeedback && typeof item.evalFeedback === "object"
+      ? item.evalFeedback as Record<string, unknown>
+      : root.evalFeedback && typeof root.evalFeedback === "object"
+        ? root.evalFeedback as Record<string, unknown>
+        : {};
+    const evalFeedback = {
+      suggestions: Array.isArray(rawEvalFeedback.suggestions) ? rawEvalFeedback.suggestions.flatMap((suggestion) => {
+        if (!suggestion || typeof suggestion !== "object") return [];
+        const detail = suggestion as Record<string, unknown>;
+        const reason = clean(detail.reason, 700);
+        return reason ? [{ assertion: clean(detail.assertion, 400) || undefined, reason }] : [];
+      }).slice(0, 6) : [],
+      overall: clean(rawEvalFeedback.overall, 900),
+    };
     // A visually perfect score must never coexist with a failed frozen
     // assertion. Keep the score useful for ranking while making the hard gate
     // visible in every aggregate metric.
@@ -336,6 +367,8 @@ export function normalizeHarnessGrades(input: {
       failureReason,
       dimensions,
       assertions: allAssertions,
+      claims,
+      evalFeedback,
       textualFeedback,
       failedCase: failedCaseById.get(caseId),
     }];
@@ -395,6 +428,9 @@ export function buildHarnessReport(input: {
   const unresolvedFailurePatterns = cases
     .filter((item) => !item.passed && item.failureReason)
     .map((item) => item.failureReason);
+  const evalQualityPatterns = Array.from(new Set(input.grades.flatMap((grade) => grade.evalFeedback.suggestions.map((suggestion) =>
+    `评测区分度 · ${suggestion.assertion ? `${suggestion.assertion}：` : ""}${suggestion.reason}`,
+  )))).slice(0, 6);
   const gradientProblems = new Map<string, TextualGradientFeedback["criticalProblems"][number]>();
   const preserve = new Set<string>();
   const summaries: string[] = [];
@@ -437,7 +473,7 @@ export function buildHarnessReport(input: {
     grades: input.grades,
     evidence: {
       cases,
-      failurePatterns: Array.from(new Set(unresolvedFailurePatterns)).slice(0, 8),
+      failurePatterns: Array.from(new Set([...unresolvedFailurePatterns, ...evalQualityPatterns])).slice(0, 8),
       textualFeedback: {
         summary: summaries.join("；").slice(0, 1_200) || (failedCases.length ? `有 ${failedCases.length} 个冻结任务暴露出可复现差距。` : "当前批次没有发现需要反向传播的关键失败。"),
         criticalProblems,
@@ -473,8 +509,8 @@ export function anonymizeComparison(left: HarnessReport, right: HarnessReport) {
 export function normalizeBlindComparison(value: unknown, caseIds: string[]): BlindComparison | null {
   if (!value || typeof value !== "object") return null;
   const raw = value as Record<string, unknown>;
-  const winner = ["A", "B", "tie"].includes(String(raw.winner)) ? raw.winner as BlindComparison["winner"] : null;
-  if (!winner || !Array.isArray(raw.caseResults)) return null;
+  const reportedWinner = ["A", "B", "tie"].includes(String(raw.winner)) ? raw.winner as BlindComparison["winner"] : null;
+  if (!reportedWinner || !Array.isArray(raw.caseResults)) return null;
   const allowed = new Set(caseIds);
   const caseResults = raw.caseResults.flatMap((entry) => {
     if (!entry || typeof entry !== "object") return [];
@@ -484,5 +520,84 @@ export function normalizeBlindComparison(value: unknown, caseIds: string[]): Bli
     return allowed.has(caseId) && itemWinner ? [{ caseId, winner: itemWinner, evidence: clean(item.evidence, 500) }] : [];
   });
   if (caseResults.length !== allowed.size) return null;
-  return { winner, confidence: Math.max(0, Math.min(1, Number(raw.confidence) || 0)), evidence: clean(raw.evidence, 800), caseResults };
+  const rubricRaw = raw.rubric && typeof raw.rubric === "object" ? raw.rubric as Record<string, unknown> : null;
+  const confidence = Math.max(0, Math.min(1, Number(raw.confidence) || 0));
+  const criteria = Array.isArray(rubricRaw?.criteria) ? rubricRaw.criteria.flatMap((criterion) => {
+    if (!criterion || typeof criterion !== "object") return [];
+    const item = criterion as Record<string, unknown>;
+    const label = clean(item.label, 160);
+    const kind = item.kind === "structure" ? "structure" as const : "content" as const;
+    return label ? [{ id: clean(item.id, 80) || label, label, kind }] : [];
+  }).slice(0, 8) : [];
+  // A task-specific rubric needs enough independent axes to avoid a single
+  // vague "quality" judgment turning into an unearned perfect score.
+  if (criteria.length < 4) return null;
+  const side = (key: "A" | "B") => {
+    const value = rubricRaw?.[key];
+    if (!value || typeof value !== "object") return null;
+    const item = value as Record<string, unknown>;
+    const rawCriterionScores = item.criterionScores && typeof item.criterionScores === "object"
+      ? item.criterionScores as Record<string, unknown>
+      : null;
+    const rawCriterionEvidence = item.criterionEvidence && typeof item.criterionEvidence === "object"
+      ? item.criterionEvidence as Record<string, unknown>
+      : null;
+    if (!rawCriterionScores || !rawCriterionEvidence) return null;
+    const criterionScores: Record<string, number> = {};
+    const criterionEvidence: Record<string, string> = {};
+    for (const criterion of criteria) {
+      const score = Number(rawCriterionScores[criterion.id]);
+      const evidence = clean(rawCriterionEvidence[criterion.id], 500);
+      if (!Number.isFinite(score) || score < 1 || score > 5 || !evidence) return null;
+      // A score of 5 must point to at least one observable frozen case. If the
+      // explanation is generic, cap that axis at 4 instead of trusting praise.
+      const grounded = caseIds.some((caseId) => evidence.includes(caseId));
+      criterionScores[criterion.id] = score === 5 && !grounded ? 4 : score;
+      criterionEvidence[criterion.id] = evidence;
+    }
+    const strengths = Array.isArray(item.strengths) ? item.strengths.map((entry) => clean(entry, 300)).filter(Boolean).slice(0, 6) : [];
+    const weaknesses = Array.isArray(item.weaknesses) ? item.weaknesses.map((entry) => clean(entry, 300)).filter(Boolean).slice(0, 6) : [];
+    const scores = Object.values(criterionScores);
+    const unanimousCases = caseResults.every((result) => result.winner === key);
+    const allCriteriaDirectlyVerified = Object.values(criterionEvidence).every((evidence) => caseIds.some((caseId) => evidence.includes(caseId)));
+    const perfectScoreQualified = scores.every((score) => score === 5)
+      && weaknesses.length === 0
+      && caseIds.length >= 8
+      && unanimousCases
+      && allCriteriaDirectlyVerified
+      && confidence >= 0.95;
+    let overallScore = Math.round((scores.reduce((sum, score) => sum + score, 0) / scores.length) * 20);
+    // 100 means exhaustive proof, not "the judge liked both outputs". Small
+    // held-out samples and acknowledged weaknesses remain visibly non-perfect.
+    if (!perfectScoreQualified) overallScore = Math.min(overallScore, weaknesses.length ? 92 : caseIds.length < 6 ? 94 : 95);
+    return {
+      criterionScores,
+      criterionEvidence,
+      overallScore,
+      perfectScoreQualified,
+      strengths,
+      weaknesses,
+    };
+  };
+  const sideA = side("A");
+  const sideB = side("B");
+  const rubric = sideA && sideB ? { criteria, A: sideA, B: sideB } : null;
+  const qualityScores = rubric ? { A: rubric.A.overallScore, B: rubric.B.overallScore } : null;
+  const scoreDelta = qualityScores ? qualityScores.A - qualityScores.B : 0;
+  const aCaseWins = caseResults.filter((item) => item.winner === "A").length;
+  const bCaseWins = caseResults.filter((item) => item.winner === "B").length;
+  const winner: BlindComparison["winner"] = Math.abs(scoreDelta) >= 2
+    ? scoreDelta > 0 ? "A" : "B"
+    : aCaseWins !== bCaseWins
+      ? aCaseWins > bCaseWins ? "A" : "B"
+      : "tie";
+  const winnerDisagreed = winner !== reportedWinner;
+  return {
+    winner,
+    confidence: winnerDisagreed ? Math.min(confidence, 0.6) : confidence,
+    evidence: `${clean(raw.evidence, 700)}${winnerDisagreed ? "；本地逐项汇总与模型结论不一致，已按可复现分数与用例胜负校正。" : ""}`,
+    caseResults,
+    qualityScores,
+    rubric,
+  };
 }

@@ -266,7 +266,7 @@ export function generationGoalSatisfied(input: {
     && input.criticalSemanticIssues === 0
     && input.evidence.passRate >= 80
     && input.evidence.score >= 78
-    && (lift >= 3 || input.evidence.score >= 88);
+    && lift >= 3;
 }
 
 /** Distinguish a failed Optimization Gate from an exhausted comparison.

@@ -1,4 +1,9 @@
-import { hasContentPermissionConflict, resolveContentPermission } from "./evidence-gates.ts";
+import {
+  hasContentPermissionConflict,
+  reconcileContentPermissionText,
+  resolveContentPermission,
+  type ContentPermission,
+} from "./evidence-gates.ts";
 
 export type SkillIRProvenance = "user_explicit" | "user_example" | "source_grounded" | "domain_inferred" | "generator_default";
 export type SkillIRRuleType = "hard_constraint" | "heuristic" | "preference" | "proxy_metric";
@@ -182,6 +187,132 @@ export type SkillIR = {
     evalCaseIds: string[];
   }>;
 };
+
+function contentPermissionFromIR(ir: SkillIR): ContentPermission {
+  const stored = ir.controlModel?.contentPermission;
+  if (stored && typeof stored === "object") {
+    const permission = stored as Partial<ContentPermission>;
+    if (typeof permission.sourceText === "string"
+      && Array.isArray(permission.sourceKeys)
+      && typeof permission.allowCreativeExpansion === "boolean"
+      && typeof permission.allowFactualCreation === "boolean"
+      && typeof permission.explicitRestriction === "boolean") return permission as ContentPermission;
+  }
+  const answers = Object.fromEntries(ir.requirements
+    .filter((item) => item.provenance === "user_explicit")
+    .map((item) => [
+      item.source.startsWith("interview.") ? item.source.slice("interview.".length) : item.source === "initial user goal" ? "__idea" : item.id,
+      item.statement,
+    ]));
+  return resolveContentPermission(answers);
+}
+
+/** Store the owner's content-transformation authority once in Canonical IR
+ * and compile every runtime/eval projection against that same authority. */
+export function reconcileSkillIRContentPermission(ir: SkillIR, answers: Record<string, string>): SkillIR {
+  const permission = resolveContentPermission(answers);
+  const visit = <T,>(value: T): T => {
+    if (typeof value === "string") return reconcileContentPermissionText(value, permission) as T;
+    if (Array.isArray(value)) return value
+      .map((item) => visit(item))
+      .filter((item) => typeof item !== "string" || Boolean(item.trim())) as T;
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, visit(item)])) as T;
+    }
+    return value;
+  };
+  const reconciled = permission.explicitRestriction ? ir : visit(ir);
+  return {
+    ...reconciled,
+    controlModel: { ...reconciled.controlModel, contentPermission: permission },
+  };
+}
+
+/**
+ * Keep optional uploaded-source evidence aligned with the materialized bundle.
+ * Canonical projection must never retain a capability or resource edge to a
+ * file that was intentionally omitted (for example, when no source was
+ * uploaded). Otherwise a file-level repair is overwritten by the next
+ * projection and the P0 loop can never converge.
+ */
+export function reconcileSkillIRSourceEvidence(ir: SkillIR, available: boolean): SkillIR {
+  const path = "references/source-evidence.md";
+  const existingResource = ir.resourcePlan.resources.find((item) => item.path === path);
+  if (available) {
+    if (existingResource?.decision === "include") return ir;
+    const capabilityId = existingResource?.capabilityId
+      || ir.capabilities.find((item) => item.kind === "llm")?.id
+      || ir.capabilities[0]?.id
+      || "task-core";
+    return {
+      ...ir,
+      resourcePlan: {
+        ...ir.resourcePlan,
+        resources: [
+          ...ir.resourcePlan.resources.filter((item) => item.path !== path),
+          {
+            capabilityId,
+            kind: "reference",
+            path,
+            decision: "include",
+            reason: existingResource?.reason || "用户提供的范例或资料会改变运行时决策，必须从主工作流显式读取。",
+            consumerTaskIds: existingResource?.consumerTaskIds?.length ? existingResource.consumerTaskIds : ir.tasks.map((item) => item.id),
+          },
+        ],
+      },
+    };
+  }
+
+  const removedCapabilityIds = new Set(ir.capabilities
+    .filter((item) => item.implementation.path === path)
+    .map((item) => item.id));
+  const remainingCapabilities = ir.capabilities.filter((item) => !removedCapabilityIds.has(item.id));
+  const fallbackCapabilityId = remainingCapabilities.find((item) => item.kind === "llm")?.id || remainingCapabilities[0]?.id || "";
+  const keepCapabilityIds = (ids: string[]) => {
+    const kept = ids.filter((id) => !removedCapabilityIds.has(id));
+    return kept.length || !fallbackCapabilityId ? kept : [fallbackCapabilityId];
+  };
+  const removedCaseIds = new Set(ir.evaluationPlan.cases.flatMap((item) => {
+    const ids = Array.isArray(item.capability_ids) ? item.capability_ids.map(String) : [];
+    return ids.length && ids.every((id) => removedCapabilityIds.has(id)) && typeof item.id === "string" ? [item.id] : [];
+  }));
+
+  return {
+    ...ir,
+    capabilities: remainingCapabilities,
+    tasks: ir.tasks.map((item) => ({ ...item, capabilityIds: keepCapabilityIds(item.capabilityIds) })),
+    requirements: ir.requirements.map((item) => ({ ...item, mappedCapabilityIds: keepCapabilityIds(item.mappedCapabilityIds) })),
+    constraints: ir.constraints.map((item) => ({ ...item, appliesTo: keepCapabilityIds(item.appliesTo) })),
+    knowledgeRequirements: ir.knowledgeRequirements.filter((item) => item.path !== path && !removedCapabilityIds.has(item.capabilityId)),
+    dependencies: ir.dependencies.filter((item) => !removedCapabilityIds.has(item.capabilityId)),
+    resourcePlan: {
+      ...ir.resourcePlan,
+      resources: ir.resourcePlan.resources.filter((item) => item.path !== path && !removedCapabilityIds.has(item.capabilityId)),
+    },
+    outputs: ir.outputs.map((item) => ({
+      ...item,
+      producerCapabilityIds: item.producerCapabilityIds.filter((id) => !removedCapabilityIds.has(id)),
+    })),
+    evaluationPlan: {
+      ...ir.evaluationPlan,
+      activation: { ...ir.evaluationPlan.activation, caseIds: ir.evaluationPlan.activation.caseIds.filter((id) => !removedCaseIds.has(id)) },
+      execution: { ...ir.evaluationPlan.execution, caseIds: ir.evaluationPlan.execution.caseIds.filter((id) => !removedCaseIds.has(id)) },
+      cases: ir.evaluationPlan.cases
+        .filter((item) => !(typeof item.id === "string" && removedCaseIds.has(item.id)))
+        .map((item) => Array.isArray(item.capability_ids)
+          ? { ...item, capability_ids: item.capability_ids.map(String).filter((id) => !removedCapabilityIds.has(id)) }
+          : item),
+    },
+    runtimeContract: {
+      ...ir.runtimeContract,
+      workflow: ir.runtimeContract.workflow.flatMap((item) => {
+        const capabilityIds = item.capabilityIds.filter((id) => !removedCapabilityIds.has(id));
+        return capabilityIds.length ? [{ ...item, capabilityIds }] : [];
+      }),
+    },
+    traceability: ir.traceability.filter((item) => item.implementationPath !== path && !removedCapabilityIds.has(item.capabilityId)),
+  };
+}
 
 type CapabilityInput = {
   id: string;
@@ -441,6 +572,40 @@ export function deriveTaskInputContract(input: {
   });
 }
 
+/** Upgrade legacy/model-authored inputs before any Canonical mutation runs.
+ * Input resolution is a compiler-owned contract: a Planner should not be
+ * forced to repair unrelated legacy omissions before it can change an Eval,
+ * requirement, or workflow edge. Confirmed user policy still controls whether
+ * a value may be inferred; otherwise the safe deterministic branch is ask or
+ * continue-without. */
+export function reconcileSkillIRInputResolutions(ir: SkillIR, answers: Record<string, string>) {
+  const explicitPolicy = Object.values(answers).join("\n");
+  return {
+    ...ir,
+    inputs: ir.inputs.map((taskInput) => {
+      const fallback = taskInput.missingBehavior?.trim()
+        || (taskInput.required
+          ? `缺少“${taskInput.name}”且无法完成核心任务时，请求最少必要信息`
+          : `未提供“${taskInput.name}”时继续不依赖它的可逆步骤`);
+      const existing = taskInput.resolution;
+      const complete = Boolean(existing?.mode
+        && existing.authority
+        && Array.isArray(existing.allowedSources)
+        && typeof existing.markProvisional === "boolean"
+        && typeof existing.reversibleOnly === "boolean"
+        && existing.stopCondition?.trim());
+      if (complete && taskInput.missingBehavior?.trim()) return taskInput;
+      const resolution = resolutionForInput({ name: taskInput.name, required: taskInput.required, explicitPolicy, fallback });
+      return {
+        ...taskInput,
+        required: resolution.mode === "infer-and-label" ? false : taskInput.required,
+        missingBehavior: missingBehaviorForInput(taskInput.name, resolution, fallback),
+        resolution,
+      };
+    }),
+  };
+}
+
 export function ensureSkillSemanticClosure(input: {
   skill: string;
   idea: string;
@@ -532,6 +697,7 @@ export function compileSkillIR(input: {
   scopeProvenance?: unknown[];
   description?: string;
 }): SkillIR {
+  const contentPermission = resolveContentPermission(input.answers);
   const capabilities: SkillIRCapability[] = input.plan.items.filter(activeCapability).map((item) => {
     const necessity = item.necessity ? { ...item.necessity, reason: item.reason || item.deterministicAdvantage || "由资源必要性分析决定" } : fallbackNecessity(item);
     const scope = item.scope || (item.kind === "llm" ? "task-specific" : /当|如果|若|when|if/i.test(item.activationCondition || item.routingCondition) ? "conditional" : "task-specific");
@@ -723,10 +889,11 @@ export function compileSkillIR(input: {
       stopConditions: input.loop.stopConditions,
       escalationConditions: input.loop.escalationConditions,
       scopes: input.loop.scopes,
+      contentPermission,
     },
     traceability: [],
   };
-  return bindSkillIREvals(ir, "");
+  return bindSkillIREvals(reconcileSkillIRContentPermission(ir, input.answers), "");
 }
 
 function yamlString(value: string) {
@@ -781,6 +948,7 @@ export function projectSkillMarkdown(ir: SkillIR) {
   const workflow = ir.runtimeContract?.workflow || [];
   const priority = ir.runtimeContract?.instructionPriority || [];
   const checks = ir.runtimeContract?.completionChecks || [];
+  const contentPermission = contentPermissionFromIR(ir);
   const hasStateContract = ir.stateRequirement?.needed === true || ir.stateRequirement?.scope !== "none";
   const hasToolContract = ir.capabilities.some((item) => item.kind === "builtin-tool" || item.kind === "mcp");
   const hasLoopContract = ir.resourcePlan.resources.some((item) => item.path === "references/loop-plan.md" && item.decision !== "exclude");
@@ -810,6 +978,7 @@ export function projectSkillMarkdown(ir: SkillIR) {
       return `${index + 1}. **${step.action}**\n   - When: ${step.when}\n   - Input: ${step.input}\n   - Runtime operation: ${operations.join(" ") || "`REASON` — execute the declared action using resolved inputs."}\n   - Output: ${step.output}\n   - If unavailable: ${step.fallback}`;
     }).join("\n") || "1. Complete the declared task using the resolved inputs."}`,
     requirements.length ? `## Confirmed requirements\n\n${requirements.map((item) => `- [${item.modality}; ${item.provenance}] ${item.statement}`).join("\n")}` : "",
+    contentPermission.sourceText ? `## Content transformation\n\n- Apply the owner's confirmed permission exactly: ${contentPermission.sourceText}\n- Keep this permission separate from privacy, missing-input handling, source citation, tool receipts, and external or irreversible actions.` : "",
     ir.riskBranches.length ? `## Runtime branches\n\n${ir.riskBranches.map((item) => `- **If ${item.condition}:** ${item.action}. ${item.stopOrRedirect}`).join("\n")}` : "",
     runtimeResources.length ? `## Capabilities and bundled resources\n\n${runtimeResources.map((item) => `- **${item.name}:** [${item.implementation.path}](${item.implementation.path}) — use when ${item.activationCondition}. Fallback: ${item.fallback}`).join("\n")}` : "",
     `## Canonical contracts\n\n${canonicalContracts.join("\n")}`,
@@ -921,10 +1090,162 @@ export function bindSkillIREvals(ir: SkillIR, evalText: string): SkillIR {
   };
 }
 
+function capabilityEvalFamily(capability: SkillIRCapability) {
+  if (capability.kind === "reference") return "grounding";
+  if (["builtin-tool", "mcp", "asset"].includes(capability.kind)) return "integration";
+  return "capability";
+}
+
+function evalCaseCoversCapability(testCase: Record<string, unknown>, capability: SkillIRCapability) {
+  const capabilityIds = Array.isArray(testCase.capability_ids) ? testCase.capability_ids.map(String) : [];
+  if (!capabilityIds.includes(capability.id) || testCase.eval_family !== capabilityEvalFamily(capability)) return false;
+  const graders = Array.isArray(testCase.graders) ? testCase.graders.map(String) : [];
+  if (capability.kind === "reference") return graders.includes("grounding");
+  if (["builtin-tool", "mcp", "asset"].includes(capability.kind)) {
+    return graders.some((grader) => ["integration", "tool_grounding", "artifact_checker"].includes(grader));
+  }
+  return graders.some((grader) => ["core_capability", "failure_mode", "loop_control"].includes(grader));
+}
+
+function canonicalCapabilityEvalCase(
+  ir: SkillIR,
+  capabilities: SkillIRCapability[],
+  index: number,
+  contractDigest: string,
+  exemplar?: Record<string, unknown>,
+) {
+  const family = capabilityEvalFamily(capabilities[0]);
+  const capabilityIds = capabilities.map((item) => item.id);
+  const producedArtifacts = [...new Set(ir.outputs
+    .filter((output) => output.producerCapabilityIds.some((id) => capabilityIds.includes(id)))
+    .flatMap((output) => output.artifactPatterns))];
+  const behaviors = [...new Set(capabilities.flatMap((item) => item.evidenceRequirements.length ? item.evidenceRequirements : [item.output]).filter(Boolean))];
+  const graders = family === "grounding"
+    ? ["grounding"]
+    : family === "integration"
+      ? ["integration", ...(producedArtifacts.length ? ["artifact_checker"] : [])]
+      : ["core_capability"];
+  const idSuffix = capabilities.length === 1
+    ? capabilities[0].id
+    : `${family}-group-${index + 1}`;
+  const exemplarPrompt = typeof exemplar?.prompt === "string" && exemplar.prompt.trim().length >= 40
+    ? exemplar.prompt.trim()
+    : "";
+  const exemplarContext = exemplar?.context && typeof exemplar.context === "object" && !Array.isArray(exemplar.context)
+    ? exemplar.context as Record<string, unknown>
+    : {};
+  const exemplarExpected = exemplar?.expected && typeof exemplar.expected === "object" && !Array.isArray(exemplar.expected)
+    ? exemplar.expected as Record<string, unknown>
+    : {};
+  const exemplarBehaviors = Array.isArray(exemplarExpected.behaviors)
+    ? exemplarExpected.behaviors.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : [];
+  const exemplarMustNot = Array.isArray(exemplarExpected.must_not)
+    ? exemplarExpected.must_not.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : [];
+  return {
+    id: `core-${idSuffix}`,
+    eval_family: family,
+    category: "core_capability",
+    should_trigger: true,
+    prompt: exemplarPrompt || `请执行“${ir.identity.intent}”对应的真实任务步骤。本用例重点验证：${capabilities.map((item) => item.requirement).join("；")}。输入契约：${capabilities.map((item) => item.input).filter(Boolean).join("；") || "使用当前任务已经提供的材料"}。必须产生可观察结果，不要只复述规则。`,
+    context: {
+      ...exemplarContext,
+      canonical_eval_compiler: true,
+      capability_scope: capabilities.map((item) => item.scope),
+      activation_condition: capabilities.map((item) => item.activationCondition || item.routingCondition),
+      output_contract: capabilities.map((item) => item.output),
+    },
+    capability_ids: capabilityIds,
+    expected: {
+      ...exemplarExpected,
+      behaviors: [...new Set([...exemplarBehaviors, ...(behaviors.length ? behaviors : ["完成该能力负责的任务步骤并产生可观察结果"])])],
+      must_not: [...new Set([...exemplarMustNot, "只描述将如何完成而不产生真实结果", "使用与当前激活分支无关的能力"])],
+      artifacts: producedArtifacts,
+    },
+    graders,
+    ...(contractDigest ? { contract_digest: contractDigest } : {}),
+  };
+}
+
+/**
+ * Canonical SkillIR owns capability coverage. A restored UI capability plan can
+ * be older than the frozen bundle, so repair missing Eval edges here instead of
+ * asking a semantic repair model to rediscover compiler-owned cases.
+ */
+export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
+  let parsed: Record<string, unknown> = {};
+  try { parsed = JSON.parse(evalText || "{}"); } catch { parsed = {}; }
+  const rawCases = Array.isArray(parsed.evals)
+    ? parsed.evals.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object")
+    : [];
+  const contractDigest = typeof parsed.contract_digest === "string"
+    ? parsed.contract_digest
+    : String(rawCases.find((item) => typeof item.contract_digest === "string")?.contract_digest || "");
+  const capabilities = ir.capabilities.filter((item) => item.kind !== "eval" && item.necessity.decision !== "exclude");
+  const cases = [...rawCases];
+  const representativeFixture = cases.find((item) => item.should_trigger === true
+    && item.eval_family !== "trigger"
+    && typeof item.prompt === "string"
+    && item.prompt.trim().length >= 40)
+    || cases.find((item) => item.should_trigger === true && typeof item.prompt === "string" && item.prompt.trim().length >= 40);
+  const missing = capabilities.filter((capability) => !cases.some((testCase) => evalCaseCoversCapability(testCase, capability)));
+  missing.forEach((capability, index) => cases.push(canonicalCapabilityEvalCase(ir, [capability], index, contractDigest, representativeFixture)));
+
+  const triggerCategories = ["trigger_explicit", "trigger_implicit", "trigger_context", "trigger_negative"];
+  const essentialTriggers = triggerCategories.flatMap((category) => {
+    const match = cases.find((item) => item.eval_family === "trigger" && item.category === category);
+    return match ? [match] : [];
+  });
+  let coverageCases = capabilities.flatMap((capability) => {
+    const match = cases.find((testCase) => evalCaseCoversCapability(testCase, capability));
+    return match ? [match] : [];
+  });
+  coverageCases = [...new Map(coverageCases.map((item) => [String(item.id || ""), item])).values()];
+
+  const coverageBudget = Math.max(1, 20 - essentialTriggers.length);
+  if (coverageCases.length > coverageBudget) {
+    const grouped = new Map<string, SkillIRCapability[][]>();
+    capabilities.forEach((capability) => {
+      const family = capabilityEvalFamily(capability);
+      grouped.set(family, [...(grouped.get(family) || []), [capability]]);
+    });
+    const groupCount = () => [...grouped.values()].reduce((sum, groups) => sum + groups.length, 0);
+    while (groupCount() > coverageBudget) {
+      const mergeable = [...grouped.entries()].filter(([, groups]) => groups.length > 1).sort((left, right) => right[1].length - left[1].length)[0];
+      if (!mergeable) break;
+      const groups = mergeable[1];
+      const right = groups.pop() || [];
+      const left = groups.pop() || [];
+      groups.push([...left, ...right]);
+    }
+    coverageCases = [...grouped.values()].flat().map((group, index) => canonicalCapabilityEvalCase(ir, group, index, contractDigest, representativeFixture));
+  }
+
+  const essentialIds = new Set([...essentialTriggers, ...coverageCases].map((item) => String(item.id || "")));
+  const selectedCases = [...essentialTriggers, ...coverageCases, ...cases.filter((item) => !essentialIds.has(String(item.id || "")))]
+    .filter((item, index, list) => list.findIndex((candidate) => String(candidate.id || "") === String(item.id || "")) === index)
+    .slice(0, 20)
+    .map((item) => contractDigest && typeof item.contract_digest !== "string" ? { ...item, contract_digest: contractDigest } : item);
+
+  return JSON.stringify({
+    ...parsed,
+    version: "2.7",
+    skill_name: ir.identity.skillName,
+    ...(contractDigest ? { contract_digest: contractDigest } : {}),
+    dataset_summary: typeof parsed.dataset_summary === "string" && parsed.dataset_summary.trim()
+      ? parsed.dataset_summary
+      : ir.evaluationPlan.datasetSummary,
+    evals: selectedCases,
+  }, null, 2);
+}
+
 export function projectEvalBank(ir: SkillIR) {
+  const contractDigest = ir.evaluationPlan.cases.find((testCase) => typeof testCase.contract_digest === "string")?.contract_digest;
   return JSON.stringify({
     version: "2.7",
     skill_name: ir.identity.skillName,
+    ...(contractDigest ? { contract_digest: contractDigest } : {}),
     dataset_summary: ir.evaluationPlan.datasetSummary,
     evals: ir.evaluationPlan.cases,
   }, null, 2);

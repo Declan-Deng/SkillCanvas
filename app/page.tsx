@@ -123,6 +123,7 @@ import {
 import {
   bindSkillIREvals,
   compileSkillIR,
+  ensureSkillIREvalCoverage,
   ensureSkillSemanticClosure,
   projectAgentMetadata,
   projectCapabilityManifest,
@@ -134,6 +135,9 @@ import {
   projectStateReference,
   projectToolContracts,
   projectToolingReference,
+  reconcileSkillIRContentPermission,
+  reconcileSkillIRInputResolutions,
+  reconcileSkillIRSourceEvidence,
   type SkillIR,
 } from "./skill-ir";
 import {
@@ -426,6 +430,12 @@ type GenerationLoopState = {
   maxRounds: number;
   baselineScore: number;
   bestScore: number;
+  baselineQualityScore: number;
+  bestQualityScore: number;
+  comparisonConfidence: number;
+  comparisonRevision: string;
+  comparisonStage: "not-run" | "initial" | "optimized" | "post-prune";
+  comparisonCaseCount: number;
   lift: number;
   passRate: number;
   closureScore: number;
@@ -690,6 +700,12 @@ const DEFAULT_GENERATION_LOOP: GenerationLoopState = {
   maxRounds: GENERATION_GOAL_MAX_ROUNDS,
   baselineScore: 0,
   bestScore: 0,
+  baselineQualityScore: 0,
+  bestQualityScore: 0,
+  comparisonConfidence: 0,
+  comparisonRevision: "",
+  comparisonStage: "not-run",
+  comparisonCaseCount: 0,
   lift: 0,
   passRate: 0,
   closureScore: 0,
@@ -1187,25 +1203,66 @@ function createBuildTimeSkillContract(idea: string, answers: Record<string, stri
   };
 }
 
-function ensureCanonicalBundledResources(ir: SkillIR, files: Record<string, string>) {
-  if (!files["references/source-evidence.md"]?.trim()
-    || ir.resourcePlan.resources.some((item) => item.path === "references/source-evidence.md")) return ir;
+function ensureCanonicalBundledResources(ir: SkillIR, files: Record<string, string>, answers: Record<string, string>) {
+  return reconcileSkillIRSourceEvidence(
+    reconcileSkillIRInputResolutions(reconcileSkillIRContentPermission(ir, answers), answers),
+    Boolean(files["references/source-evidence.md"]?.trim()),
+  );
+}
+
+function reconcileCapabilityPlanWithCanonicalIR(plan: CapabilityPlan, ir: SkillIR | null) {
+  if (!ir) return plan;
+  const currentById = new Map(plan.items.map((item) => [item.id, item]));
+  const items: CapabilityItem[] = ir.capabilities.map((capability) => {
+    const current = currentById.get(capability.id);
+    return {
+      id: capability.id,
+      kind: capability.kind,
+      name: capability.name,
+      path: capability.implementation.path,
+      layer: capability.implementation.layer,
+      requirement: capability.requirement,
+      purpose: capability.purpose,
+      reason: capability.necessity.reason,
+      status: capability.implementation.status,
+      input: capability.input,
+      output: capability.output,
+      fallback: capability.fallback,
+      routingCondition: capability.routingCondition,
+      deterministicAdvantage: capability.necessity.deterministicNeed ? "确定性实现可重复验证" : "由运行契约控制",
+      evaluationCriteria: capability.evidenceRequirements,
+      scope: capability.scope,
+      activationCondition: capability.activationCondition,
+      affects: capability.affects,
+      mustNotAffect: capability.mustNotAffect,
+      connection: capability.connection,
+      optional: capability.necessity.decision === "optional",
+      enabled: capability.necessity.decision !== "exclude",
+      recommended: current?.recommended,
+      necessity: {
+        successLift: capability.necessity.successLift,
+        bareModelReliable: capability.necessity.bareModelReliable,
+        deterministicNeed: capability.necessity.deterministicNeed,
+        realResourceAvailable: capability.necessity.realResourceAvailable,
+        externalDependency: capability.necessity.externalDependency,
+        decision: capability.necessity.decision,
+      },
+    };
+  });
+  const output = ir.outputs[0];
   return {
-    ...ir,
-    resourcePlan: {
-      ...ir.resourcePlan,
-      resources: [
-        ...ir.resourcePlan.resources,
-        {
-          capabilityId: ir.capabilities.find((item) => item.kind === "llm")?.id || ir.capabilities[0]?.id || "task-core",
-          kind: "reference" as const,
-          path: "references/source-evidence.md",
-          decision: "include" as const,
-          reason: "用户提供的范例或资料会改变运行时决策，必须从主工作流显式读取。",
-          consumerTaskIds: ir.tasks.map((item) => item.id),
-        },
-      ],
-    },
+    ...plan,
+    summary: ir.identity.summary || plan.summary,
+    outcomeModel: ir.outcomeModel,
+    outputContract: output ? {
+      mode: output.mode,
+      format: output.name,
+      requiredSections: output.requiredSections,
+      artifactPatterns: output.artifactPatterns,
+      validation: output.validation,
+    } : plan.outputContract,
+    failureModes: ir.evaluationPlan.failureModes,
+    items,
   };
 }
 
@@ -1269,7 +1326,7 @@ function createCanonicalSkillIR(input: {
   // Uploaded examples are implementation resources consumed by the primary
   // semantic capability. Record the path in Canonical SkillIR so the runtime
   // projector can route to it without a post-projection file edit.
-  return ensureCanonicalBundledResources(ir, files);
+  return ensureCanonicalBundledResources(ir, files, input.answers);
 }
 
 function compactThinkingPhrase(value: string) {
@@ -1684,8 +1741,61 @@ function harnessVerifiableCapabilityIds(plan: CapabilityPlan) {
     && item.kind !== "mcp").map((item) => item.id);
 }
 
+function stableEvalContractValue(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableEvalContractValue).join(",")}]`;
+  if (!value || typeof value !== "object") return JSON.stringify(value);
+  return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableEvalContractValue((value as Record<string, unknown>)[key])}`).join(",")}}`;
+}
+
+function currentEvalContractDigest(skillName: string, idea: string, answers: Record<string, string>, loopPlan: LoopPlan, capabilityPlan: CapabilityPlan) {
+  const reconciledPlan = reconcileCapabilityPlanContentPermission(capabilityPlan, answers);
+  const payload = stableEvalContractValue({
+    skillName,
+    idea: idea.trim(),
+    answers: Object.fromEntries(Object.entries(answers).filter(([, value]) => Boolean(value?.trim())).sort(([left], [right]) => left.localeCompare(right))),
+    loop: {
+      mode: loopPlan.mode,
+      goal: loopPlan.goal,
+      maxRounds: loopPlan.maxRounds,
+      stopConditions: loopPlan.stopConditions,
+      escalationConditions: loopPlan.escalationConditions,
+      scopes: loopPlan.scopes,
+    },
+    capabilities: reconciledPlan.items.filter(capabilityIsActive).map((item) => ({
+      id: item.id,
+      kind: item.kind,
+      requirement: item.requirement,
+      input: item.input,
+      output: item.output,
+      routingCondition: item.routingCondition,
+      activationCondition: item.activationCondition,
+      evaluationCriteria: item.evaluationCriteria,
+    })),
+  });
+  let hash = 2166136261;
+  for (const character of payload) {
+    hash ^= character.charCodeAt(0);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `eval-contract-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+function evalBankMatchesCurrentContract(raw: string, skillName: string, idea: string, answers: Record<string, string>, loopPlan: LoopPlan, capabilityPlan: CapabilityPlan) {
+  try {
+    const parsed = JSON.parse(raw) as { contract_digest?: string; evals?: Array<{ contract_digest?: string }> };
+    const expected = currentEvalContractDigest(skillName, idea, answers, loopPlan, capabilityPlan);
+    return parsed.contract_digest === expected
+      && Array.isArray(parsed.evals)
+      && parsed.evals.length > 0
+      && parsed.evals.every((testCase) => testCase.contract_digest === expected);
+  } catch {
+    return false;
+  }
+}
+
 function createSpecificEvals(skillName: string, idea: string, answers: Record<string, string>, loopPlan: LoopPlan = DEFAULT_LOOP_PLAN, capabilityPlan: CapabilityPlan = DEFAULT_CAPABILITY_PLAN) {
   capabilityPlan = reconcileCapabilityPlanContentPermission(capabilityPlan, answers);
+  const contractDigest = currentEvalContractDigest(skillName, idea, answers, loopPlan, capabilityPlan);
   const task = compactTaskPhrase(idea);
   const inputs = answers.inputs?.trim() || "完成任务所需的核心材料";
   const contentPolicy = confirmedContentPolicy(answers) || "按当前任务说明决定润色、扩写或补全范围；没有确认时先说明工作假设";
@@ -1857,10 +1967,13 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
     ...realisticFixtureCases,
     firstByCategory("failure_mode"),
   ].filter((item): item is Record<string, unknown> => Boolean(item));
-  const selectedEvals = [...new Map([...requiredCases, ...evals].map((item) => [String(item.id), item])).values()].slice(0, 20);
+  const selectedEvals = [...new Map([...requiredCases, ...evals].map((item) => [String(item.id), item])).values()]
+    .slice(0, 20)
+    .map((testCase) => ({ ...testCase, contract_digest: contractDigest }));
   return JSON.stringify({
     version: "2.7",
     skill_name: skillName,
+    contract_digest: contractDigest,
     dataset_summary: "四类隔离回归集：Trigger、Capability、Grounding、Integration 分别运行，条件工具不会污染核心文本能力。",
     evals: selectedEvals,
   }, null, 2);
@@ -2667,7 +2780,15 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   if (sourceEvidence.trim() && !files["references/source-evidence.md"]) {
     files["references/source-evidence.md"] = `# Source evidence\n\n${sourceEvidence.trim()}\n\nUse only confirmed reusable traits. Keep filename and page provenance, distinguish working inferences from user-confirmed decisions, and never copy direct identifiers or the full source document.`;
   }
-  if (!sourceEvidence.trim()) delete files["references/source-evidence.md"];
+  if (!sourceEvidence.trim()) {
+    delete files["references/source-evidence.md"];
+    capabilityPlan = {
+      ...capabilityPlan,
+      items: capabilityPlan.items.map((item) => item.path === "references/source-evidence.md"
+        ? { ...item, enabled: false, status: "not-needed" as const }
+        : item),
+    };
+  }
   const contentPolicy = confirmedContentPolicy(answers);
   if (files["references/domain-playbook.md"]) {
     const originalPlaybook = files["references/domain-playbook.md"];
@@ -2776,7 +2897,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   if (evalPath) {
     const evalText = files[evalPath] || "";
     try {
-      const parsed = JSON.parse(evalText) as { version?: string; evals?: Array<{ prompt?: string; expected?: { artifacts?: unknown[] }; eval_family?: string; category?: string; should_trigger?: boolean; graders?: string[]; capability_ids?: unknown[] }> };
+      const parsed = JSON.parse(evalText) as { version?: string; contract_digest?: string; evals?: Array<{ prompt?: string; contract_digest?: string; expected?: { artifacts?: unknown[] }; eval_family?: string; category?: string; should_trigger?: boolean; graders?: string[]; capability_ids?: unknown[] }> };
       const categories = new Set((parsed.evals || []).map((item) => item.category));
       const families = new Set((parsed.evals || []).map((item) => item.eval_family));
       const artifactOwnerIds = new Set(capabilityPlan.items.filter((item) => capabilityIsActive(item) && capabilityOwnsArtifacts(item)).map((item) => item.id));
@@ -2784,6 +2905,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
       const requiredCapabilityIds = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind !== "eval").map((item) => item.id);
       const allowedCapabilityIds = new Set(capabilityPlan.items.filter((item) => capabilityIsActive(item)).map((item) => item.id));
       evalNeedsRebuild = parsed.version !== "2.7"
+        || !evalBankMatchesCurrentContract(evalText, skillName, idea, answers, loopPlan, capabilityPlan)
         || !Array.isArray(parsed.evals)
         || parsed.evals.length < 10
         || parsed.evals.length > 20
@@ -2813,7 +2935,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   files["evals/result.schema.json"] = createEvalResultSchema();
   files["evals/artifact_checker.py"] = createArtifactChecker();
   files["evals/run_evals.py"] = createEvalRunner();
-  const canonicalIR = bindSkillIREvals(ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
+  const canonicalBaseIR = ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
     skillName,
     idea,
     answers,
@@ -2821,7 +2943,12 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     loop: loopPlan,
     sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
     files,
-  }), files), canonicalIROverride ? projectEvalBank(canonicalIROverride) : files["evals/evals.json"]);
+  }), files, answers);
+  const canonicalEvalSeed = evalNeedsRebuild
+    ? files["evals/evals.json"]
+    : canonicalIROverride ? projectEvalBank(canonicalBaseIR) : files["evals/evals.json"];
+  const canonicalEvalBank = ensureSkillIREvalCoverage(canonicalBaseIR, canonicalEvalSeed);
+  const canonicalIR = bindSkillIREvals(canonicalBaseIR, canonicalEvalBank);
   files["evals/skill-ir.json"] = JSON.stringify(canonicalIR, null, 2);
   files["evals/capability-manifest.json"] = createCapabilityManifest(capabilityPlan, files["evals/evals.json"], loopPlan, { idea, answers, sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`, skill: files["SKILL.md"], files }, canonicalIR);
   const generatedScriptPaths = Object.keys(files).filter((path) => path.startsWith("scripts/") && path.endsWith(".py"));
@@ -2853,15 +2980,8 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   // Freeze Canonical SkillIR last, then overwrite every compiler-owned
   // semantic artifact from that one source. No semantic repair is allowed
   // after this boundary.
-  const frozenIR = bindSkillIREvals(ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
-    skillName,
-    idea,
-    answers,
-    plan: capabilityPlan,
-    loop: loopPlan,
-    sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
-    files,
-  }), files), canonicalIROverride ? projectEvalBank(canonicalIROverride) : files["evals/evals.json"] || "");
+  const frozenBaseIR = ensureCanonicalBundledResources(canonicalIR, files, answers);
+  const frozenIR = bindSkillIREvals(frozenBaseIR, ensureSkillIREvalCoverage(frozenBaseIR, projectEvalBank(frozenBaseIR)));
   files["evals/skill-ir.json"] = JSON.stringify(frozenIR, null, 2);
   files["evals/capability-manifest.json"] = JSON.stringify(projectCapabilityManifest(frozenIR), null, 2);
   files["evals/evals.json"] = projectEvalBank(frozenIR);
@@ -3016,7 +3136,21 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
   const calculationScripts = scripts.filter((path) => /(?:def|function)\s+(?:calculate|compute)|计算|formula|denominator/i.test(files[path]));
   if (formulaDecisionPending && calculationScripts.some((path) => !/(?:--(?:formula|denominator|numerator)|公式.{0,24}(?:参数|配置)|分母.{0,24}(?:参数|配置))/i.test(files[path]))) blockers.push("计算公式仍待用户确认，但脚本没有可配置的公式或分母参数");
   const contentPolicy = confirmedContentPolicy(answers);
-  if (contentPolicy && !allText.includes(contentPolicy)) blockers.push("没有保留用户确认的内容改动范围");
+  let canonicalPermissionPreserved = !contentPolicy;
+  try {
+    const ir = JSON.parse(files["evals/skill-ir.json"] || "{}") as SkillIR;
+    const stored = ir.controlModel?.contentPermission as Partial<ReturnType<typeof resolveContentPermission>> | undefined;
+    const expected = resolveContentPermission(answers);
+    canonicalPermissionPreserved = Boolean(stored
+      && stored.sourceText === expected.sourceText
+      && stored.allowCreativeExpansion === expected.allowCreativeExpansion
+      && stored.allowFactualCreation === expected.allowFactualCreation
+      && stored.explicitRestriction === expected.explicitRestriction
+      && allText.includes(expected.sourceText));
+  } catch {
+    canonicalPermissionPreserved = Boolean(contentPolicy && allText.includes(contentPolicy));
+  }
+  if (!canonicalPermissionPreserved) blockers.push("没有保留用户确认的内容改动范围");
   if (contentPolicyAllowsExpansion(answers) && !contentPolicyExplicitlyRestrictsExpansion(answers) && contentPolicyRuntimeText.split("\n").some(isUnconfirmedGenericFactRestriction)) blockers.push("内容限制与用户确认的润色或扩写权限冲突");
   blockers.push(...confirmedPersonalizationConflicts(files));
   if (files["references/requirements.md"] || files["references/capability-plan.json"]) blockers.push("构建期需求或能力计划被混入运行时 references");
@@ -3681,9 +3815,10 @@ function applyCanonicalCandidate(input: {
 }) {
   const currentIR = parseCanonicalSkillIR(input.currentFiles);
   if (!currentIR) throw new Error("Canonical SkillIR 无法解析，语义修改必须先通过 P0 JSON 修复");
+  const normalizedCurrentIR = ensureCanonicalBundledResources(currentIR, input.currentFiles, input.answers);
   const mutations = normalizeCanonicalMutations(input.rawMutations);
   if (!mutations.length && !Object.keys(input.implementationFiles || {}).length) throw new Error("模型没有返回 CanonicalMutation 或 implementation bytes");
-  const mutated = applySkillIRMutations(currentIR, mutations);
+  const mutated = applySkillIRMutations(normalizedCurrentIR, mutations);
   const irValidation = validateCanonicalSkillIR(mutated.ir);
   if (!irValidation.valid) throw new Error(`CanonicalMutation 未通过 IR Validator：${irValidation.issues.join("；")}`);
   const implementationFiles = Object.fromEntries(Object.entries(input.implementationFiles || {}).filter((entry): entry is [string, string] => (
@@ -3698,7 +3833,7 @@ function applyCanonicalCandidate(input: {
     input.loopPlan,
     mutated.ir,
   );
-  const baselineDigest = semanticSkillIRDigest(currentIR);
+  const baselineDigest = semanticSkillIRDigest(normalizedCurrentIR);
   const candidateDigest = semanticSkillIRDigest(candidateFiles);
   return {
     files: candidateFiles,
@@ -3709,6 +3844,58 @@ function applyCanonicalCandidate(input: {
     candidateDigest,
     materialDiff: baselineDigest !== candidateDigest || Object.keys(implementationFiles).some((path) => input.currentFiles[path] !== implementationFiles[path]),
   };
+}
+
+function canonicalMutationTargetCatalog(files: Record<string, string>) {
+  const ir = parseCanonicalSkillIR(files);
+  if (!ir) return { unavailable: true };
+  return {
+    requirementIds: ir.requirements.map((item) => item.id),
+    taskIds: ir.tasks.map((item) => item.id),
+    capabilityIds: ir.capabilities.map((item) => item.id),
+    inputIds: ir.inputs.map((item) => item.id),
+    outputIds: ir.outputs.map((item) => item.id),
+    constraintIds: ir.constraints.map((item) => item.id),
+    knowledgeIds: ir.knowledgeRequirements.map((item) => item.id),
+    evalCaseIds: ir.evaluationPlan.cases.map((item) => String(item.id || "")).filter(Boolean),
+    inputAddShape: {
+      id: "input-stable-id",
+      concept: "semantic concept",
+      name: "user-facing input name",
+      required: false,
+      source: "user|source|runtime",
+      availableAtBuild: false,
+      missingBehavior: "observable behavior when absent",
+      resolution: {
+        mode: "ask|infer-and-label|continue-without",
+        authority: "user_explicit|user_example|source_grounded|domain_inferred|generator_default",
+        allowedSources: ["explicit source identifier"],
+        markProvisional: true,
+        reversibleOnly: true,
+        stopCondition: "condition that ends resolution",
+      },
+    },
+  };
+}
+
+function allowedP1MutationTypes(issues: PipelineIssue[]) {
+  const allMatch = (pattern: RegExp) => issues.length > 0 && issues.every((issue) => pattern.test(`${issue.type} ${issue.evidence}`));
+  if (allMatch(/EVAL|评测|测试用例|SKILL_IR_CLOSURE.*(?:Eval|评测)/i)) return ["eval-source.add", "eval-source.update", "eval-source.remove"];
+  if (allMatch(/INPUT|输入|DESCRIPTION_INPUT|RESOLUTION/i)) return ["input.add", "input.update", "input.remove", "task.update"];
+  if (allMatch(/OUTPUT|ARTIFACT|PRODUCER|输出|产物/i)) return ["output.add", "output.update", "output.remove", "capability.update", "task.update"];
+  if (allMatch(/STATE|PERSIST|状态|持久/i)) return ["state.update", "requirement.update", "constraint.update"];
+  if (allMatch(/PERMISSION|CONTENT|权限|补写|扩写|编造/i)) return ["requirement.add", "requirement.update", "constraint.add", "constraint.update", "constraint.remove"];
+  return [
+    "requirement.add", "requirement.update", "requirement.remove",
+    "task.add", "task.update", "task.remove",
+    "capability.add", "capability.update", "capability.remove",
+    "input.add", "input.update", "input.remove",
+    "output.add", "output.update", "output.remove",
+    "state.update",
+    "constraint.add", "constraint.update", "constraint.remove",
+    "knowledge.add", "knowledge.update", "knowledge.remove",
+    "eval-source.add", "eval-source.update", "eval-source.remove",
+  ];
 }
 
 function normalizeCapabilityPlan(value: unknown): CapabilityPlan | null {
@@ -3861,6 +4048,10 @@ function reconcileCapabilityPlanContentPermission(plan: CapabilityPlan, answers:
       uncontrollableOutcomes: reconcileList(plan.outcomeModel.uncontrollableOutcomes),
       observableIndicators: reconcileList(plan.outcomeModel.observableIndicators),
     },
+    stateModel: Object.fromEntries(Object.entries(plan.stateModel).map(([key, value]) => [
+      key,
+      typeof value === "string" ? reconcile(value) : Array.isArray(value) ? reconcileList(value.map(String)) : value,
+    ])),
     outputContract: {
       ...plan.outputContract,
       format: reconcile(plan.outputContract.format) || "面向用户的可直接使用结果",
@@ -4883,6 +5074,10 @@ export default function Home() {
       && generationLoop.bestScore === 100
       && generationLoop.passRate === 100
       && generationLoop.closureScore === 100);
+  const optimizationCompletedWithRollback = generationLoop.status === "attention"
+    && generationLoop.minimalityChecked
+    && generationLoop.benchmarkRuns > 0
+    && !optimizationStableAtCeiling;
   const selectedFileExplanation = useMemo(() => explainSkillFile(selectedFile, files[selectedFile] || "", files), [files, selectedFile]);
   const personalizedFeedbackOptions = evalRan
     ? feedbackOptions
@@ -4923,6 +5118,7 @@ export default function Home() {
     if (!sessionHydrated || !files["SKILL.md"] || busy) return;
     const compilerFixable = bundleAudit.blockers.some((blocker) => (
       blocker === "总目标为空、过短或仍是占位内容"
+      || blocker === "没有保留用户确认的内容改动范围"
       || blocker === "内容限制与用户确认的润色或扩写权限冲突"
       || blocker.includes("[USER_PERMISSION_IR_CONFLICT]")
       || blocker.includes("[USER_PERMISSION_RUNTIME_CONFLICT]")
@@ -5438,13 +5634,28 @@ export default function Home() {
 
   async function runBlindHarnessComparison(left: HarnessReport, right: HarnessReport) {
     const anonymized = anonymizeComparison(left, right);
-    const raw = await callAI<unknown>("eval-compare", { comparison: anonymized.payload });
-    const comparison = normalizeBlindComparison(raw, left.contract.cases.map((item) => item.id));
+    const caseIds = left.contract.cases.map((item) => item.id);
+    let raw = await callAI<unknown>("eval-compare", { comparison: anonymized.payload });
+    let comparison = normalizeBlindComparison(raw, caseIds);
+    if (!comparison) {
+      raw = await callAI<unknown>("eval-compare", {
+        comparison: {
+          ...anonymized.payload,
+          responseCorrection: "The previous response was rejected. Return 4-8 criteria; for every criterion and both sides include a 1-5 criterionScore and criterionEvidence naming an exact caseId; return exactly one caseResult per case.",
+        },
+      });
+      comparison = normalizeBlindComparison(raw, caseIds);
+    }
     if (!comparison) throw new Error("匿名 A/B 比较没有返回完整结果");
     const revealWinner = (winner: "A" | "B" | "tie") => winner === "tie" ? "tie" as const : anonymized.reveal[winner];
+    const revealedScores = comparison.qualityScores ? {
+      left: anonymized.reveal.A === "left" ? comparison.qualityScores.A : comparison.qualityScores.B,
+      right: anonymized.reveal.A === "right" ? comparison.qualityScores.A : comparison.qualityScores.B,
+    } : null;
     return {
       ...comparison,
       revealedWinner: revealWinner(comparison.winner),
+      revealedScores,
       caseResults: comparison.caseResults.map((item) => ({ ...item, revealedWinner: revealWinner(item.winner) })),
     };
   }
@@ -6237,8 +6448,18 @@ export default function Home() {
         capabilityId: issue.capabilityId,
       })),
     ];
-    const uniqueIssues = [...new Map(issues.map((issue) => [`${issue.type}:${issue.evidence}`, issue])).values()];
+    const uniqueIssues = [...new Map(issues.map((issue) => {
+      const evalClosure = /CAPABILITY_WITHOUT_EVAL|没有绑定可执行\s*Eval|没有映射到任何\s*Eval|没有可执行评测|without.*eval/i.test(`${issue.type} ${issue.evidence}`);
+      const key = evalClosure
+        ? `eval-closure:${issue.capabilityId || issue.evidence.match(/能力\s+([a-z0-9-]+)/i)?.[1] || issue.type}`
+        : `${issue.type}:${issue.evidence}`;
+      return [key, issue] as const;
+    })).values()];
     return { audit, closure, crossArtifact, issues: uniqueIssues };
+  }
+
+  function p1IssuesAreCompilerOwnedEvalEdges(issues: PipelineIssue[]) {
+    return issues.length > 0 && issues.every((issue) => /CAPABILITY_WITHOUT_EVAL|没有绑定可执行\s*Eval|没有映射到任何\s*Eval|没有可执行评测|without.*eval/i.test(`${issue.type} ${issue.evidence}`));
   }
 
   async function runP1ContractRepairLoop(input: {
@@ -6255,9 +6476,49 @@ export default function Home() {
     let rounds = 0;
     let nestedP0Rounds = 0;
     let previousSignature = "";
+    const rejectedAttempts: string[] = [];
     while (validation.executionReady && state.issues.length && rounds < BUILD_REPAIR_MAX_ROUNDS) {
+      if (p1IssuesAreCompilerOwnedEvalEdges(state.issues)) {
+        const currentIR = parseCanonicalSkillIR(currentFiles);
+        if (currentIR) {
+          const coveredEvalBank = ensureSkillIREvalCoverage(currentIR, currentFiles["evals/evals.json"] || projectEvalBank(currentIR));
+          const coveredIR = bindSkillIREvals(currentIR, coveredEvalBank);
+          const deterministicCandidate = finalizeSkillFiles({
+            ...currentFiles,
+            "evals/evals.json": coveredEvalBank,
+          }, idea, input.answers, input.sourceText, input.generationPlan, loopPlan, coveredIR);
+          rounds += 1;
+          currentFiles = deterministicCandidate;
+          validation = await validateBundle(currentFiles);
+          state = collectP1ContractState(currentFiles, input.answers, input.generationPlan, validation);
+          reportClientGenerationLoopEvent("generation_loop_candidate", {
+            phase: "contract-repair",
+            round: rounds,
+            accepted: validation.executionReady && state.issues.length === 0,
+            updatedPaths: ["evals/skill-ir.json", "evals/evals.json", "evals/capability-manifest.json"],
+            reason: state.issues.length
+              ? `Canonical Eval Compiler 补齐能力映射后仍有 ${state.issues.length} 项契约问题`
+              : "Canonical Eval Compiler 已确定性补齐全部激活能力的可执行 Eval 映射，无需请求修复模型",
+          });
+          if (!validation.executionReady || !state.issues.length) break;
+        }
+      }
       const blockers = state.issues.map((issue) => `${issue.type} · ${issue.files.join("、") || "bundle"} · ${issue.evidence}`);
       const signature = state.issues.map((issue) => `${issue.type}:${issue.evidence}`).join("\n");
+      const allowedMutationTypes = allowedP1MutationTypes(state.issues);
+      const evidencePaths = [...new Set([
+        "SKILL.md",
+        "evals/capability-manifest.json",
+        ...state.issues.flatMap((issue) => issue.files),
+      ].filter((path) => isSafeSkillFilePath(path) && Boolean(currentFiles[path])))].slice(0, 8);
+      let evidenceBudget = 28_000;
+      const focusedRepairEvidence = Object.fromEntries(evidencePaths.flatMap((path) => {
+        if (evidenceBudget <= 0) return [];
+        const content = currentFiles[path] || "";
+        const selected = content.slice(0, evidenceBudget);
+        evidenceBudget -= selected.length;
+        return [[path, selected] as const];
+      }));
       setBuildLoop((current) => ({ ...current, status: "repairing", phase: "bundle", rounds, issues: blockers.slice(0, 8) }));
       setGenerationLoop((current) => ({ ...current, status: "running", phase: "static", stopReason: `P1 Contract Gate 第 ${rounds + 1}/${BUILD_REPAIR_MAX_ROUNDS} 轮：修复契约矛盾、闭环和跨文件语义` }));
       reportClientGenerationLoopEvent("generation_loop_phase", { phase: "contract-repair", round: rounds + 1, blockers, reason: `P1 Contract Gate 发现 ${state.issues.length} 项契约阻断` });
@@ -6270,7 +6531,7 @@ export default function Home() {
           capabilityPlan: input.generationPlan,
           loopPlan,
           skillIR: parseCanonicalSkillIR(currentFiles) || input.skillIR,
-          skill: currentFiles,
+          skill: focusedRepairEvidence,
           evaluation: {
             priority: "P1",
             category: "P1_CONTRACT_BLOCKER",
@@ -6278,20 +6539,28 @@ export default function Home() {
             blockers,
             warnings: state.audit.warnings,
             contractAttempt: rounds + 1,
+            allowedMutationTypes,
           },
+          canonicalTargets: { ...canonicalMutationTargetCatalog(currentFiles), allowedMutationTypes },
+          rejectedHistory: rejectedAttempts,
         });
       } catch (error) {
         rounds += 1;
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason: error instanceof Error ? error.message : "P1 契约修复请求失败" });
+        const reason = error instanceof Error ? error.message : "P1 契约修复请求失败";
+        rejectedAttempts.push(reason);
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason });
         if (rounds >= BUILD_REPAIR_MAX_ROUNDS) break;
         continue;
       }
       rounds += 1;
       let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate>;
       try {
+        const normalizedMutations = normalizeCanonicalMutations(repairedResult.canonicalMutations);
+        const disallowedMutation = normalizedMutations.find((mutation) => !allowedMutationTypes.includes(mutation.type));
+        if (disallowedMutation) throw new Error(`修复路由只允许 ${allowedMutationTypes.join("、")}，但模型返回了 ${disallowedMutation.type}`);
         canonicalCandidate = applyCanonicalCandidate({
           currentFiles,
-          rawMutations: repairedResult.canonicalMutations,
+          rawMutations: normalizedMutations,
           implementationFiles: repairedResult.implementationFiles,
           idea,
           answers: input.answers,
@@ -6300,11 +6569,15 @@ export default function Home() {
           loopPlan,
         });
       } catch (error) {
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason: error instanceof Error ? error.message : "CanonicalMutation 无法应用" });
+        const reason = error instanceof Error ? error.message : "CanonicalMutation 无法应用";
+        rejectedAttempts.push(reason);
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason });
         continue;
       }
       if (!canonicalCandidate.materialDiff) {
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason: "CanonicalMutation 经投影后没有产生语义变化，已在 Eval 前拒绝" });
+        const reason = "CanonicalMutation 经投影后没有产生语义变化，已在 Eval 前拒绝";
+        rejectedAttempts.push(reason);
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason });
         continue;
       }
       const nextFiles = canonicalCandidate.files;
@@ -6341,6 +6614,18 @@ export default function Home() {
     showLoopBusy("Build 已通过，正在固定能力边界并启动 Optimization Loop");
     setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "static", stopReason: "正在建立能力闭环" });
     reportClientGenerationLoopEvent("generation_loop_started", { phase: "static", reason: "固定 Goal 并开始能力闭环检查" });
+    const restoredCanonicalIR = parseCanonicalSkillIR(initialFiles);
+    const restoredPlan = reconcileCapabilityPlanWithCanonicalIR(generationPlan, restoredCanonicalIR);
+    const planChangedAfterRestore = stableEvalContractValue(generationPlan.items.map((item) => ({ id: item.id, status: item.status, enabled: item.enabled })))
+      !== stableEvalContractValue(restoredPlan.items.map((item) => ({ id: item.id, status: item.status, enabled: item.enabled })));
+    generationPlan = restoredPlan;
+    if (planChangedAfterRestore) {
+      setCapabilityPlan(restoredPlan);
+      reportClientGenerationLoopEvent("generation_loop_phase", {
+        phase: "canonical-plan-restore",
+        reason: "已用冻结 Bundle 的 Canonical SkillIR 恢复能力计划，消除刷新后 UI 状态与 Bundle 能力图的漂移",
+      });
+    }
     let evaluationAnswers = { ...demoAnswers };
     if (!evaluationAnswers.__previewInput?.trim()) {
       try {
@@ -6367,14 +6652,22 @@ export default function Home() {
     try {
       const evalVersion = String((JSON.parse(initialFiles["evals/evals.json"] || "{}") as { version?: unknown }).version || "");
       const evalHasRepresentativeFixture = /本用例携带的代表性输入材料如下/.test(initialFiles["evals/evals.json"] || "");
-      if (evalVersion !== "2.7" || Boolean(evaluationAnswers.__previewInput?.trim()) !== evalHasRepresentativeFixture) {
+      const evalContractAligned = evalBankMatchesCurrentContract(
+        initialFiles["evals/evals.json"] || "",
+        deriveSkillIdentity(idea, evaluationAnswers).name,
+        idea,
+        evaluationAnswers,
+        loopPlan,
+        generationPlan,
+      );
+      if (evalVersion !== "2.7" || !evalContractAligned || Boolean(evaluationAnswers.__previewInput?.trim()) !== evalHasRepresentativeFixture) {
         const migratedEvalBank = createSpecificEvals(deriveSkillIdentity(idea, evaluationAnswers).name, idea, evaluationAnswers, loopPlan, generationPlan);
         const existingIR = parseCanonicalSkillIR(initialFiles);
         compilerInputFiles = finalizeSkillFiles({
           ...initialFiles,
           "evals/evals.json": migratedEvalBank,
         }, idea, evaluationAnswers, contextBundle, generationPlan, loopPlan, existingIR ? bindSkillIREvals(existingIR, migratedEvalBank) : undefined);
-        reportClientGenerationLoopEvent("generation_loop_phase", { phase: "eval-contract-migration", reason: `评测契约 ${evalVersion || "legacy"} → 2.7：优先复用真实 Demo 输入，并为可确定补齐的关键决策生成隔离分支 fixture；没有核心 fixture 时只验证最小输入请求` });
+        reportClientGenerationLoopEvent("generation_loop_phase", { phase: "eval-contract-migration", reason: `评测契约 ${evalVersion || "legacy"} 已按当前 Skill 意图重新绑定：清除跨任务样本，优先复用真实 Demo 输入，并为可确定补齐的关键决策生成隔离分支 fixture` });
       }
     } catch {
       const migratedEvalBank = createSpecificEvals(deriveSkillIdentity(idea, evaluationAnswers).name, idea, evaluationAnswers, loopPlan, generationPlan);
@@ -6515,6 +6808,8 @@ export default function Home() {
     let bestHarness = initialBestHarness;
     let bestEvidence = bestHarness.evidence;
     let blindResult = await runBlindHarnessComparison(baselineHarness, bestHarness);
+    let comparisonRevision = skillBundleRevision(bestFiles);
+    let comparisonStage: GenerationLoopState["comparisonStage"] = "initial";
 
     const baselineMetrics = summarizeGenerationEvidence(baselineEvidence);
     let bestMetrics = summarizeGenerationEvidence(bestEvidence);
@@ -6525,6 +6820,12 @@ export default function Home() {
       phase: "diagnose",
       baselineScore: baselineMetrics.score,
       bestScore: bestMetrics.score,
+      baselineQualityScore: blindResult.revealedScores?.left ?? baselineMetrics.score,
+      bestQualityScore: blindResult.revealedScores?.right ?? bestMetrics.score,
+      comparisonConfidence: blindResult.confidence,
+      comparisonRevision,
+      comparisonStage,
+      comparisonCaseCount: selectionCases.length,
       lift: bestMetrics.score - baselineMetrics.score,
       passRate: bestMetrics.passRate,
       contractDigest: bestHarness.contract.digest,
@@ -6659,6 +6960,7 @@ export default function Home() {
       let patchPlan: ReturnType<typeof normalizePatchPlan> = null;
       let planValidation: ReturnType<typeof validatePatchPlan> | null = null;
       let preparedPatch: ReturnType<typeof applyPatchPlan> | null = null;
+      let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate> | null = null;
       const requiredDecisionIds = rejectedHistory.flatMap((item) => item.decisionId ? [item.decisionId] : []);
       for (let planAttempt = 1; planAttempt <= PATCH_PLAN_MAX_ATTEMPTS; planAttempt += 1) {
         const patchRaw = await callAI<unknown>("optimization-patch-plan", {
@@ -6669,6 +6971,7 @@ export default function Home() {
           rolloutEvidence: { trainingEvidence, researchDecision },
           mutationBudget: DEFAULT_MUTATION_BUDGET,
           compilerProtectedArtifacts: ["evals/skill-ir.json", "evals/capability-manifest.json", ...(bestFiles["references/domain-playbook.md"] ? ["references/domain-playbook.md"] : [])],
+          canonicalTargets: canonicalMutationTargetCatalog(bestFiles),
           rejectedHistory,
           planAttempt,
         });
@@ -6703,6 +7006,27 @@ export default function Home() {
             setGenerationLoop((current) => ({ ...current, phase: "patch", stopReason: `第 ${round} 轮：修改锚点不稳定，正在自动重规划（${planAttempt}/${PATCH_PLAN_MAX_ATTEMPTS}）` }));
             continue;
           }
+          try {
+            canonicalCandidate = applyCanonicalCandidate({
+              currentFiles: bestFiles,
+              rawMutations: constrainedPlan.canonicalMutations,
+              implementationFiles: Object.fromEntries(preparedPatch.changedPaths.map((path) => [path, preparedPatch?.files[path] || ""])),
+              idea,
+              answers: evaluationAnswers,
+              sourceEvidence: sourceInsightText,
+              capabilityPlan: generationPlan,
+              loopPlan,
+            });
+            if (!canonicalCandidate.materialDiff) throw new Error("CanonicalMutation 经投影后没有产生语义变化");
+          } catch (error) {
+            const reason = `Planner 第 ${planAttempt} 次未通过 Canonical IR 检查：${error instanceof Error ? error.message : "CanonicalMutation 无法应用"}`;
+            rejectedHistory.push({ round, reason, files: validation.changedPaths });
+            reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan", round, attempt: planAttempt, accepted: false, updatedPaths: validation.changedPaths, reason });
+            setGenerationLoop((current) => ({ ...current, phase: "patch", stopReason: `第 ${round} 轮：Canonical Mutation 无效，正在携带失败证据重规划（${planAttempt}/${PATCH_PLAN_MAX_ATTEMPTS}）` }));
+            preparedPatch = null;
+            canonicalCandidate = null;
+            continue;
+          }
           patchPlan = constrainedPlan;
           planValidation = validation;
           if (constrainedPlan.operations.length < normalizedPlan.operations.length) {
@@ -6716,39 +7040,13 @@ export default function Home() {
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan", round, attempt: planAttempt, accepted: false, updatedPaths: validation.changedPaths, reason });
         setGenerationLoop((current) => ({ ...current, phase: "patch", stopReason: `第 ${round} 轮：Patch Plan 不安全，正在自动缩小并重规划（${planAttempt}/${PATCH_PLAN_MAX_ATTEMPTS}）` }));
       }
-      if (!patchPlan || !planValidation?.valid || !preparedPatch) {
+      if (!patchPlan || !planValidation?.valid || !preparedPatch || !canonicalCandidate) {
         rejectedPatches += 1;
         stopReason = `Planner 已自动重规划 ${PATCH_PLAN_MAX_ATTEMPTS} 次，仍没有落在安全修改面内；已保留当前可用版本`;
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "impact", round, accepted: false, reason: stopReason });
         break;
       }
       const applied = preparedPatch;
-      let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate>;
-      try {
-        canonicalCandidate = applyCanonicalCandidate({
-          currentFiles: bestFiles,
-          rawMutations: patchPlan.canonicalMutations,
-          implementationFiles: Object.fromEntries(applied.changedPaths.map((path) => [path, applied.files[path]])),
-          idea,
-          answers: evaluationAnswers,
-          sourceEvidence: sourceInsightText,
-          capabilityPlan: generationPlan,
-          loopPlan,
-        });
-      } catch (error) {
-        rejectedPatches += 1;
-        const reason = error instanceof Error ? error.message : "CanonicalMutation 无法应用";
-        rejectedHistory.push({ round, reason, files: applied.changedPaths });
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "canonical-mutation", round, accepted: false, updatedPaths: applied.changedPaths, reason });
-        continue;
-      }
-      if (!canonicalCandidate.materialDiff) {
-        rejectedPatches += 1;
-        const reason = "Patch was erased by canonical projection：语义 digest 与 implementation bytes 均未变化，已在 Eval 前拒绝";
-        rejectedHistory.push({ round, reason, files: applied.changedPaths });
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "canonical-mutation", round, accepted: false, updatedPaths: applied.changedPaths, reason });
-        continue;
-      }
       const candidateFiles = canonicalCandidate.files;
       const candidateChangedPaths = [...new Set([...canonicalCandidate.changedTargets, ...applied.changedPaths])];
       const candidateBundleValidation = await validateBundle(candidateFiles);
@@ -6883,8 +7181,10 @@ export default function Home() {
       }
 
       let acceptedBaselineBlind = blindResult;
+      let acceptedBaselineComparisonFresh = false;
       try {
         acceptedBaselineBlind = await runBlindHarnessComparison(baselineHarness, candidateHarness);
+        acceptedBaselineComparisonFresh = true;
       } catch {
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "compare", round, accepted: true, updatedPaths: candidateChangedPaths, reason: "候选相对当前最佳已通过；无 Skill 基线复核暂时不可用，保留上一轮基线证据" });
       }
@@ -6912,6 +7212,10 @@ export default function Home() {
       bestEvidence = candidateEvidence;
       bestHarness = candidateHarness;
       blindResult = acceptedBaselineBlind;
+      if (acceptedBaselineComparisonFresh) {
+        comparisonRevision = skillBundleRevision(bestFiles);
+        comparisonStage = "optimized";
+      }
       bestSemantic = candidateSemantic;
       bestPipelineIssues = includeAnonymousBaselineEvidence(candidatePipelineIssues, blindResult);
       bestCrossArtifact = candidateCrossArtifact;
@@ -6994,10 +7298,27 @@ export default function Home() {
       stopReason = `${stopReason}；精简检查通过，没有发现可安全删除的重复或无效内容`;
     }
 
+    // The public comparison must describe the exact final Bundle. Candidate
+    // acceptance and the minimality pass can both change the canonical
+    // revision after the first A/B run; never surface scores from an older
+    // projection as if they belonged to the final files.
+    const finalBundleRevision = skillBundleRevision(bestFiles);
+    if (comparisonRevision !== finalBundleRevision) {
+      try {
+        blindResult = await runBlindHarnessComparison(baselineHarness, bestHarness);
+        comparisonRevision = finalBundleRevision;
+        comparisonStage = acceptedPatches > 0 ? "post-prune" : "optimized";
+        reportClientGenerationLoopEvent("generation_loop_phase", { phase: "final-compare", accepted: true, reason: `匿名对照已绑定最终 Bundle ${finalBundleRevision.slice(0, 12)}` });
+      } catch (error) {
+        reportClientGenerationLoopEvent("generation_loop_phase", { phase: "final-compare", accepted: false, reason: `最终 Bundle 对照未完成：${error instanceof Error ? error.message : "未知错误"}` });
+      }
+    }
+
     const remainingCritical = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
+    const comparisonIsCurrent = comparisonRevision === finalBundleRevision;
     const qualityGoalSatisfied = generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: remainingCritical });
-    const passed = qualityGoalSatisfied && blindResult.revealedWinner !== "left";
-    const stableAtCeiling = !passed && generationEvaluationAtCeiling({
+    const passed = comparisonIsCurrent && qualityGoalSatisfied && blindResult.revealedWinner !== "left";
+    const stableAtCeiling = comparisonIsCurrent && !passed && blindResult.revealedWinner === "tie" && generationEvaluationAtCeiling({
       evidence: bestMetrics,
       baseline: baselineMetrics,
       closureScore: bestClosure.score,
@@ -7005,6 +7326,9 @@ export default function Home() {
       criticalSemanticIssues: remainingCritical,
     });
     const remainingIssues = [
+      ...(baselineMetrics.score === 100 && bestMetrics.score === 100 && blindResult.revealedWinner !== "tie"
+        ? ["绝对断言评分已触顶，但匿名质量比较仍能区分结果；当前 Eval 存在低区分度断言，不能把 100 分解释为满分质量"]
+        : []),
       ...(blindResult.revealedWinner === "left" ? [`匿名结果比较仍更偏好无 Skill 基线：${blindResult.evidence}`] : []),
       ...optimizationPolicyFor(bestPipelineIssues).selected.map((item) => `${item.priority} · ${item.evidence}`),
       ...bestEvidence.failurePatterns.map((item) => `保留任务 · ${item}`),
@@ -7017,6 +7341,12 @@ export default function Home() {
       rounds: Math.min(GENERATION_GOAL_MAX_ROUNDS, acceptedPatches + rejectedPatches),
       baselineScore: baselineMetrics.score,
       bestScore: bestMetrics.score,
+      baselineQualityScore: blindResult.revealedScores?.left ?? baselineMetrics.score,
+      bestQualityScore: blindResult.revealedScores?.right ?? bestMetrics.score,
+      comparisonConfidence: blindResult.confidence,
+      comparisonRevision,
+      comparisonStage,
+      comparisonCaseCount: selectionCases.length,
       lift: bestMetrics.score - baselineMetrics.score,
       passRate: bestMetrics.passRate,
       closureScore: bestClosure.score,
@@ -7031,7 +7361,7 @@ export default function Home() {
       minimalityChecked: true,
       issues: remainingIssues,
       stopReason: stableAtCeiling
-        ? "冻结评测已完整跑完：无 Skill 与当前版本均达到 100 分，保留任务全部通过且能力闭环完整。新候选没有证明额外提升，系统已回滚候选并保留当前最佳版本。"
+        ? "冻结断言评测已完整跑完并触顶，匿名逐项质量比较结果接近；新候选没有证明额外提升，系统已回滚并保留当前最佳版本。"
         : passed
           ? stopReason
           : remainingIssues.length ? `${stopReason}；仍有需要观察的问题` : stopReason,
@@ -8835,17 +9165,19 @@ export default function Home() {
                   })}
                 </div>
               </section>
-              <section className={`generation-loop-result ${optimizationStableAtCeiling ? "stable" : generationLoop.status}`} aria-label="Optimization Loop 结果">
+              <section className={`generation-loop-result ${optimizationStableAtCeiling || optimizationCompletedWithRollback ? "completed" : generationLoop.status}`} aria-label="Optimization Loop 结果">
                 <div className="generation-loop-head">
-                  <div><span>OPTIMIZATION LOOP · 只做有证据的局部优化</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationStableAtCeiling ? "评测已完成，当前版本处于稳定上限" : optimizationBlockedByBuild ? "等待 Build Loop 修复完成后启动" : generationLoop.status === "attention" ? "当前证据不足以接受候选" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{optimizationStableAtCeiling ? "无 Skill 与当前版本都达到评测上限，保留任务全部通过。候选没有证明额外提升，系统已自动回滚并保留当前最佳版本。" : generationLoop.stopReason}</p></div>
+                  <div><span>OPTIMIZATION LOOP · 只做有证据的局部优化</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationStableAtCeiling ? "评测已完成，当前版本处于稳定上限" : optimizationCompletedWithRollback ? "评测已完成，已保留当前最佳版本" : optimizationBlockedByBuild ? "等待 Build Loop 修复完成后启动" : generationLoop.status === "attention" ? "Optimization Loop 需要处理" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{optimizationStableAtCeiling ? "无 Skill 与当前版本都达到评测上限，保留任务全部通过。候选没有证明额外提升，系统已自动回滚并保留当前最佳版本。" : optimizationCompletedWithRollback ? "候选已完成真实试跑，但没有稳定优于当前版本，因此系统自动回滚候选。当前最佳版本没有被失败修改覆盖。" : generationLoop.stopReason}</p></div>
                   <div className="generation-loop-actions">
-                    <em>{gateOutcomes.optimization.verdict === "satisfied" ? "✓ 已接受" : optimizationStableAtCeiling ? "✓ 已保留最佳版" : optimizationBlockedByBuild ? "未启动" : generationLoop.status === "attention" ? "证据不足" : generationLoop.status === "running" ? "执行中" : "未运行"}</em>
+                    <em>{gateOutcomes.optimization.verdict === "satisfied" ? "✓ 已接受" : optimizationStableAtCeiling ? "✓ 已保留最佳版" : optimizationCompletedWithRollback ? "✓ 已安全回滚" : optimizationBlockedByBuild ? "未启动" : generationLoop.status === "attention" ? "需处理" : generationLoop.status === "running" ? "执行中" : "未运行"}</em>
                     <button type="button" className={`loop-notification-button ${notificationPermission}`} onClick={() => void requestCompletionNotifications()}>{notificationPermission === "granted" ? "✓ 完成通知已开启" : notificationPermission === "denied" ? "通知被阻止" : notificationPermission === "unsupported" ? "不支持通知" : "完成后通知我"}</button>
-                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在重跑…" : optimizationBlockedByBuild ? "继续修复并启动" : "只重跑 Optimization Loop"}</button>}
+                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在重跑…" : optimizationBlockedByBuild ? "继续修复并启动" : optimizationCompletedWithRollback ? "再次尝试优化" : "重跑 Optimization Loop"}</button>}
                   </div>
                 </div>
-                {generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>证据类型</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "重复 held-out 比较" : "模型观察"}</strong><em>{gateOutcomes.optimization.sampleSize} 次 · 随机性证据</em></div>}
-                <div className="generation-loop-flow optimization-loop-flow">
+                {optimizationBlockedByBuild
+                  ? <div className="optimization-waiting-note">真实试跑尚未开始；当前只显示 Build Loop 的待修复原因，不提前展示评分、Lift 或 held-out 证据。</div>
+                  : generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>证据类型</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "重复 held-out 比较" : "模型观察"}</strong><em>{gateOutcomes.optimization.sampleSize} 次 · 随机性证据</em></div>}
+                {!optimizationBlockedByBuild && <div className="generation-loop-flow optimization-loop-flow">
                   {OPTIMIZATION_LOOP_STEPS.map((label, index) => {
                     const reachedIndex = generationLoop.status === "passed" || generationLoop.minimalityChecked
                       ? OPTIMIZATION_LOOP_STEPS.length - 1
@@ -8859,8 +9191,8 @@ export default function Home() {
                         : index < reachedIndex ? "done" : index === reachedIndex ? optimizationBlockedByBuild ? "" : generationLoop.status === "attention" ? "failed" : "active" : "";
                     return <span className={flowState} key={label}><i>{flowState === "done" ? "✓" : flowState === "failed" ? "!" : index + 1}</i>{label}</span>;
                   })}
-                </div>
-                {generationLoop.status !== "idle" && <div className="generation-loop-metrics">
+                </div>}
+                {generationLoop.status !== "idle" && !optimizationBlockedByBuild && <div className="generation-loop-metrics">
                   <div><span>无 Skill 基线</span><strong>{generationLoop.baselineScore || "—"}</strong></div>
                   <div><span>当前最佳版本</span><strong>{generationLoop.bestScore || "—"}</strong></div>
                   <div className={generationLoop.lift > 0 ? "positive" : ""}><span>Skill Lift</span><strong>{generationLoop.bestScore ? `${generationLoop.lift >= 0 ? "+" : ""}${generationLoop.lift}` : "—"}</strong></div>
@@ -8870,7 +9202,7 @@ export default function Home() {
                   <div><span>隔离试跑证据</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkRuns} 次 · 波动 ${generationLoop.bestStddev}` : "—"}</strong></div>
                   <div><span>匿名结果比较</span><strong>{generationLoop.blindWinner === "candidate" ? "当前版本胜" : generationLoop.blindWinner === "baseline" ? "无 Skill 基线胜" : generationLoop.blindWinner === "tie" ? "两者持平" : "—"}</strong></div>
                 </div>}
-                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{optimizationStableAtCeiling ? `查看 ${generationLoop.issues.length} 条比较说明` : `查看仍需观察的 ${generationLoop.issues.length} 项`}</summary><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
+                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{optimizationStableAtCeiling ? `查看 ${generationLoop.issues.length} 条比较说明` : optimizationCompletedWithRollback ? `查看 ${generationLoop.issues.length} 条未采纳证据` : `查看仍需观察的 ${generationLoop.issues.length} 项`}</summary><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
               </section>
               <div className="editor-shell">
                 <div className="file-tree">
@@ -8930,15 +9262,23 @@ export default function Home() {
                 <b>已试跑 {demoRunCount} 次</b>
               </div>
 
-              {generationLoop.benchmarkRuns > 0 && (
+              {generationLoop.benchmarkRuns > 0 && generationLoop.comparisonRevision === currentBundleRevision && (
                 <section className={`user-proof-card ${generationLoop.blindWinner}`}>
-                  <div className="user-proof-copy"><span>正式对照证据 · 不是理解预演</span><strong>{generationLoop.blindWinner === "candidate" ? "专属 Skill 在匿名比较中更好" : generationLoop.blindWinner === "baseline" ? "当前 Skill 还没有稳定超过普通 AI" : "当前 Skill 与普通 AI 表现接近"}</strong><p>{generationLoop.blindWinner === "candidate" ? "系统把结果隐藏身份后再比较，避免因为知道哪份用了 Skill 就偏向它。" : "系统保留了真实结果，没有用文件完整度或漂亮措辞把它包装成已经有效。你仍可以通过下面的 Demo 继续纠偏。"}</p></div>
+                  <div className="user-proof-copy"><span>{generationLoop.comparisonStage === "initial" ? "当前版本正式对照 · 本轮未采纳新候选" : "优化后正式对照 · 已绑定最终版本"}</span><strong>{generationLoop.blindWinner === "candidate" ? "专属 Skill 在匿名比较中更好" : generationLoop.blindWinner === "baseline" ? "当前 Skill 还没有稳定超过普通 AI" : "当前 Skill 与普通 AI 表现接近"}</strong><p>{generationLoop.comparisonStage === "initial" ? "Optimization Loop 已完成，但没有候选同时通过保留任务与匿名比较；这里展示的是本轮重新执行的当前版本，不是旧缓存。" : generationLoop.blindWinner === "candidate" ? "系统按逐项标准重新汇总分数，并把匿名结果绑定到最终 Bundle 版本。" : "系统保留真实结果，没有用结构完整度或模型自报总分把它包装成已经有效。"}</p></div>
                   <div className="user-proof-metrics">
-                    <div><span>普通 AI</span><strong>{generationLoop.baselineScore}</strong></div>
-                    <div><span>你的 Skill</span><strong>{generationLoop.bestScore}</strong></div>
-                    <div className={generationLoop.lift > 0 ? "positive" : generationLoop.lift < 0 ? "negative" : ""}><span>实际变化</span><strong>{generationLoop.lift >= 0 ? "+" : ""}{generationLoop.lift}</strong></div>
-                    <div><span>隔离试跑</span><strong>{generationLoop.benchmarkRuns} 次</strong></div>
+                    <div><span>普通 AI 质量</span><strong>{generationLoop.baselineQualityScore}</strong></div>
+                    <div><span>你的 Skill 质量</span><strong>{generationLoop.bestQualityScore}</strong></div>
+                    {(() => {
+                      const qualityDelta = generationLoop.bestQualityScore - generationLoop.baselineQualityScore;
+                      return <div className={qualityDelta > 0 ? "positive" : qualityDelta < 0 ? "negative" : ""}><span>盲评变化</span><strong>{qualityDelta >= 0 ? "+" : ""}{qualityDelta}</strong></div>;
+                    })()}
+                    <div><span>评测证据</span><strong>{generationLoop.comparisonCaseCount} 个场景 · {generationLoop.benchmarkRuns} 次执行</strong></div>
                   </div>
+                </section>
+              )}
+              {generationLoop.benchmarkRuns > 0 && generationLoop.comparisonRevision !== currentBundleRevision && (
+                <section className="user-proof-card attention">
+                  <div className="user-proof-copy"><span>最终版本对照尚未完成</span><strong>旧版本分数已隐藏</strong><p>Bundle 在最近一次匿名比较后发生了变化。系统不会把旧结果冒充为当前版本证据，请重新运行 Optimization Loop。</p></div>
                 </section>
               )}
 

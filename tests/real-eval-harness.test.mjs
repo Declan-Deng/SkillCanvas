@@ -206,8 +206,49 @@ test("anonymizes candidate identity before pairwise comparison", () => {
     winner: "B",
     confidence: 0.9,
     evidence: "B 更完整",
+    rubric: {
+      criteria: [
+        { id: "correctness", label: "正确完成任务", kind: "content" },
+        { id: "usability", label: "结果可直接使用", kind: "structure" },
+        { id: "completeness", label: "覆盖冻结要求", kind: "content" },
+        { id: "grounding", label: "不增加无依据断言", kind: "content" },
+      ],
+      A: {
+        criterionScores: { correctness: 5, usability: 5, completeness: 5, grounding: 5 },
+        criterionEvidence: { correctness: "core-1 正确", usability: "negative-1 可用", completeness: "core-1 完整", grounding: "negative-1 无额外断言" },
+        strengths: ["完整"], weaknesses: [],
+      },
+      B: {
+        criterionScores: { correctness: 5, usability: 5, completeness: 5, grounding: 5 },
+        criterionEvidence: { correctness: "core-1 正确", usability: "negative-1 可用", completeness: "core-1 完整", grounding: "negative-1 无额外断言" },
+        strengths: ["更贴合任务"], weaknesses: [],
+      },
+    },
     caseResults: cases().map((item) => ({ caseId: item.id, winner: "B", evidence: "B 满足更多冻结要求" })),
   }, cases().map((item) => item.id));
   assert.ok(comparison);
   assert.equal(comparison.caseResults.length, 2);
+  assert.deepEqual(comparison.qualityScores, { A: 94, B: 94 }, "small held-out samples cannot self-declare a perfect score");
+  assert.equal(comparison.winner, "B", "case-level evidence breaks a tied rubric without fabricating a numeric margin");
+});
+
+test("recomputes blind quality locally instead of trusting a model-reported total", () => {
+  const ids = cases().map((item) => item.id);
+  const criteria = ["correctness", "completeness", "grounding", "usability"].map((id) => ({ id, label: id, kind: id === "usability" ? "structure" : "content" }));
+  const evidence = Object.fromEntries(criteria.map(({ id }, index) => [id, `${ids[index % ids.length]} observable behavior`]));
+  const comparison = normalizeBlindComparison({
+    winner: "A",
+    confidence: 0.9,
+    evidence: "model preferred A",
+    rubric: {
+      criteria,
+      A: { criterionScores: Object.fromEntries(criteria.map(({ id }) => [id, 3])), criterionEvidence: evidence, overallScore: 100, strengths: [], weaknesses: ["material gap"] },
+      B: { criterionScores: Object.fromEntries(criteria.map(({ id }) => [id, 4])), criterionEvidence: evidence, overallScore: 1, strengths: ["strong"], weaknesses: [] },
+    },
+    caseResults: cases().map((item) => ({ caseId: item.id, winner: "B", evidence: "B is observably stronger" })),
+  }, ids);
+  assert.ok(comparison);
+  assert.deepEqual(comparison.qualityScores, { A: 60, B: 80 });
+  assert.equal(comparison.winner, "B");
+  assert.equal(comparison.confidence, 0.6, "confidence is capped when the reported winner conflicts with deterministic aggregation");
 });

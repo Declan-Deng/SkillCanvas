@@ -7,12 +7,16 @@ import {
   bindSkillIREvals,
   compileSkillIR,
   deriveTaskInputContract,
+  ensureSkillIREvalCoverage,
   ensureSkillSemanticClosure,
   projectCapabilityManifest,
   projectCapabilityRuntimeOperation,
   projectEvalBank,
   projectSkillMarkdown,
   projectToolContracts,
+  reconcileSkillIRContentPermission,
+  reconcileSkillIRInputResolutions,
+  reconcileSkillIRSourceEvidence,
 } from "../app/skill-ir.ts";
 import {
   applySkillIRMutations,
@@ -130,6 +134,62 @@ test("canonical runtime projection links every compiler-owned knowledge resource
   const projected = projectSkillMarkdown(ir);
   assert.match(projected, /\[Evidence-grounded domain playbook\]\(references\/domain-playbook\.md\)/);
   assert.match(projected, /\[User-provided source evidence\]\(references\/source-evidence\.md\)/);
+});
+
+test("source evidence is projected only when its file is materialized", () => {
+  const ir = compile();
+  const sourceCapability = {
+    ...ir.capabilities[0],
+    id: "source-evidence",
+    kind: "reference",
+    name: "Uploaded source evidence",
+    implementation: { path: "references/source-evidence.md", layer: "runtime", status: "use-provided" },
+  };
+  ir.capabilities.push(sourceCapability);
+  ir.tasks[0].capabilityIds.push(sourceCapability.id);
+  ir.runtimeContract.workflow.push({
+    id: "step-source-evidence",
+    capabilityIds: [sourceCapability.id],
+    when: "uploaded source evidence exists",
+    input: "uploaded source evidence",
+    action: "read the evidence",
+    output: "grounded decisions",
+    fallback: "continue without source-specific decisions",
+  });
+  ir.resourcePlan.resources.push({
+    capabilityId: sourceCapability.id,
+    kind: "reference",
+    path: "references/source-evidence.md",
+    decision: "include",
+    reason: "user supplied evidence",
+    consumerTaskIds: ["task-core"],
+  });
+
+  const withoutSource = reconcileSkillIRSourceEvidence(ir, false);
+  assert.equal(withoutSource.capabilities.some((item) => item.id === sourceCapability.id), false);
+  assert.equal(withoutSource.resourcePlan.resources.some((item) => item.path === "references/source-evidence.md"), false);
+  assert.equal(withoutSource.runtimeContract.workflow.some((item) => item.capabilityIds.includes(sourceCapability.id)), false);
+  assert.doesNotMatch(projectSkillMarkdown(withoutSource), /references\/source-evidence\.md/);
+
+  const withSource = reconcileSkillIRSourceEvidence(compile(), true);
+  assert.match(projectSkillMarkdown(withSource), /\[User-provided source evidence\]\(references\/source-evidence\.md\)/);
+});
+
+test("owner content permission is canonical and removes conflicting generator defaults", () => {
+  const answers = { "__idea": "可以随意扩写并增加经历和量化数据，让结果更符合目标" };
+  const ir = compile();
+  ir.stateRequirement = {
+    needed: false,
+    scope: "none",
+    missingBehavior: "缺少信息时不把未知当作事实，并禁止编造经历",
+  };
+  ir.evaluationPlan.failureModes.push("禁止编造量化数据");
+
+  const reconciled = reconcileSkillIRContentPermission(ir, answers);
+  const projected = projectSkillMarkdown(reconciled);
+  assert.equal(reconciled.controlModel.contentPermission.allowFactualCreation, true);
+  assert.match(projected, /可以随意扩写并增加经历和量化数据/);
+  assert.doesNotMatch(JSON.stringify(reconciled), /禁止编造经历|不把未知当作事实|禁止编造量化数据/);
 });
 
 test("tool contracts preserve the canonical capability scope contract", () => {
@@ -294,6 +354,25 @@ test("a required task input never inherits a meaningless not-applicable missing 
   assert.match(inputs[0].missingBehavior, /请求|提供/);
 });
 
+test("canonical migration fills legacy input resolution before optimizer mutations", () => {
+  const plan = fixturePlan();
+  const ir = compileSkillIR({
+    skillName: "legacy-input-skill",
+    idea: "根据任务说明处理原始材料",
+    answers: { inputs: "任务说明；原始材料" },
+    plan,
+    loop: { mode: "single-pass", goal: "交付结果", maxRounds: 1, stopConditions: ["完成"], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "处理原始材料", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  });
+  const legacy = structuredClone(ir);
+  delete legacy.inputs[0].resolution;
+  legacy.inputs[0].missingBehavior = "";
+  assert.equal(validateCanonicalSkillIR(legacy).valid, false);
+  const migrated = reconcileSkillIRInputResolutions(legacy, { inputs: "任务说明；原始材料" });
+  assert.equal(validateCanonicalSkillIR(migrated).valid, true);
+  assert.ok(migrated.inputs[0].resolution.stopCondition);
+});
+
 test("semantically distinct inputs remain independently required", () => {
   const inputs = deriveTaskInputContract({
     idea: "根据目标岗位说明改写现有材料",
@@ -370,6 +449,43 @@ test("Eval bindings and manifest are projections of the same SkillIR", () => {
   assert.deepEqual(auditSkillIRFiles(files), []);
   assert.deepEqual(ir.capabilities.find((item) => item.id === "core-resume")?.evalCaseIds, ["core-1"]);
   assert.equal(manifest.skill_ir.path, "evals/skill-ir.json");
+});
+
+test("canonical eval compiler deterministically closes every active capability after restore", () => {
+  const ir = compile();
+  const domainCapability = {
+    ...ir.capabilities[0],
+    id: "domain-decision-playbook",
+    kind: "reference",
+    name: "Domain decision playbook",
+    requirement: "Use source-backed domain decisions when their routing condition matches",
+    input: "current task conditions",
+    output: "source-backed decision",
+    evidenceRequirements: ["applies the routed domain decision and keeps its evidence boundary visible"],
+    implementation: { path: "references/domain-playbook.md", layer: "runtime", status: "generate" },
+  };
+  ir.capabilities.push(domainCapability);
+  ir.tasks[0].capabilityIds.push(domainCapability.id);
+  const seed = JSON.stringify({
+    version: "2.7",
+    skill_name: ir.identity.skillName,
+    evals: [
+      { id: "trigger-explicit", eval_family: "trigger", category: "trigger_explicit", should_trigger: true, capability_ids: [] },
+      { id: "trigger-implicit", eval_family: "trigger", category: "trigger_implicit", should_trigger: true, capability_ids: [] },
+      { id: "trigger-context", eval_family: "trigger", category: "trigger_context", should_trigger: true, capability_ids: [] },
+      { id: "trigger-negative", eval_family: "trigger", category: "trigger_negative", should_trigger: false, capability_ids: [] },
+      { id: "core-resume", eval_family: "capability", category: "core_capability", should_trigger: true, capability_ids: ["core-resume"], graders: ["core_capability"], prompt: "这是一个包含目标岗位要求和候选人经历的真实简历改写任务，请产出可以直接使用的改写结果。" },
+    ],
+  });
+  const covered = ensureSkillIREvalCoverage(ir, seed);
+  const parsed = JSON.parse(covered);
+  const domainCase = parsed.evals.find((item) => item.capability_ids?.includes(domainCapability.id));
+  assert.equal(parsed.evals.length <= 20, true);
+  assert.equal(domainCase?.eval_family, "grounding");
+  assert.deepEqual(domainCase?.graders, ["grounding"]);
+  assert.equal(domainCase?.prompt, "这是一个包含目标岗位要求和候选人经历的真实简历改写任务，请产出可以直接使用的改写结果。");
+  const bound = bindSkillIREvals(ir, covered);
+  assert.deepEqual(bound.capabilities.find((item) => item.id === domainCapability.id)?.evalCaseIds, [domainCase.id]);
 });
 
 test("frozen SkillIR rejects semantic edits to every canonical projection", () => {
