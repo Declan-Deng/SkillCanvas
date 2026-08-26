@@ -171,6 +171,16 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /再次尝试优化/);
   assert.match(page, /evalBankMatchesCurrentContract/);
   assert.match(page, /Canonical Mutation 无效，正在携带失败证据重规划/);
+  assert.match(page, /baselineQualityScore:\s*initialComparison\.baselineScore/);
+  assert.match(page, /bestQualityScore:\s*finalComparison\.skillScore/);
+  assert.match(page, /baselineQualityScore:\s*comparison\.baselineScore/);
+  assert.match(page, /bestQualityScore:\s*comparison\.skillScore/);
+  assert.doesNotMatch(page, /baselineQualityScore:\s*blindResult\.revealedScores/);
+  assert.match(page, /普通 AI · 4 场景总分/);
+  assert.match(page, /你的 Skill · 4 场景总分/);
+  assert.match(page, /当前单场景 ·/);
+  assert.match(page, /不与多场景总分直接比较/);
+  assert.match(page, /本次提案=\$\{attempted\}/);
   assert.match(page, /评测已完成，当前版本处于稳定上限/);
   assert.match(page, /✓ 已保留最佳版/);
   assert.match(page, /generationLoop\.status === "attention" && !optimizationStableAtCeiling/);
@@ -198,18 +208,20 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /AI 修复并重新评估/);
   assert.match(page, /AI 正在修复发布前问题/);
   assert.match(page, /还有少量不会阻止下载的提醒/);
-  assert.match(page, /这个 Skill 真正需要哪些能力/);
+  assert.match(page, /AI 工具建议/);
   assert.match(page, /目标、子目标与循环/);
   assert.match(page, /AI 已推荐并采用一条可执行流程/);
   assert.match(page, /推荐工作流：目标、子目标与循环/);
   assert.match(page, /本次无需额外安装/);
   assert.match(page, /没有为了显得“专业”而机械添加 MCP/);
+  assert.match(page, /if \(!normalizedQueries\.length \|\| !mcpConnections\.length\) return empty/);
+  assert.match(page, /mcpConnections\.length > 0 && knowledgeMcpReport/);
+  assert.match(page, /initialResearch\.knowledgeGaps\.length && mcpConnections\.length > 0/);
   assert.match(page, /质检标准不是目标/);
   assert.match(page, /粘贴你已经在使用的方法、步骤、检查清单或 Prompt/);
   assert.ok(page.indexOf('id: "existingPrompt"') < page.indexOf('id: "idealOutput"'));
   assert.ok(page.indexOf('id: "idealOutput"') < page.indexOf('id: "negativeOutput"'));
   assert.ok(page.indexOf('id: "negativeOutput"') < page.indexOf('id: "background"'));
-  assert.match(page, /核心能力会自动生成真实文件/);
   assert.match(page, /代表性任务试跑/);
   assert.match(page, /function runDemoAndReview\(/);
   assert.match(page, /function runOptimizationLoop\(/);
@@ -233,7 +245,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /<details className="knowledge-atom-details">/);
   assert.match(page, /Notification\.requestPermission\(\)/);
   assert.match(page, /notifyGenerationLoopResult\(state\)/);
-  assert.match(page, /完成后通知我/);
+  assert.match(page, /完成后通过浏览器通知你/);
   assert.match(page, /runIsolatedEvalHarness/);
   assert.match(page, /批量隔离执行漏返回用例，自动拆成单用例补跑/);
   assert.match(page, /批量隔离执行失败，自动拆成单用例补跑/);
@@ -243,7 +255,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /评测契约[^\n]+→ 2\.3/);
   assert.match(page, /runBlindHarnessComparison/);
   assert.match(page, /冻结评测/);
-  assert.match(page, /隔离试跑证据/);
+  assert.match(page, /隔离执行/);
   assert.match(page, /匿名结果比较/);
   assert.match(route, /mode === "eval-execute"/);
   assert.match(route, /mode === "eval-grade"/);
@@ -255,9 +267,23 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /function enterEvaluation\(\)/);
   assert.match(page, /onClick=\{enterEvaluation\}/);
   assert.match(page, /function sendDemoChatMessage\(\)/);
+  assert.match(page, /function handleDemoChatFiles\(/);
+  assert.match(page, /function reevaluateDemoConversation\(/);
+  assert.match(page, /更新评分/);
+  assert.doesNotMatch(page, /次试跑完成/);
+  assert.match(page, /restoreFrozenBundleExactly/);
+  assert.match(page, /current-format snapshots byte-for-byte/);
+  assert.match(page, /重新验证当前版本/);
+  assert.match(page, /demoConversationScoredReplyId/);
+  assert.match(page, /hasNewConversationEvidence/);
+  assert.match(page, /先继续对话一轮，AI 回复后即可更新评分/);
+  assert.doesNotMatch(page, /completedConversationTurns < 2/);
+  assert.match(page, /accept="\.pdf,\.md,\.txt,\.json,\.csv,\.html,\.js,\.ts,\.tsx,\.py"/);
   assert.doesNotMatch(page, /继续试用这个 Skill/);
   assert.match(route, /mode === "demo-chat"/);
   assert.match(route, /continuing the same visible trial/);
+  assert.match(route, /Multi-turn conversation evidence/);
+  assert.match(route, /A file attached during the conversation is user-provided material/);
   assert.match(page, /const CAPABILITY_LIBRARY/);
   assert.match(page, /宿主 Tools 与外部 MCP 分开选择/);
   assert.match(page, /function explainSkillFile\(/);
@@ -444,17 +470,20 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(css, /font-size:\s*21\.25px/);
 });
 
-test("keeps the Optimization Loop card from collapsing inside the build workspace", async () => {
+test("keeps the generated Skill editor usable inside the build workspace", async () => {
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const buildStageRule = css.match(/\.build-stage\s*\{([\s\S]*?)\}/)?.[1] ?? "";
   const loopCardRule = css.match(/\.generation-loop-result\s*\{([\s\S]*?)\}/)?.[1] ?? "";
   const editorRule = css.match(/\.editor-shell\s*\{([\s\S]*?)\}/)?.[1] ?? "";
+  const fileTreeRule = css.match(/\.file-tree\s*\{([\s\S]*?)\}/)?.[1] ?? "";
 
   assert.match(buildStageRule, /height:\s*auto/);
   assert.match(buildStageRule, /min-height:\s*max\(600px, calc\(100vh - 70px\)\)/);
   assert.match(loopCardRule, /flex:\s*0 0 auto/);
   assert.doesNotMatch(loopCardRule, /\bheight\s*:/);
-  assert.match(editorRule, /flex:\s*1 0 470px/);
+  assert.match(editorRule, /height:\s*clamp\(520px, 68vh, 720px\)/);
+  assert.match(editorRule, /min-height:\s*520px/);
+  assert.match(fileTreeRule, /overflow-y:\s*auto/);
 });
 
 test("records client repair-gate outcomes without bundle content", async () => {
@@ -625,7 +654,7 @@ test("Eval v2.7 covers completed decision branches and script field mapping", as
   assert.match(page, /generationLoop\.status !== "idle" && generationLoop\.issues\.length/);
   assert.match(page, /__previewInput:\s*restoredPreviewInput/);
   assert.match(page, /savedEvalVersion === "2\.7"/);
-  assert.match(page, /savedLoop\.status !== "running"/);
+  assert.match(page, /savedLoopSnapshot\.status !== "running"/);
   assert.match(page, /const optimizationRunInFlight = useRef\(false\)/);
   assert.match(page, /if \(optimizationRunInFlight\.current\) return/);
 });

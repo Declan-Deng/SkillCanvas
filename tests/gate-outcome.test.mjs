@@ -6,6 +6,7 @@ import {
   buildGateOutcome,
   demoGateOutcome,
   demoScoringPolicyPrompt,
+  qualityScoringPolicyPrompt,
   optimizationGateOutcome,
 } from "../app/gate-outcome.ts";
 
@@ -54,8 +55,14 @@ test("multiple cases are not mislabeled as repeated evidence", () => {
 });
 
 test("Demo quality is not capped to compensate for weak evidence", () => {
-  assert.match(demoScoringPolicyPrompt(), /demo-observation-rubric-v1/);
+  assert.match(demoScoringPolicyPrompt(), /shared-five-dimension-rubric-v2/);
   assert.match(demoScoringPolicyPrompt(), /do not impose a special high-score ceiling/i);
   assert.doesNotMatch(demoScoringPolicyPrompt(), /\b92\b/);
   assert.equal("strongSingleRunCeiling" in DEMO_SCORING_POLICY, false);
+});
+
+test("Demo and held-out grading share the same explicit score anchors", () => {
+  const policy = qualityScoringPolicyPrompt();
+  for (const anchor of [50, 70, 85, 95, 100]) assert.match(policy, new RegExp(`\\b${anchor}\\b`));
+  assert.match(demoScoringPolicyPrompt(), /single-scenario score is not directly interchangeable/i);
 });

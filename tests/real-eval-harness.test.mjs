@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   anonymizeComparison,
   buildHarnessReport,
+  compareHarnessBenchmarks,
   freezeEvalContract,
   normalizeBlindComparison,
   normalizeHarnessExecutions,
@@ -245,6 +246,38 @@ test("anonymizes candidate identity before pairwise comparison", () => {
   assert.equal(comparison.caseResults.length, 2);
   assert.deepEqual(comparison.qualityScores, { A: 94, B: 94 }, "small held-out samples cannot self-declare a perfect score");
   assert.equal(comparison.winner, "B", "case-level evidence breaks a tied rubric without fabricating a numeric margin");
+});
+
+test("completed benchmark is not accepted when the Skill regresses", () => {
+  const contract = freezeEvalContract(cases());
+  const baselineExecutions = normalizeHarnessExecutions({ value: executionPayload(1), contract, configuration: "without_skill", runIndex: 1, durationMs: 1000 });
+  const skillExecutions = normalizeHarnessExecutions({ value: executionPayload(1, "候选"), contract, configuration: "candidate", runIndex: 1, durationMs: 1000 });
+  assert.ok(baselineExecutions && skillExecutions);
+  const baselineGrades = normalizeHarnessGrades({ value: gradePayload(75), contract, executions: baselineExecutions });
+  const skillGrades = normalizeHarnessGrades({ value: gradePayload(60), contract, executions: skillExecutions });
+  assert.ok(baselineGrades && skillGrades);
+  const baseline = buildHarnessReport({ contract, configuration: "without_skill", executions: baselineExecutions, grades: baselineGrades });
+  const skill = buildHarnessReport({ contract, configuration: "candidate", executions: skillExecutions, grades: skillGrades });
+  const comparison = compareHarnessBenchmarks(baseline, skill, "baseline");
+  assert.equal(comparison.verdict, "regressed");
+  assert.equal(comparison.lift, -15);
+  assert.equal(comparison.cases.length, 2);
+});
+
+test("benchmark comparison rejects reports from different frozen contracts", () => {
+  const baselineContract = freezeEvalContract(cases());
+  const changedCases = cases();
+  changedCases[0] = { ...changedCases[0], prompt: `${changedCases[0].prompt} 请保留时间线。` };
+  const skillContract = freezeEvalContract(changedCases);
+  const baselineExecutions = normalizeHarnessExecutions({ value: executionPayload(1), contract: baselineContract, configuration: "without_skill", runIndex: 1, durationMs: 1000 });
+  const skillExecutions = normalizeHarnessExecutions({ value: executionPayload(1), contract: skillContract, configuration: "candidate", runIndex: 1, durationMs: 1000 });
+  assert.ok(baselineExecutions && skillExecutions);
+  const baselineGrades = normalizeHarnessGrades({ value: gradePayload(75), contract: baselineContract, executions: baselineExecutions });
+  const skillGrades = normalizeHarnessGrades({ value: gradePayload(80), contract: skillContract, executions: skillExecutions });
+  assert.ok(baselineGrades && skillGrades);
+  const baseline = buildHarnessReport({ contract: baselineContract, configuration: "without_skill", executions: baselineExecutions, grades: baselineGrades });
+  const skill = buildHarnessReport({ contract: skillContract, configuration: "candidate", executions: skillExecutions, grades: skillGrades });
+  assert.throws(() => compareHarnessBenchmarks(baseline, skill, "candidate"), /同一个冻结 Eval 合约/);
 });
 
 test("recomputes blind quality locally instead of trusting a model-reported total", () => {

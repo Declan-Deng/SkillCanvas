@@ -175,7 +175,41 @@ Capability Planner 在加入能力前检查五件事：
 | `mcp` | GitHub、知识库、协作工具等命名外部服务 | 需要具体 Server、安装和授权确认 |
 | `eval` | 核心能力、触发、Grounding 和 Integration 回归 | 每个激活能力至少有对应证据 |
 
-SkillCanvas 不会在 Skill 包里“安装” MCP。未配置的 MCP 只能生成 setup、availability 与 fallback 契约，不能计为执行成功。
+SkillCanvas 不会在 Skill 包里“安装” MCP。未配置的 MCP 只能生成 setup、availability 与 fallback 契约，不能计为执行成功。对已经由用户注册并授权的 MCP Server，服务端 Runtime Adapter 可以执行真实的 Tool Discovery 与 Tool Call。
+
+### MCP Runtime Adapter
+
+`app/mcp-runtime.ts` 和 `/api/mcp` 实现了一条独立于 Skill 文案的真实运行链路：
+
+```text
+register connection
+  → discover tools
+  → verify authorization
+  → call tool
+  → input_required / approval_required
+  → persist checkpoint
+  → resume original request
+  → verify result
+  → append trace
+```
+
+- 使用官方 MCP TypeScript Client 和 Streamable HTTP Transport，不用自定义 JSON 假装 MCP。
+- 生产连接要求 HTTPS；本地开发只放行 loopback HTTP。
+- Bearer Token 加密保存在服务端凭据存储，前端连接列表不返回 Token。
+- Tool 可以返回 `input_required`。Runtime 保存原始 `requestState` 和 Workflow Checkpoint，取得用户补充输入后恢复同一调用。
+- 未授权时进入 `approval_required`，不会把鉴权失败误写成 Tool 不可用。
+- 调用结果必须通过非错误、非空内容检查，之后才把 Workflow 标记为完成。
+
+### 生成器内部的 MCP Evidence Router
+
+MCP 不只会被规划进最终 Skill。`app/internal-mcp-evidence.ts` 还把用户已经授权的只读 MCP Tool 接入生成器自身的两条证据链：
+
+1. **Knowledge Compiler**：根据 Knowledge Plan 的具体 Query 自动发现只读 Search/Read/Retrieve Tool，构造参数并取回可追溯证据；若网页搜索也已配置，则合并两类来源后再蒸馏 Knowledge Atom。
+2. **Optimization Research**：先由 Critic 从真实失败和低知识密度中定位具体 Knowledge Gap，只有证据不足时才调用 MCP；取回内容后重新做一次 Critic 判断，再把蒸馏结果交给 Canonical Mutation Planner。
+
+Router 会拒绝名称或描述中带有写入、发送、删除、发布等副作用的 Tool。需要额外输入或授权的调用只记录 Trace 并安全跳过，不会在后台替用户确认。每份 MCP 证据都保留 `connectionId / toolName / runId`，因此可以从 Knowledge Atom 或优化决策追溯到 Durable Workflow。没有可用 MCP 时，两条流程会继续使用网页来源或按“无来源知识”安全降级，不阻塞通用 Skill 生成。
+
+`/api/mcp/conformance` 是本地协议测试 Server，用来验证多轮调用；它不是产品业务 Tool。
 
 ## Build Loop：先证明结构可执行，再冻结架构
 
@@ -235,6 +269,31 @@ Optimization Loop 不再修改用户 Goal，也不接受“模型觉得更好”
   → 保留任务
   → 精简冗余
 ```
+
+## Durable Workflow Runtime
+
+`app/workflow-runtime.ts` 把长任务状态从 React 页面状态中抽成服务端持久化状态机。Build、Optimization 与 MCP Call 共用相同的运行语义：
+
+- 每个 Run 保存 `kind / status / currentNode / input / output / error / version`。
+- 每个 Node 保存顺序、输入、输出、尝试次数、重试上限和当前状态。
+- 每次 claim、complete、fail、interrupt、resume 都先写 Checkpoint，再追加 Runtime Trace。
+- 节点失败时只在自己的 Retry Budget 内回到 pending；用尽预算后 Run 才进入 failed。
+- `input_required` 与 `approval_required` 是可恢复中断，不是异常字符串。
+- Run、Node、Checkpoint、Trace 和 MCP Connection 全部按 Tenant 查询和写入。
+
+标准节点计划：
+
+```text
+Build:
+intent → representative-task → contract → capability-plan
+       → knowledge-compile → bundle → freeze
+
+Optimization:
+held-out-split → baseline → execute → grade → diagnose
+               → mutate → regression → commit
+```
+
+`/api/workflows` 暴露 `start / claim / complete / fail / interrupt / resume`，使 Worker 或 UI 可以在进程重启后从最新 Checkpoint 继续，而不是从第一步重新生成。当前第一阶段已经把 Runtime Kernel、D1 Schema、API 与 MCP 多轮调用接通；原有超大页面中的 Build/Optimization 业务处理器会按节点逐步迁入这个 Runtime，避免一次性重写导致现有生成流程回归。
 
 ### 1. 生成真实 Eval Bank
 
@@ -428,7 +487,7 @@ pnpm dev
 - **真实执行**：模型任务、临时文件系统写入、Artifact Pattern 检查和生成 Python 测试的受限进程运行。
 - **真实隔离**：Executor 与 Grader 使用分离 Prompt Context；可能仍是同一个 Provider/Model。
 - **网络限制**：macOS Script Test 使用 Seatbelt 禁止网络，仅允许在临时工作区写文件。
-- **Tool/MCP 边界**：本地 Eval 尚未配置通用 Live Tool Adapter。未实际连接的宿主 Tool/MCP 只检查契约与 fallback，不算调用成功。
+- **Tool/MCP 边界**：MCP Runtime 已支持已注册 Server 的真实 discovery、authorization、call、`input_required`、resume、verify 和 trace；Eval Harness 尚未自动执行任意第三方 MCP。未连接的宿主 Tool/MCP 仍只检查契约与 fallback，不算调用成功。
 - **平台限制**：受限 Python 进程目前只为 macOS Seatbelt 实现；其他平台返回 `not_available`，不会伪报通过。
 
 ## 验证命令
@@ -437,15 +496,18 @@ pnpm dev
 pnpm lint
 pnpm test
 pnpm db:generate
+pnpm test:workflow-runtime
+# 先启动本地服务，再执行：
+pnpm test:mcp-runtime
 ```
 
 `pnpm test` 会先执行生产构建，再运行 `tests/*.test.mjs`。测试覆盖 SkillIR 投影、Bundle Gate、Knowledge Compiler、Eval 分层、Sandbox、Decision Ledger、Personalization、Workflow State 和发布契约。
 
 ## 当前技术债务
 
-- `app/page.tsx` 仍同时承担较多 UI State 与 Agent Orchestration。核心编译器、验证器和 Eval 已拆成独立模块，后续仍需要继续抽离 Workflow Service 与前端 State Machine。
+- `app/page.tsx` 仍承担部分 Build/Optimization 业务处理器。Durable Workflow Kernel 与 API 已落地，下一阶段是把现有节点处理器逐个迁到服务端 Worker，而不是重新设计一套状态语义。
 - 生产多租户需要接入正式身份系统、稳定 D1/R2 资源、租户级预算和更细的成本告警。
-- Tool/MCP 真执行需要为目标 Agent 或具体 MCP Server 实现受控 Adapter，不能只靠通用 JSON 契约。
+- MCP Runtime 已有通用 Streamable HTTP Adapter；OAuth 动态注册、第三方 Server 白名单、租户级 Egress Policy 和 Eval Harness 自动调用仍需继续补齐。
 - Eval 能降低回归风险，但不能证明 Skill 在所有真实任务中都优于通用模型；前端会保留样本量、波动和证据强度。
 
 ## 设计借鉴

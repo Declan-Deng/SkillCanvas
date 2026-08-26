@@ -86,6 +86,26 @@ export type HarnessReport = {
   benchmark: HarnessBenchmark;
 };
 
+export type BenchmarkComparisonVerdict = "improved" | "equivalent" | "regressed";
+
+export type BenchmarkCaseComparison = {
+  caseId: string;
+  baselineScore: number;
+  skillScore: number;
+  delta: number;
+  skillPassed: boolean;
+  failureReason: string;
+  dimensionGaps: string[];
+};
+
+export type BenchmarkComparisonSummary = {
+  verdict: BenchmarkComparisonVerdict;
+  baselineScore: number;
+  skillScore: number;
+  lift: number;
+  cases: BenchmarkCaseComparison[];
+};
+
 export type BlindComparison = {
   winner: "A" | "B" | "tie";
   confidence: number;
@@ -500,6 +520,55 @@ export function buildHarnessReport(input: {
       failedCases,
     },
     benchmark,
+  };
+}
+
+/** Compare two reports produced from the same frozen contract.
+ *
+ * This is deliberately deterministic. A completed benchmark is not the same
+ * thing as an accepted Skill: negative lift, a failing frozen-task pass rate,
+ * or a baseline win in the anonymous comparison all produce `regressed`.
+ */
+export function compareHarnessBenchmarks(
+  baseline: HarnessReport,
+  skill: HarnessReport,
+  blindWinner: "baseline" | "candidate" | "tie",
+): BenchmarkComparisonSummary {
+  if (baseline.contract.digest !== skill.contract.digest) {
+    throw new Error("正式对照必须使用同一个冻结 Eval 合约");
+  }
+  const baselineById = new Map(baseline.evidence.cases.map((item) => [item.caseId, item]));
+  const cases = skill.evidence.cases.map((item): BenchmarkCaseComparison => {
+    const before = baselineById.get(item.caseId);
+    const baselineDimensions = new Map((before?.dimensions || []).map((dimension) => [dimension.label, dimension.score]));
+    const dimensionGaps = item.dimensions
+      .map((dimension) => ({ label: dimension.label, delta: dimension.score - (baselineDimensions.get(dimension.label) ?? dimension.score) }))
+      .filter((dimension) => dimension.delta < 0)
+      .sort((left, right) => left.delta - right.delta)
+      .slice(0, 3)
+      .map((dimension) => `${dimension.label} ${dimension.delta}`);
+    const baselineScore = before?.score || 0;
+    return {
+      caseId: item.caseId,
+      baselineScore,
+      skillScore: item.score,
+      delta: item.score - baselineScore,
+      skillPassed: item.passed,
+      failureReason: item.failureReason || "",
+      dimensionGaps,
+    };
+  });
+  const baselineScore = Math.round(baseline.evidence.cases.reduce((sum, item) => sum + item.score, 0) / Math.max(1, baseline.evidence.cases.length));
+  const skillScore = Math.round(skill.evidence.cases.reduce((sum, item) => sum + item.score, 0) / Math.max(1, skill.evidence.cases.length));
+  const lift = skillScore - baselineScore;
+  const regressed = lift < 0 || skill.benchmark.passRate < 80 || blindWinner === "baseline";
+  const improved = lift >= 3 && skill.benchmark.passRate >= 80 && blindWinner === "candidate";
+  return {
+    verdict: regressed ? "regressed" : improved ? "improved" : "equivalent",
+    baselineScore,
+    skillScore,
+    lift,
+    cases,
   };
 }
 

@@ -159,20 +159,24 @@ import {
   serializeKnowledgePackForRefinement,
   serializeKnowledgePack,
   type KnowledgePack,
+  type RetrievedKnowledgeSource,
   type ResearchProviderId,
 } from "./knowledge-research";
 import { dedupeResearchSources } from "./research-core";
 import { verifyBundleScriptTests, verifyExecutionsInLocalSandbox } from "./eval-workflow-service";
+import { DurableWorkflowJournal } from "./workflow-client";
 import { completedNumericDecisionFixture, confirmedCorrectionEvalEvidence, confirmedOutputFields, ensureConfirmedCorrectionContract, ensureInformationDependencyContract, ensureProductiveCheckpointContract, ensureRuntimeKnowledgeRoutes, productiveCheckpointRequested, reconcileContractFacingFieldLabels, semanticIssueContradictsBundleBranchClaim, semanticIssueContradictsOwnMissingFieldClaim } from "./workflow-compiler";
 import {
   anonymizeComparison,
   buildHarnessReport,
+  compareHarnessBenchmarks,
   freezeEvalContract,
   normalizeBlindComparison,
   normalizeHarnessExecutions,
   normalizeHarnessGrades,
   publicExecutionContract,
   runtimeSkillBundle,
+  type BenchmarkCaseComparison,
   type HarnessConfiguration,
   type HarnessExecution,
   type HarnessGrade,
@@ -242,7 +246,7 @@ type SourceInsight = {
 };
 
 type BusyTask = "interview" | "blueprint" | "build" | "repair" | "evaluate" | "personalize";
-type RetryAction = "start-interview" | "advance-interview" | "regenerate-interview" | "build-blueprint" | "compile-skill" | "rerun-optimization-loop" | "repair-skill" | "evaluate" | "personalize";
+type RetryAction = "start-interview" | "advance-interview" | "regenerate-interview" | "build-blueprint" | "compile-skill" | "rerun-optimization-loop" | "rerun-multi-scene-comparison" | "repair-skill" | "evaluate" | "personalize";
 type BusyExecutionKind = "local" | "model" | "loop";
 
 const SESSION_STORAGE_KEY = "skillcanvas.current-tab.v1";
@@ -437,6 +441,10 @@ type GenerationLoopState = {
   comparisonRevision: string;
   comparisonStage: "not-run" | "initial" | "optimized" | "post-prune";
   comparisonCaseCount: number;
+  comparisonVerdict: "not-run" | "improved" | "equivalent" | "regressed";
+  comparisonEvidence: BenchmarkCaseComparison[];
+  /** Project-level held-out suite. It stays fixed when the Bundle changes. */
+  benchmarkSuiteCases: SkillEvalCase[];
   lift: number;
   passRate: number;
   closureScore: number;
@@ -454,6 +462,36 @@ type GenerationLoopState = {
   issues: string[];
   stopReason: string;
 };
+
+function describeMultiSceneComparison(loop: GenerationLoopState) {
+  const delta = loop.bestQualityScore - loop.baselineQualityScore;
+  if (loop.comparisonVerdict === "improved") {
+    return {
+      tone: "improved",
+      title: "专属 Skill 已证明有稳定增益",
+      detail: `当前 Skill 多场景总分高于普通 AI ${Math.max(0, delta)} 分，并通过了冻结任务与匿名质量对照。`,
+    };
+  }
+  if (delta > 0) {
+    return {
+      tone: "attention",
+      title: "多场景总分已提升，稳定性仍待确认",
+      detail: `当前 Skill 多场景总分高于普通 AI ${delta} 分，但冻结任务通过率或匿名质量对照尚未达到接受门槛，因此暂不宣称获得稳定增益。`,
+    };
+  }
+  if (delta < 0) {
+    return {
+      tone: "regressed",
+      title: "当前 Skill 出现多场景回退",
+      detail: `当前 Skill 多场景总分比普通 AI 低 ${Math.abs(delta)} 分，系统已保留原版本，不接受这次候选修改。`,
+    };
+  }
+  return {
+    tone: "equivalent",
+    title: "当前 Skill 与普通 AI 表现接近",
+    detail: "两者多场景总分持平；当前证据不足以证明稳定增益，系统不会夸大结果。",
+  };
+}
 
 type EvalResult = {
   label: string;
@@ -476,10 +514,20 @@ type SkillDemo = {
   uncertainties: string[];
 };
 
+type DemoChatAttachment = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  text: string;
+  truncated: boolean;
+};
+
 type DemoChatMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  attachments?: DemoChatAttachment[];
 };
 
 type CapabilityCatalogItem = CapabilityItem & {
@@ -684,6 +732,74 @@ const RESEARCH_PROVIDERS: Record<ResearchProviderId, { name: string; mark: strin
   searxng: { name: "SearXNG", mark: "SX", detail: "连接你自部署的开源搜索服务，再读取公开结果正文", baseUrl: "" },
 };
 
+type InternalMcpEvidenceReport = {
+  phase: "knowledge-compile" | "optimization-research";
+  sources: RetrievedKnowledgeSource[];
+  attempts: Array<{ status: string; query: string; toolName: string; reason?: string }>;
+  connectionsScanned: number;
+  toolsDiscovered: number;
+  error?: string;
+};
+
+type InternalMcpEvidenceReports = Partial<Record<InternalMcpEvidenceReport["phase"], InternalMcpEvidenceReport>>;
+
+type McpConnectionSummary = {
+  id: string;
+  name: string;
+  serverUrl: string;
+  configured: boolean;
+  updatedAt: string;
+};
+
+function mergeInternalMcpEvidenceReports(
+  current: InternalMcpEvidenceReport | undefined,
+  next: InternalMcpEvidenceReport,
+): InternalMcpEvidenceReport {
+  if (!current || current.phase !== next.phase) return next;
+  const sources = new Map<string, RetrievedKnowledgeSource>();
+  [...current.sources, ...next.sources].forEach((source) => sources.set(source.id || source.url, source));
+  const attempts = [...current.attempts, ...next.attempts].filter((attempt, index, list) => (
+    list.findIndex((candidate) => [candidate.status, candidate.query, candidate.toolName, candidate.reason || ""].join("|")
+      === [attempt.status, attempt.query, attempt.toolName, attempt.reason || ""].join("|")) === index
+  ));
+  return {
+    phase: next.phase,
+    sources: [...sources.values()],
+    attempts,
+    connectionsScanned: Math.max(current.connectionsScanned, next.connectionsScanned),
+    toolsDiscovered: Math.max(current.toolsDiscovered, next.toolsDiscovered),
+    error: next.error || current.error,
+  };
+}
+
+type OptimizationResearchDecision = {
+  required: boolean;
+  reason: string;
+  knowledgeGaps: string[];
+  availableSourcesSufficient: boolean;
+  distilledKnowledge: string[];
+  forbiddenGenericAdvice: string[];
+  mcpEvidence?: {
+    sourceCount: number;
+    attempts: InternalMcpEvidenceReport["attempts"];
+  };
+};
+
+function normalizeOptimizationResearchDecision(value: unknown): OptimizationResearchDecision {
+  const raw = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const strings = (input: unknown, max = 8) => Array.isArray(input)
+    ? Array.from(new Set(input.map((item) => typeof item === "string" ? item.trim() : "").filter(Boolean))).slice(0, max)
+    : [];
+  return {
+    required: raw.required === true,
+    reason: typeof raw.reason === "string" ? raw.reason.trim().slice(0, 800) : "",
+    knowledgeGaps: strings(raw.knowledgeGaps, 6),
+    availableSourcesSufficient: raw.availableSourcesSufficient === true,
+    distilledKnowledge: strings(raw.distilledKnowledge, 12),
+    forbiddenGenericAdvice: strings(raw.forbiddenGenericAdvice, 12),
+  };
+}
+
 const UNSURE_OPTION = "我不确定，请 AI 帮我判断";
 const BUILD_REPAIR_MAX_ROUNDS = 2;
 const STATIC_REPAIR_MAX_ROUNDS = 5;
@@ -709,6 +825,9 @@ const DEFAULT_GENERATION_LOOP: GenerationLoopState = {
   comparisonRevision: "",
   comparisonStage: "not-run",
   comparisonCaseCount: 0,
+  comparisonVerdict: "not-run",
+  comparisonEvidence: [],
+  benchmarkSuiteCases: [],
   lift: 0,
   passRate: 0,
   closureScore: 0,
@@ -1592,7 +1711,7 @@ function deriveSkillIdentity(idea: string, answers: Record<string, string> = {})
   const name = semanticAsciiWords.length ? `${action}-${semanticAsciiWords.join("-")}`.slice(0, 63).replace(/-+$/g, "") : `${action}-${domain}`;
   const triggerExamples = (answers["trigger-language"] || "").split("；").map((item) => item.trim()).filter(Boolean).slice(0, 2);
   const triggerClause = triggerExamples.length ? `典型表达包括“${triggerExamples.join("”或“")}”。` : "";
-  const capabilityDescription = `完成“${task}”：根据当前输入识别必要条件、执行领域步骤并交付可检查结果。${triggerClause}用于用户直接提出该任务、提供新材料继续处理或要求修改已有结果时；不用于只解释相关概念或处理无关任务。`;
+  const capabilityDescription = `完成“${task}”：根据当前输入识别必要条件、执行领域步骤并交付可检查结果。${triggerClause}用于用户直接提出该任务，或提供与该任务相关的新材料继续处理时；不用于只解释相关概念或处理无关任务。`;
   return {
     name,
     displayName: semanticAsciiWords.length ? semanticAsciiWords.map((word) => word[0]?.toUpperCase() + word.slice(1)).join(" ") : `${actionLabel[action]}${domainLabel[domain]}`,
@@ -3222,12 +3341,13 @@ function normalizeEvalResults(value: unknown, files: Record<string, string>, ans
     const rawFinding = [candidate.detail, candidate.issue, candidate.evidence, candidate.impact].filter((text): text is string => typeof text === "string").join("\n");
     const mentionsUntestedBranch = /(?:本轮|本次|演示|demo|试跑).{0,30}(?:未覆盖|未测试|未展示|未涉及|无法验证|仅演示)|未触发.{0,20}(?:分支|异常)|没有.{0,20}(?:缺失|异常).{0,20}(?:展示|验证)|用户(?:已经|已).{0,30}提供.{0,30}(?:所以|因此|无需)|不构成缺陷|(?:流程中的)?必要步骤|符合流程要求/i.test(rawFinding);
     const hasObservedFailure = /算错|错误结果|不准确|不一致|遗漏了必需|缺少必需|擅自|虚构|违反|违背|与.{0,20}冲突|格式错误|无法使用/i.test(rawFinding);
-    const coverage: EvalResult["coverage"] = mentionsUntestedBranch && !hasObservedFailure && dimensionIndex === 4 ? "not-covered" : "observed";
-    if (mentionsUntestedBranch && !hasObservedFailure) score = Math.max(score, 88);
-    const normalizedIssue = mentionsUntestedBranch && !hasObservedFailure
+    const explicitlyNotCovered = candidate.coverage === "not-covered";
+    const coverage: EvalResult["coverage"] = explicitlyNotCovered || (mentionsUntestedBranch && !hasObservedFailure) ? "not-covered" : "observed";
+    if (coverage === "not-covered") score = 0;
+    const normalizedIssue = coverage === "not-covered"
       ? "本轮未覆盖这一分支，需要换一个场景验证；这不代表当前结果做错了。"
       : clean(candidate.issue, presentation.issue || candidate.detail);
-    const normalizedImpact = mentionsUntestedBranch && !hasObservedFailure
+    const normalizedImpact = coverage === "not-covered"
       ? "当前只能确认这个场景的表现，不能据此判断未测试分支。"
       : clean(candidate.impact, presentation.impact || "这会影响最终结果是否真正可用。");
     return [{
@@ -3238,7 +3358,7 @@ function normalizeEvalResults(value: unknown, files: Record<string, string>, ans
       evidence: clean(candidate.evidence, presentation.evidence || "请结合本次 Demo 判断。"),
       impact: normalizedImpact,
       score,
-      tone: score >= DEMO_SCORING_POLICY.observedGoodFloor ? "good" : score >= DEMO_SCORING_POLICY.observedWarningFloor ? "warn" : "bad",
+      tone: coverage === "not-covered" ? "warn" : score >= DEMO_SCORING_POLICY.observedGoodFloor ? "good" : score >= DEMO_SCORING_POLICY.observedWarningFloor ? "warn" : "bad",
       coverage,
     }];
   });
@@ -3860,6 +3980,7 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
   const ir = parseCanonicalSkillIR(files);
   if (!ir) return { unavailable: true };
   return {
+    semanticDigest: semanticSkillIRDigest(ir),
     requirementIds: ir.requirements.map((item) => item.id),
     taskIds: ir.tasks.map((item) => item.id),
     capabilityIds: ir.capabilities.map((item) => item.id),
@@ -3868,6 +3989,17 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
     constraintIds: ir.constraints.map((item) => item.id),
     knowledgeIds: ir.knowledgeRequirements.map((item) => item.id),
     evalCaseIds: ir.evaluationPlan.cases.map((item) => String(item.id || "")).filter(Boolean),
+    // Give the Planner the current editable values next to their IDs. This is
+    // intentionally compact: it prevents update-to-the-same-value plans without
+    // duplicating the entire Canonical SkillIR in the prompt.
+    currentValues: {
+      requirements: ir.requirements.map((item) => ({ id: item.id, statement: item.statement, hard: item.hard, provenance: item.provenance })),
+      tasks: ir.tasks.map((item) => ({ id: item.id, intent: item.intent, activationCondition: item.activationCondition, requiredInputIds: item.requiredInputIds, optionalInputIds: item.optionalInputIds, outputIds: item.outputIds, capabilityIds: item.capabilityIds })),
+      capabilities: ir.capabilities.map((item) => ({ id: item.id, purpose: item.purpose, requirement: item.requirement, activationCondition: item.activationCondition, routingCondition: item.routingCondition, input: item.input, output: item.output, fallback: item.fallback })),
+      inputs: ir.inputs.map((item) => ({ id: item.id, name: item.name, required: item.required, missingBehavior: item.missingBehavior, resolution: item.resolution })),
+      outputs: ir.outputs.map((item) => ({ id: item.id, name: item.name, mode: item.mode, requiredSections: item.requiredSections, validation: item.validation, producerCapabilityIds: item.producerCapabilityIds })),
+      constraints: ir.constraints.map((item) => ({ id: item.id, statement: item.statement, hard: item.hard, provenance: item.provenance, appliesTo: item.appliesTo })),
+    },
     inputAddShape: {
       id: "input-stable-id",
       concept: "semantic concept",
@@ -3890,12 +4022,14 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
 
 function allowedP1MutationTypes(issues: PipelineIssue[]) {
   const allMatch = (pattern: RegExp) => issues.length > 0 && issues.every((issue) => pattern.test(`${issue.type} ${issue.evidence}`));
+  if (allMatch(/DESCRIPTION|触发描述|触发范围|使用场景/i)) return ["identity.update", "task.add", "task.update", "task.remove"];
   if (allMatch(/EVAL|评测|测试用例|SKILL_IR_CLOSURE.*(?:Eval|评测)/i)) return ["eval-source.add", "eval-source.update", "eval-source.remove"];
   if (allMatch(/INPUT|输入|DESCRIPTION_INPUT|RESOLUTION/i)) return ["input.add", "input.update", "input.remove", "task.update"];
   if (allMatch(/OUTPUT|ARTIFACT|PRODUCER|输出|产物/i)) return ["output.add", "output.update", "output.remove", "capability.update", "task.update"];
   if (allMatch(/STATE|PERSIST|状态|持久/i)) return ["state.update", "requirement.update", "constraint.update"];
   if (allMatch(/PERMISSION|CONTENT|权限|补写|扩写|编造/i)) return ["requirement.add", "requirement.update", "constraint.add", "constraint.update", "constraint.remove"];
   return [
+    "identity.update",
     "requirement.add", "requirement.update", "requirement.remove",
     "task.add", "task.update", "task.remove",
     "capability.add", "capability.update", "capability.remove",
@@ -4368,7 +4502,8 @@ function isSafeSkillFilePath(path: string) {
 }
 
 async function validateBundle(files: Record<string, string>): Promise<BundleStaticValidation> {
-  try {
+  let lastValidatorError = "";
+  const requestValidation = async () => {
     const response = await fetch("/api/validate-bundle", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -4377,6 +4512,19 @@ async function validateBundle(files: Record<string, string>): Promise<BundleStat
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const parsed = await response.json() as BundleStaticValidation;
     if (!Array.isArray(parsed.issues) || !Array.isArray(parsed.checks) || typeof parsed.valid !== "boolean" || typeof parsed.executionReady !== "boolean" || typeof parsed.contractReady !== "boolean") throw new Error("invalid validator response");
+    return parsed;
+  };
+  try {
+    let parsed: BundleStaticValidation | null = null;
+    for (let attempt = 0; attempt < 2 && !parsed; attempt += 1) {
+      try {
+        parsed = await requestValidation();
+      } catch (error) {
+        lastValidatorError = error instanceof Error ? error.message : "validator network error";
+        if (attempt === 0) await new Promise((resolve) => window.setTimeout(resolve, 320));
+      }
+    }
+    if (!parsed) throw new Error(lastValidatorError || "validator unavailable");
     const scriptTestPaths = Object.keys(files).filter((path) => path.startsWith("evals/script-tests/") && path.endsWith(".py"));
     const hasScriptTests = scriptTestPaths.length > 0;
     if (!hasScriptTests) return parsed;
@@ -4396,13 +4544,14 @@ async function validateBundle(files: Record<string, string>): Promise<BundleStat
       // this deterministic capability from model-simulated scoring.
       return { ...parsed, checks: [...parsed.checks, { id: "script-tests", label: "生成脚本独立测试（本地适配器未连接）", passed: true }] };
     }
-  } catch {
+  } catch (error) {
+    lastValidatorError = lastValidatorError || (error instanceof Error ? error.message : "validator unavailable");
     const fallback = validateBundleStructure(files);
     const compilerIssue: BundleStaticIssue = {
       ...classifyBundleIssue("STATIC_VALIDATOR_UNAVAILABLE"),
       code: "STATIC_VALIDATOR_UNAVAILABLE",
       path: "",
-      message: "P0 Execution Gate 暂时不可用，已阻止进入契约修复和 Eval",
+      message: `P0 Execution Gate 暂时不可用，已阻止进入契约修复和 Eval（${lastValidatorError.slice(0, 80)}）`,
     };
     return { ...fallback, valid: false, executionReady: false, issues: [...fallback.issues, compilerIssue], checks: [...fallback.checks, { id: "syntax", label: "Python 与 shell 语法", passed: false }] };
   }
@@ -4605,10 +4754,12 @@ export default function Home() {
   const [buildLoop, setBuildLoop] = useState<BuildLoopState>(DEFAULT_BUILD_LOOP);
   const [generationLoop, setGenerationLoop] = useState<GenerationLoopState>(DEFAULT_GENERATION_LOOP);
   const [knowledgePack, setKnowledgePack] = useState<KnowledgePack>(EMPTY_KNOWLEDGE_PACK);
+  const [internalMcpEvidenceReports, setInternalMcpEvidenceReports] = useState<InternalMcpEvidenceReports>({});
   const [files, setFiles] = useState<Record<string, string>>(DEFAULT_FILES);
   const [selectedFile, setSelectedFile] = useState("SKILL.md");
   const [evals, setEvals] = useState<EvalResult[]>(DEFAULT_EVALS);
   const [evalRan, setEvalRan] = useState(false);
+  const [evalDetailsOpen, setEvalDetailsOpen] = useState(false);
   const [skillDemo, setSkillDemo] = useState<SkillDemo | null>(null);
   const [demoReviewPending, setDemoReviewPending] = useState(false);
   const [demoExpanded, setDemoExpanded] = useState(true);
@@ -4619,6 +4770,12 @@ export default function Home() {
   const [demoChatInput, setDemoChatInput] = useState("");
   const [demoChatBusy, setDemoChatBusy] = useState(false);
   const [demoChatError, setDemoChatError] = useState("");
+  const [demoChatAttachments, setDemoChatAttachments] = useState<DemoChatAttachment[]>([]);
+  const [demoChatFilesLoading, setDemoChatFilesLoading] = useState(false);
+  const [demoConversationScoredTurns, setDemoConversationScoredTurns] = useState(0);
+  const [demoConversationScoredReplyId, setDemoConversationScoredReplyId] = useState("");
+  const [demoConversationScoreBusy, setDemoConversationScoreBusy] = useState(false);
+  const demoChatFileInputRef = useRef<HTMLInputElement | null>(null);
   const [feedbackLoopSummary, setFeedbackLoopSummary] = useState("");
   const [mutationHistory, setMutationHistory] = useState<SkillMutationReceipt[]>([]);
   const [repaired, setRepaired] = useState(false);
@@ -4668,6 +4825,13 @@ export default function Home() {
   const [researchApiKey, setResearchApiKey] = useState("");
   const [researchCredentialStored, setResearchCredentialStored] = useState(false);
   const [researchBaseUrl, setResearchBaseUrl] = useState("");
+  const [mcpConnections, setMcpConnections] = useState<McpConnectionSummary[]>([]);
+  const [mcpConnectionsLoaded, setMcpConnectionsLoaded] = useState(false);
+  const [mcpConnectionName, setMcpConnectionName] = useState("");
+  const [mcpServerUrl, setMcpServerUrl] = useState("");
+  const [mcpBearerToken, setMcpBearerToken] = useState("");
+  const [mcpConnectionBusy, setMcpConnectionBusy] = useState(false);
+  const [mcpConnectionIssue, setMcpConnectionIssue] = useState("");
   const [connectionState, setConnectionState] = useState<"idle" | "testing" | "ok" | "error">("idle");
   const [platforms, setPlatforms] = useState<string[]>([]);
   const [allowSensitiveExport, setAllowSensitiveExport] = useState(false);
@@ -4684,6 +4848,20 @@ export default function Home() {
     if (belongsToCurrentRevision) history[entry.optimization.dimension] = entry.optimization;
     return history;
   }, {}), [currentBundleRevision, mutationHistory]);
+
+  useEffect(() => {
+    if (!sessionHydrated || generationLoop.status === "running") return;
+    if (!generationLoop.benchmarkRuns || !generationLoop.comparisonRevision) return;
+    if (generationLoop.comparisonRevision === currentBundleRevision || generationLoop.comparisonVerdict === "not-run") return;
+    /* eslint-disable react-hooks/set-state-in-effect -- Benchmark evidence is valid only for the exact immutable Bundle revision. */
+    setGenerationLoop((current) => ({
+      ...current,
+      status: "attention",
+      comparisonVerdict: "not-run",
+      stopReason: "当前 Bundle 已发生变化；旧正式对照已失效，必须用原冻结场景重新验证后才能判断是否有增益",
+    }));
+    /* eslint-enable react-hooks/set-state-in-effect */
+  }, [currentBundleRevision, generationLoop.benchmarkRuns, generationLoop.comparisonRevision, generationLoop.comparisonVerdict, generationLoop.status, sessionHydrated]);
 
   useEffect(() => {
     /* eslint-disable react-hooks/set-state-in-effect -- One-time hydration intentionally restores an external browser session snapshot. */
@@ -4756,6 +4934,19 @@ export default function Home() {
       const raw = window.sessionStorage.getItem(SESSION_STORAGE_KEY);
       if (raw) {
         const saved = JSON.parse(raw) as Record<string, unknown>;
+        const savedFilesSnapshot = saved.files && typeof saved.files === "object"
+          ? saved.files as Record<string, string>
+          : {};
+        const savedLoopSnapshot = saved.generationLoop && typeof saved.generationLoop === "object"
+          ? saved.generationLoop as Partial<GenerationLoopState>
+          : {};
+        let savedEvalVersion = "";
+        try {
+          savedEvalVersion = String((JSON.parse(savedFilesSnapshot["evals/evals.json"] || "{}") as { version?: unknown }).version || "");
+        } catch { /* Invalid or legacy Eval bundles are migrated below. */ }
+        const restoreFrozenBundleExactly = savedEvalVersion === "2.7"
+          && savedLoopSnapshot.evaluationContractVersion === "2.7"
+          && savedLoopSnapshot.status !== "running";
         const restoredStep = normalizeWorkflowStep(saved.step);
         if (restoredStep) setStep(restoredStep);
         if (typeof saved.idea === "string") setIdea(saved.idea);
@@ -4820,13 +5011,8 @@ export default function Home() {
         if (saved.loopPlan && typeof saved.loopPlan === "object") setLoopPlan(saved.loopPlan as LoopPlan);
         if (saved.buildLoop && typeof saved.buildLoop === "object") setBuildLoop({ ...DEFAULT_BUILD_LOOP, ...saved.buildLoop as Partial<BuildLoopState> });
         if (saved.generationLoop && typeof saved.generationLoop === "object") {
-          let savedEvalVersion = "";
-          try {
-            const savedFiles = saved.files && typeof saved.files === "object" ? saved.files as Record<string, string> : {};
-            savedEvalVersion = String((JSON.parse(savedFiles["evals/evals.json"] || "{}") as { version?: unknown }).version || "");
-          } catch { /* An invalid saved Eval is rebuilt below. */ }
-          const savedLoop = saved.generationLoop as Partial<GenerationLoopState>;
-          setGenerationLoop(savedEvalVersion === "2.7" && savedLoop.evaluationContractVersion === "2.7" && savedLoop.status !== "running"
+          const savedLoop = savedLoopSnapshot;
+          setGenerationLoop(restoreFrozenBundleExactly
             ? { ...DEFAULT_GENERATION_LOOP, ...saved.generationLoop as GenerationLoopState }
             : { ...DEFAULT_GENERATION_LOOP, stopReason: savedLoop.status === "running"
               ? "上一次 Loop 在页面刷新前尚未完成，未完成的中间分数与问题已丢弃；下次将从冻结评测重新运行"
@@ -4837,6 +5023,9 @@ export default function Home() {
           const restoredAnswers = { ...createDemoAnswers(restoredInterviewRounds, savedAnswers), __idea: typeof saved.idea === "string" ? saved.idea : "", __previewInput: restoredPreviewInput };
           setKnowledgePack(reconcileKnowledgePackContentPermission(restoreKnowledgePack(saved.knowledgePack), restoredAnswers));
         }
+        if (saved.internalMcpEvidenceReports && typeof saved.internalMcpEvidenceReports === "object") {
+          setInternalMcpEvidenceReports(saved.internalMcpEvidenceReports as InternalMcpEvidenceReports);
+        }
         if (saved.files && typeof saved.files === "object") {
           const savedAnswers = saved.answers && typeof saved.answers === "object" ? saved.answers as Record<string, string> : {};
           const savedRounds = restoredInterviewRounds;
@@ -4846,15 +5035,21 @@ export default function Home() {
             : EMPTY_KNOWLEDGE_PACK;
           const restoredPlan = attachCompiledKnowledgeCapability(normalizeCapabilityPlan(saved.capabilityPlan) || DEFAULT_CAPABILITY_PLAN, restoredPack);
           const restoredLoop = saved.loopPlan && typeof saved.loopPlan === "object" ? saved.loopPlan as LoopPlan : DEFAULT_LOOP_PLAN;
-          const restoredFiles = finalizeSkillFiles(
-            applyKnowledgePackToFiles(saved.files as Record<string, string>, restoredPack),
-            typeof saved.idea === "string" ? saved.idea : "",
-            restoredAnswers,
-            Array.isArray(saved.sourceInsights) ? serializeSourceInsights(saved.sourceInsights as SourceInsight[]) : "",
-            restoredPlan,
-            restoredLoop,
-            parseCanonicalSkillIR(saved.files as Record<string, string>) || undefined,
-          );
+          // A completed comparison is evidence for an exact Bundle revision.
+          // Re-projecting that Bundle during hydration can change compiler-owned
+          // bytes and incorrectly make its own comparison look stale. Restore
+          // current-format snapshots byte-for-byte; only legacy bundles migrate.
+          const restoredFiles = restoreFrozenBundleExactly
+            ? savedFilesSnapshot
+            : finalizeSkillFiles(
+              applyKnowledgePackToFiles(savedFilesSnapshot, restoredPack),
+              typeof saved.idea === "string" ? saved.idea : "",
+              restoredAnswers,
+              Array.isArray(saved.sourceInsights) ? serializeSourceInsights(saved.sourceInsights as SourceInsight[]) : "",
+              restoredPlan,
+              restoredLoop,
+              parseCanonicalSkillIR(savedFilesSnapshot) || undefined,
+            );
           setFiles(restoredFiles);
           if (["passed", "stable"].includes((saved.generationLoop as Partial<GenerationLoopState> | undefined)?.status || "")) {
             setGenerationLoop((current) => ({ ...current, issues: removeResolvedFileObservations(current.issues, restoredFiles) }));
@@ -4869,8 +5064,18 @@ export default function Home() {
         if (typeof saved.personalizationRound === "number") setPersonalizationRound(saved.personalizationRound);
         if (typeof saved.demoRunCount === "number") setDemoRunCount(saved.demoRunCount);
         else if (saved.skillDemo && typeof saved.skillDemo === "object") setDemoRunCount(1);
-        if (Array.isArray(saved.demoConversation)) setDemoConversation(saved.demoConversation.filter((item): item is DemoChatMessage => Boolean(item) && typeof item === "object" && (item as DemoChatMessage).role !== undefined && typeof (item as DemoChatMessage).content === "string").slice(-12));
+        const restoredDemoConversation = Array.isArray(saved.demoConversation)
+          ? saved.demoConversation.filter((item): item is DemoChatMessage => Boolean(item) && typeof item === "object" && (item as DemoChatMessage).role !== undefined && typeof (item as DemoChatMessage).content === "string").slice(-12)
+          : [];
+        if (restoredDemoConversation.length) setDemoConversation(restoredDemoConversation);
         if (typeof saved.demoChatSequence === "number") setDemoChatSequence(Math.max(0, saved.demoChatSequence));
+        if (typeof saved.demoConversationScoredTurns === "number") setDemoConversationScoredTurns(Math.max(0, saved.demoConversationScoredTurns));
+        if (typeof saved.demoConversationScoredReplyId === "string") {
+          setDemoConversationScoredReplyId(saved.demoConversationScoredReplyId);
+        } else if (Number(saved.demoConversationScoredTurns) > 0) {
+          const lastScoredReply = [...restoredDemoConversation].reverse().find((item) => item.role === "assistant");
+          if (lastScoredReply) setDemoConversationScoredReplyId(lastScoredReply.id);
+        }
         if (typeof saved.feedbackLoopSummary === "string") setFeedbackLoopSummary(saved.feedbackLoopSummary);
         if (typeof saved.repaired === "boolean") setRepaired(saved.repaired);
         if (Array.isArray(saved.mutationHistory)) {
@@ -4951,8 +5156,9 @@ export default function Home() {
         interviewRounds, interviewRoundOrigins, interviewRoundIndex, highestRoundReached, intentInterpretation,
         discoveryPreview, discoveryPreviewExpanded, previewFeedback, previewFeedbackCustom, interviewReadiness,
         answers, customQuestionIds: [...customQuestionIds], blueprint, capabilityPlan, loopPlan, buildLoop, generationLoop, knowledgePack,
+        internalMcpEvidenceReports,
         files, selectedFile, evals, evalRan, skillDemo, demoReviewPending, demoExpanded, personalizationRound, demoRunCount,
-        demoConversation, demoChatSequence,
+        demoConversation, demoChatSequence, demoConversationScoredTurns, demoConversationScoredReplyId,
         feedbackLoopSummary, mutationHistory, repaired, rejectedOptimizations, feedbackOptions, feedbackReasons,
         feedbackCustom, feedbackSaved, mcpDrafts, provider, model, availableModels, baseUrl,
         researchProvider, researchBaseUrl,
@@ -5018,7 +5224,21 @@ export default function Home() {
   const optimizationTarget = optimizationTargetIndex === null ? null : evals[optimizationTargetIndex] || null;
   const optimizationTargetHistory = optimizationTarget ? optimizationHistory[optimizationTarget.label] : null;
   const optimizationPhaseIndex = optimizationStatus === "analyzing" ? 0 : optimizationStatus === "ready" ? 1 : optimizationStatus === "optimizing" ? 1 : optimizationStatus === "reevaluating" ? 2 : optimizationStatus === "complete" ? 3 : 0;
-  const averageEvalScore = evalRan && evals.length ? Math.round(evals.reduce((total, item) => total + item.score, 0) / evals.length) : 0;
+  const observedEvals = evals.filter((item) => item.coverage !== "not-covered");
+  const strongEvals = observedEvals.filter((item) => item.score >= DEMO_SCORING_POLICY.observedGoodFloor);
+  const needsWorkEvals = observedEvals.filter((item) => item.score < DEMO_SCORING_POLICY.observedGoodFloor);
+  const pendingEvals = evals.filter((item) => item.coverage === "not-covered");
+  const averageEvalScore = evalRan && observedEvals.length ? Math.round(observedEvals.reduce((total, item) => total + item.score, 0) / observedEvals.length) : 0;
+  const evaluationHeadline = needsWorkEvals.length
+    ? `这次试跑发现 ${needsWorkEvals.length} 个还能再提升的地方`
+    : pendingEvals.length
+      ? "这次表现符合要求，还有场景没测到"
+      : "这次试跑已经达到预期";
+  const evaluationSummary = needsWorkEvals.length
+    ? `优先处理“${needsWorkEvals[0].label}”。其他结论会保留，不需要一次读完所有评语。`
+    : pendingEvals.length
+      ? `已经确认 ${strongEvals.length} 项表现，剩余 ${pendingEvals.length} 项需要换一个输入才能判断。`
+      : "五项都有本轮证据，可以继续发布检查，也可以选择其中一项继续提高。";
   const busyStageIndex = busyTask
     ? Math.min(BUSY_STAGES[busyTask].stages.length - 1, busyPhaseIndex)
     : 0;
@@ -5194,7 +5414,13 @@ export default function Home() {
   }, [busyTask]);
 
   useEffect(() => {
+    if (!sessionHydrated) return;
+    void loadMcpConnections();
+  }, [sessionHydrated]);
+
+  useEffect(() => {
     if (!settingsOpen) return;
+    void loadMcpConnections();
     const previousOverflow = document.body.style.overflow;
     document.body.style.overflow = "hidden";
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -5342,6 +5568,81 @@ export default function Home() {
     setResearchBaseUrl(RESEARCH_PROVIDERS[next].baseUrl);
   }
 
+  async function loadMcpConnections(): Promise<McpConnectionSummary[]> {
+    try {
+      const response = await fetch("/api/mcp", { cache: "no-store" });
+      const result = await response.json() as { connections?: McpConnectionSummary[]; error?: string };
+      if (!response.ok) throw new Error(result.error || "MCP 连接读取失败");
+      const connections = Array.isArray(result.connections) ? result.connections : [];
+      setMcpConnections(connections);
+      setMcpConnectionsLoaded(true);
+      if (!connections.length) setInternalMcpEvidenceReports({});
+      setMcpConnectionIssue("");
+      return connections;
+    } catch (error) {
+      setMcpConnectionsLoaded(true);
+      setMcpConnectionIssue(error instanceof Error ? error.message : "MCP 连接读取失败");
+      return [];
+    }
+  }
+
+  async function registerMcpConnection() {
+    const serverUrl = mcpServerUrl.trim();
+    if (!serverUrl) {
+      setMcpConnectionIssue("请填写 MCP Server 地址");
+      return;
+    }
+    setMcpConnectionBusy(true);
+    setMcpConnectionIssue("");
+    let registeredConnectionId = "";
+    try {
+      const response = await fetch("/api/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "register", name: mcpConnectionName.trim(), serverUrl, bearerToken: mcpBearerToken.trim() }),
+      });
+      const result = await response.json() as { connection?: McpConnectionSummary; error?: string };
+      if (!response.ok || !result.connection) throw new Error(result.error || "MCP 连接保存失败");
+      registeredConnectionId = result.connection.id;
+      const discovery = await fetch("/api/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "discover", connectionId: result.connection.id }),
+      });
+      const discoveryResult = await discovery.json() as { tools?: unknown[]; error?: string };
+      if (!discovery.ok) throw new Error(discoveryResult.error || "Tool discovery 失败");
+      if (!Array.isArray(discoveryResult.tools) || !discoveryResult.tools.length) throw new Error("连接成功，但没有发现任何可调用 Tool");
+      setMcpConnectionName("");
+      setMcpServerUrl("");
+      setMcpBearerToken("");
+      await loadMcpConnections();
+      setToast(`MCP 已连接，发现 ${Array.isArray(discoveryResult.tools) ? discoveryResult.tools.length : 0} 个 Tool`);
+    } catch (error) {
+      if (registeredConnectionId) {
+        await fetch(`/api/mcp?connectionId=${encodeURIComponent(registeredConnectionId)}`, { method: "DELETE" }).catch(() => undefined);
+        await loadMcpConnections();
+      }
+      setMcpConnectionIssue(error instanceof Error ? error.message : "MCP 连接失败");
+    } finally {
+      setMcpConnectionBusy(false);
+    }
+  }
+
+  async function removeMcpConnection(connectionId: string) {
+    setMcpConnectionBusy(true);
+    setMcpConnectionIssue("");
+    try {
+      const response = await fetch(`/api/mcp?connectionId=${encodeURIComponent(connectionId)}`, { method: "DELETE" });
+      const result = await response.json() as { deleted?: boolean; error?: string };
+      if (!response.ok || !result.deleted) throw new Error(result.error || "MCP 连接移除失败");
+      await loadMcpConnections();
+    } catch (error) {
+      setMcpConnectionIssue(error instanceof Error ? error.message : "MCP 连接移除失败");
+    } finally {
+      setMcpConnectionBusy(false);
+    }
+  }
+
   function markComplete(id: StepId) {
     setCompletedSteps((current) => {
       const next = new Set(current);
@@ -5481,6 +5782,7 @@ export default function Home() {
     if (retryAction === "build-blueprint") void buildBlueprint();
     if (retryAction === "compile-skill") void compileSkill();
     if (retryAction === "rerun-optimization-loop") void rerunOptimizationLoop();
+    if (retryAction === "rerun-multi-scene-comparison") void rerunMultiSceneComparison();
     if (retryAction === "repair-skill") void repairSkill();
     if (retryAction === "evaluate") void runEvaluation();
     if (retryAction === "personalize") void applyPersonalFeedback();
@@ -5860,35 +6162,49 @@ export default function Home() {
         ...decisionLedgerFeedback(files, { source: "optimization", limit: 6 }),
         ...rejectedOptimizations.filter((item) => item.dimension === before.label),
       ].slice(-6);
-      const optimized = await callAI<OptimizationEditResponse>("optimize", {
-        idea,
-        sourceText: contextBundle,
-        answers: interviewEvidence,
-        capabilityPlan,
-        loopPlan,
-        skillIR: parseCanonicalSkillIR(files),
-        skill: files,
-        evaluation: before,
-        dimension: before.label,
-        optimizationPlan: selected,
-        rolloutEvidence: optimizationSession.trainingEvidence,
-        rejectedHistory,
-      });
-      const applied = applyOptimizationEdits(files, optimized);
-      const canonicalCandidate = applyCanonicalCandidate({
-        currentFiles: files,
-        rawMutations: optimized.canonicalMutations,
-        implementationFiles: {
-          ...optimized.implementationFiles,
-          ...Object.fromEntries(applied.changedPaths.map((path) => [path, applied.files[path]])),
-        },
-        idea,
-        answers: demoAnswers,
-        sourceEvidence: sourceInsightText,
-        capabilityPlan,
-        loopPlan,
-      });
-      if (!canonicalCandidate.materialDiff) throw new Error("候选修改在 Canonical Projection 后没有语义或实现变化，已停止无效评测");
+      const canonicalTargets = canonicalMutationTargetCatalog(files);
+      const noOpFeedback: string[] = [];
+      let optimized: OptimizationEditResponse | null = null;
+      let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate> | null = null;
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
+        optimized = await callAI<OptimizationEditResponse>("optimize", {
+          idea,
+          sourceText: contextBundle,
+          answers: interviewEvidence,
+          capabilityPlan,
+          loopPlan,
+          skillIR: parseCanonicalSkillIR(files),
+          skill: files,
+          evaluation: before,
+          dimension: before.label,
+          optimizationPlan: selected,
+          rolloutEvidence: optimizationSession.trainingEvidence,
+          rejectedHistory,
+          canonicalTargets,
+          priorAttemptFeedback: noOpFeedback,
+          attempt,
+        });
+        const applied = applyOptimizationEdits(files, optimized);
+        const candidate = applyCanonicalCandidate({
+          currentFiles: files,
+          rawMutations: optimized.canonicalMutations,
+          implementationFiles: {
+            ...optimized.implementationFiles,
+            ...Object.fromEntries(applied.changedPaths.map((path) => [path, applied.files[path]])),
+          },
+          idea,
+          answers: demoAnswers,
+          sourceEvidence: sourceInsightText,
+          capabilityPlan,
+          loopPlan,
+        });
+        if (candidate.materialDiff) {
+          canonicalCandidate = candidate;
+          break;
+        }
+        noOpFeedback.push(`第 ${attempt} 次候选被投影消除。已尝试：${JSON.stringify(candidate.mutations).slice(0, 2_400)}。下一次必须改用不同目标或不同值。`);
+      }
+      if (!optimized || !canonicalCandidate) throw new Error("AI 连续 3 次都只返回了无效或重复修改；当前 Skill 已安全保留，请重新选择另一个优化方向");
       const optimizedFiles = canonicalCandidate.files;
       const allPaths = new Set([...Object.keys(files), ...Object.keys(optimizedFiles)]);
       const changedFiles = Array.from(allPaths).filter((path) => files[path] !== optimizedFiles[path]);
@@ -6104,6 +6420,7 @@ export default function Home() {
     setBuildLoop(DEFAULT_BUILD_LOOP);
     setGenerationLoop(DEFAULT_GENERATION_LOOP);
     setKnowledgePack(EMPTY_KNOWLEDGE_PACK);
+    setInternalMcpEvidenceReports({});
     setFiles(DEFAULT_FILES);
     setSelectedFile("SKILL.md");
     setEvals(DEFAULT_EVALS);
@@ -6343,7 +6660,19 @@ export default function Home() {
     let previousSignature = "";
     while (!validation.executionReady && rounds < STATIC_REPAIR_MAX_ROUNDS) {
       const p0Issues = validation.issues.filter((issue) => issue.priority === "P0");
+      const infrastructureIssues = p0Issues.filter((issue) => issue.code === "STATIC_VALIDATOR_UNAVAILABLE");
       const blockers = p0Issues.map((issue) => `${issue.code} · ${issue.path || "bundle"} · ${issue.message}`);
+      if (infrastructureIssues.length) {
+        setBuildLoop((current) => ({ ...current, status: "attention", phase: "bundle", rounds, issues: blockers.slice(0, 8) }));
+        setGenerationLoop((current) => ({ ...current, status: "attention", phase: "static", stopReason: "本地确定性校验服务暂时不可用；已停止 AI Repair，避免把基础设施故障误修成 Skill 内容" }));
+        reportClientGenerationLoopEvent("generation_loop_failed", {
+          phase: "static-infrastructure",
+          round: rounds,
+          blockers,
+          reason: "P0 校验服务不可用；没有调用 AI Repair",
+        });
+        break;
+      }
       const signature = blockers.join("\n");
       setBuildLoop((current) => ({ ...current, status: "repairing", phase: "bundle", rounds, issues: blockers.slice(0, 8) }));
       setGenerationLoop((current) => ({ ...current, status: "running", phase: "static", stopReason: `P0 Execution Gate 第 ${rounds + 1}/${STATIC_REPAIR_MAX_ROUNDS} 轮：只修复语法、路径、依赖与启动阻塞` }));
@@ -6496,8 +6825,39 @@ export default function Home() {
     let previousSignature = "";
     const rejectedAttempts: string[] = [];
     while (validation.executionReady && state.issues.length && rounds < BUILD_REPAIR_MAX_ROUNDS) {
+      const currentIR = parseCanonicalSkillIR(currentFiles);
+      const hasLegacyGenericEditPromise = state.issues.some((issue) => /触发描述承诺了工作流没有实现的任务：改写或优化已有内容/i.test(issue.evidence))
+        && Boolean(currentIR?.identity.description.includes("提供新材料继续处理或要求修改已有结果时"));
+      if (currentIR && hasLegacyGenericEditPromise) {
+        const migratedDescription = currentIR.identity.description
+          .replace(/、提供新材料继续处理或要求修改已有结果时/g, "，或提供与该任务相关的新材料继续处理时")
+          .replace(/提供新材料继续处理或要求修改已有结果时/g, "提供与该任务相关的新材料继续处理时");
+        const deterministicCandidate = applyCanonicalCandidate({
+          currentFiles,
+          rawMutations: [{ type: "identity.update", changes: { description: migratedDescription } }],
+          idea,
+          answers: input.answers,
+          sourceEvidence: input.sourceText,
+          capabilityPlan: input.generationPlan,
+          loopPlan,
+        });
+        rounds += 1;
+        currentFiles = deterministicCandidate.files;
+        validation = await validateBundle(currentFiles);
+        state = collectP1ContractState(currentFiles, input.answers, input.generationPlan, validation);
+        reportClientGenerationLoopEvent("generation_loop_candidate", {
+          phase: "contract-repair",
+          round: rounds,
+          accepted: validation.executionReady && !state.issues.some((issue) => /触发描述承诺了工作流没有实现的任务：改写或优化已有内容/i.test(issue.evidence)),
+          updatedPaths: ["identity.update"],
+          reason: state.issues.length
+            ? `已移除生成器旧版默认加入的未实现改写承诺；仍有 ${state.issues.length} 项独立契约问题`
+            : "已确定性移除生成器旧版默认加入的未实现改写承诺，无需消耗模型修复",
+        });
+        if (!validation.executionReady || !state.issues.length) break;
+        continue;
+      }
       if (p1IssuesAreCompilerOwnedEvalEdges(state.issues)) {
-        const currentIR = parseCanonicalSkillIR(currentFiles);
         if (currentIR) {
           const coveredEvalBank = ensureSkillIREvalCoverage(currentIR, currentFiles["evals/evals.json"] || projectEvalBank(currentIR));
           const coveredIR = bindSkillIREvals(currentIR, coveredEvalBank);
@@ -6627,6 +6987,11 @@ export default function Home() {
   }
 
   async function runOptimizationLoop(initialFiles: Record<string, string>, generationPlan: CapabilityPlan = capabilityPlan) {
+    const durableOptimization = await DurableWorkflowJournal.start("optimization", {
+      skillRevision: skillBundleRevision(initialFiles),
+      activeCapabilityIds: generationPlan.items.filter(capabilityIsActive).map((item) => item.id),
+    });
+    setInternalMcpEvidenceReports((current) => ({ ...current, "optimization-research": undefined }));
     loopStartedAt.current = Date.now();
     setBusyPhaseIndex(4);
     showLoopBusy("Build 已通过，正在固定能力边界并启动 Optimization Loop");
@@ -6728,6 +7093,7 @@ export default function Home() {
       setGenerationLoop(state);
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "static", blockers: state.issues, reason: state.stopReason });
       notifyGenerationLoopResult(state);
+      await durableOptimization?.fail(new Error(state.stopReason));
       return { files: bestFiles, state };
     }
     if (!initialContractRepair.passed || !bestBundleValidation.contractReady || staticPolicy.priority === "P1") {
@@ -6743,6 +7109,7 @@ export default function Home() {
       setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "attention", phase: "bundle", rounds: initialStaticRepair.rounds + initialContractRepair.rounds + initialContractRepair.nestedP0Rounds, issues: state.issues, frozen: false });
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "contract", blockers: state.issues, reason: state.stopReason });
       notifyGenerationLoopResult(state);
+      await durableOptimization?.fail(new Error(state.stopReason));
       return { files: bestFiles, state };
     }
     setBuildLoop({
@@ -6776,7 +7143,9 @@ export default function Home() {
       });
     }
     const trainCases = sampleOptimizationCases(evalBank, "train", OPTIMIZATION_TRAIN_SAMPLE);
-    const selectionCases = sampleOptimizationCases(evalBank, "selection", OPTIMIZATION_SELECTION_SAMPLE, { requiredCapabilityIds });
+    const selectionCases = generationLoop.benchmarkSuiteCases.length >= 2
+      ? generationLoop.benchmarkSuiteCases
+      : sampleOptimizationCases(evalBank, "selection", OPTIMIZATION_SELECTION_SAMPLE, { requiredCapabilityIds });
     if (heldOutCoverage.missing.length) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
@@ -6789,6 +7158,7 @@ export default function Home() {
       setGenerationLoop(state);
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "rollout", blockers: state.issues, reason: state.stopReason });
       notifyGenerationLoopResult(state);
+      await durableOptimization?.fail(new Error(state.stopReason));
       return { files: bestFiles, state };
     }
     if (trainCases.length < 2 || selectionCases.length < 2) {
@@ -6803,8 +7173,15 @@ export default function Home() {
       setGenerationLoop(state);
       reportClientGenerationLoopEvent("generation_loop_finished", { phase: "rollout", reason: state.stopReason });
       notifyGenerationLoopResult(state);
+      await durableOptimization?.fail(new Error(state.stopReason));
       return { files: bestFiles, state };
     }
+
+    await durableOptimization?.complete("held-out-split", {
+      trainCaseIds: trainCases.map((item) => item.id),
+      selectionCaseIds: selectionCases.map((item) => item.id),
+      coveredCapabilityIds: requiredCapabilityIds,
+    });
 
     setBusyPhaseIndex(5);
     showLoopBusy("能力契约已固定，准备冻结评测并隔离运行无 Skill 基线");
@@ -6831,6 +7208,15 @@ export default function Home() {
 
     const baselineMetrics = summarizeGenerationEvidence(baselineEvidence);
     let bestMetrics = summarizeGenerationEvidence(bestEvidence);
+    const initialBlindWinner = blindResult.revealedWinner === "left" ? "baseline" : blindResult.revealedWinner === "tie" ? "tie" : "candidate";
+    const initialComparison = compareHarnessBenchmarks(baselineHarness, bestHarness, initialBlindWinner);
+    await durableOptimization?.complete("baseline", { metrics: baselineMetrics, contractDigest: baselineHarness.contract.digest });
+    await durableOptimization?.complete("execute", { metrics: bestMetrics, runIds: initialBestHarness.executions.map((item) => item.runId) });
+    await durableOptimization?.complete("grade", {
+      winner: blindResult.revealedWinner,
+      confidence: blindResult.confidence,
+      evidence: blindResult.evidence,
+    });
     setBusyPhaseIndex(6);
     showLoopBusy("三组任务证据已收齐，正在进入跨文件语义诊断");
     setGenerationLoop((current) => ({
@@ -6838,13 +7224,19 @@ export default function Home() {
       phase: "diagnose",
       baselineScore: baselineMetrics.score,
       bestScore: bestMetrics.score,
-      baselineQualityScore: blindResult.revealedScores?.left ?? baselineMetrics.score,
-      bestQualityScore: blindResult.revealedScores?.right ?? bestMetrics.score,
+      // Public formal-comparison numbers come from the same frozen-case
+      // comparison object that decides improved/equivalent/regressed. This
+      // prevents the verdict and the visible scores from using two rulers.
+      baselineQualityScore: initialComparison.baselineScore,
+      bestQualityScore: initialComparison.skillScore,
       comparisonConfidence: blindResult.confidence,
       comparisonRevision,
       comparisonStage,
       comparisonCaseCount: selectionCases.length,
-      lift: bestMetrics.score - baselineMetrics.score,
+      comparisonVerdict: initialComparison.verdict,
+      comparisonEvidence: initialComparison.cases,
+      benchmarkSuiteCases: selectionCases,
+      lift: initialComparison.lift,
       passRate: bestMetrics.passRate,
       contractDigest: bestHarness.contract.digest,
       benchmarkCases: selectionCases.length,
@@ -6853,7 +7245,7 @@ export default function Home() {
       baselineStddev: baselineHarness.benchmark.repeatScoreStddev,
       bestStddev: bestHarness.benchmark.repeatScoreStddev,
       meanDurationMs: Math.round((baselineHarness.benchmark.meanDurationMs + bestHarness.benchmark.meanDurationMs) / 2),
-      blindWinner: blindResult.revealedWinner === "left" ? "baseline" : blindResult.revealedWinner === "tie" ? "tie" : "candidate",
+      blindWinner: initialBlindWinner,
       stopReason: "隔离执行、上下文隔离评分和匿名 A/B 已完成，正在做跨文件语义闭环检查",
     }));
     const initialSemanticRaw = await callAI<unknown>("optimization-diagnose", {
@@ -6866,6 +7258,10 @@ export default function Home() {
     const normalizedInitialSemantic = normalizeGenerationSemanticAudit(initialSemanticRaw);
     let bestSemantic = normalizedInitialSemantic ? reconcileSemanticAuditWithCompilerEvidence(normalizedInitialSemantic, bestFiles) : null;
     if (!bestSemantic) throw new Error("生成 Loop 没有完成多视角语义闭环检查");
+    await durableOptimization?.complete("diagnose", {
+      issueIds: bestSemantic.issues.map((item) => item.id),
+      criticalIssueCount: bestSemantic.issues.filter((item) => item.priority === "P1").length,
+    });
     let acceptedPatches = 0;
     let rejectedPatches = 0;
     const rejectedHistory: Array<{
@@ -6969,12 +7365,38 @@ export default function Home() {
       let researchDecision: unknown = null;
       if (issuePolicy.allowResearch && density.shouldResearch) {
         setGenerationLoop((current) => ({ ...current, phase: "diagnose", stopReason: `第 ${round} 轮：领域知识价值密度 ${density.score}，正在判断是否值得进入 Research Loop` }));
-        researchDecision = await callAI<unknown>("optimization-research", {
+        const initialResearchRaw = await callAI<unknown>("optimization-research", {
           ...evidencePayload,
           skill: bestFiles,
           issues: issuePolicy.selected,
           domainValueDensity: density,
         });
+        const initialResearch = normalizeOptimizationResearchDecision(initialResearchRaw);
+        researchDecision = initialResearch;
+        if (initialResearch.required && !initialResearch.availableSourcesSufficient && initialResearch.knowledgeGaps.length && mcpConnections.length > 0) {
+          setGenerationLoop((current) => ({ ...current, phase: "diagnose", stopReason: `第 ${round} 轮：已定位 ${initialResearch.knowledgeGaps.length} 个具体知识缺口，正在调用只读 MCP 取证` }));
+          showLoopBusy(`正在通过已授权 MCP 核对：${initialResearch.knowledgeGaps[0]}`);
+          const mcpReport = await retrieveInternalMcpEvidence("optimization-research", initialResearch.knowledgeGaps, 3);
+          if (mcpReport.sources.length) {
+            const enrichedResearchRaw = await callAI<unknown>("optimization-research", {
+              ...evidencePayload,
+              skill: bestFiles,
+              issues: issuePolicy.selected,
+              domainValueDensity: density,
+              researchSources: buildKnowledgeEvidencePayload(mcpReport.sources, 24_000),
+              priorResearchDecision: initialResearch,
+            });
+            researchDecision = {
+              ...normalizeOptimizationResearchDecision(enrichedResearchRaw),
+              mcpEvidence: { sourceCount: mcpReport.sources.length, attempts: mcpReport.attempts },
+            } satisfies OptimizationResearchDecision;
+          } else {
+            researchDecision = {
+              ...initialResearch,
+              mcpEvidence: { sourceCount: 0, attempts: mcpReport.attempts },
+            } satisfies OptimizationResearchDecision;
+          }
+        }
       }
       setGenerationLoop((current) => ({ ...current, phase: "patch", rounds: round, acceptedPatches, rejectedPatches, issues: issuePolicy.selected.map((item) => item.evidence).slice(0, 8), stopReason: `第 ${round} 轮：Planner 正在做影响分析并生成有限 Patch Operations` }));
       let patchPlan: ReturnType<typeof normalizePatchPlan> = null;
@@ -7037,7 +7459,10 @@ export default function Home() {
               capabilityPlan: generationPlan,
               loopPlan,
             });
-            if (!canonicalCandidate.materialDiff) throw new Error("CanonicalMutation 经投影后没有产生语义变化");
+            if (!canonicalCandidate.materialDiff) {
+              const attempted = JSON.stringify(canonicalCandidate.mutations).slice(0, 1_800);
+              throw new Error(`CanonicalMutation 经投影后没有产生语义变化；本次提案=${attempted}。下一次必须修改不同的 canonical 字段或写入与当前值不同的新值`);
+            }
           } catch (error) {
             const reason = `Planner 第 ${planAttempt} 次未通过 Canonical IR 检查：${error instanceof Error ? error.message : "CanonicalMutation 无法应用"}`;
             rejectedHistory.push({ round, reason, files: validation.changedPaths });
@@ -7336,6 +7761,8 @@ export default function Home() {
 
     const remainingCritical = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
     const comparisonIsCurrent = comparisonRevision === finalBundleRevision;
+    const finalBlindWinner = blindResult.revealedWinner === "left" ? "baseline" : blindResult.revealedWinner === "tie" ? "tie" : "candidate";
+    const finalComparison = compareHarnessBenchmarks(baselineHarness, bestHarness, finalBlindWinner);
     const qualityGoalSatisfied = generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: remainingCritical });
     const passed = comparisonIsCurrent && qualityGoalSatisfied && blindResult.revealedWinner !== "left";
     const stableAtCeiling = comparisonIsCurrent && !passed && blindResult.revealedWinner === "tie" && generationEvaluationAtCeiling({
@@ -7361,13 +7788,16 @@ export default function Home() {
       rounds: Math.min(GENERATION_GOAL_MAX_ROUNDS, acceptedPatches + rejectedPatches),
       baselineScore: baselineMetrics.score,
       bestScore: bestMetrics.score,
-      baselineQualityScore: blindResult.revealedScores?.left ?? baselineMetrics.score,
-      bestQualityScore: blindResult.revealedScores?.right ?? bestMetrics.score,
+      baselineQualityScore: finalComparison.baselineScore,
+      bestQualityScore: finalComparison.skillScore,
       comparisonConfidence: blindResult.confidence,
       comparisonRevision,
       comparisonStage,
       comparisonCaseCount: selectionCases.length,
-      lift: bestMetrics.score - baselineMetrics.score,
+      comparisonVerdict: comparisonIsCurrent ? finalComparison.verdict : "not-run",
+      comparisonEvidence: comparisonIsCurrent ? finalComparison.cases : [],
+      benchmarkSuiteCases: selectionCases,
+      lift: finalComparison.lift,
       passRate: bestMetrics.passRate,
       closureScore: bestClosure.score,
       acceptedPatches,
@@ -7379,7 +7809,7 @@ export default function Home() {
       baselineStddev: baselineHarness.benchmark.repeatScoreStddev,
       bestStddev: bestHarness.benchmark.repeatScoreStddev,
       meanDurationMs: Math.round((baselineHarness.benchmark.meanDurationMs + bestHarness.benchmark.meanDurationMs) / 2),
-      blindWinner: blindResult.revealedWinner === "left" ? "baseline" : blindResult.revealedWinner === "tie" ? "tie" : "candidate",
+      blindWinner: finalBlindWinner,
       minimalityChecked: true,
       issues: remainingIssues,
       stopReason: stableAtCeiling
@@ -7389,6 +7819,19 @@ export default function Home() {
           : remainingIssues.length ? `${stopReason}；仍有需要观察的问题` : stopReason,
     };
     showLocalBusy("精简检查已完成，正在固定通过验证的最佳版本");
+    await durableOptimization?.complete("mutate", { acceptedPatches, rejectedPatches });
+    await durableOptimization?.complete("regression", {
+      baselineScore: baselineMetrics.score,
+      bestScore: bestMetrics.score,
+      passRate: bestMetrics.passRate,
+      remainingIssues,
+    });
+    await durableOptimization?.complete("commit", {
+      outcome: state.status,
+      revision: finalBundleRevision,
+      acceptedPatches,
+      rejectedPatches,
+    });
     setGenerationLoop(state);
     reportClientGenerationLoopEvent("generation_loop_finished", { phase: "complete", round: state.rounds, accepted: state.status === "passed", beforeCount: state.baselineScore, afterCount: state.bestScore, reason: state.stopReason });
     notifyGenerationLoopResult(state);
@@ -7396,8 +7839,69 @@ export default function Home() {
   }
   /* eslint-enable react-hooks/immutability */
 
+  async function retrieveInternalMcpEvidence(
+    phase: InternalMcpEvidenceReport["phase"],
+    queries: string[],
+    maxCalls = 3,
+  ): Promise<InternalMcpEvidenceReport> {
+    const empty: InternalMcpEvidenceReport = { phase, sources: [], attempts: [], connectionsScanned: 0, toolsDiscovered: 0 };
+    const normalizedQueries = Array.from(new Set(queries.map((item) => item.trim()).filter(Boolean))).slice(0, 4);
+    // MCP is an optional side branch. With no successfully discovered
+    // connection, preserve the pre-MCP workflow exactly: do not call the API,
+    // start a timeout, write a receipt, or affect Knowledge/Optimization state.
+    if (!normalizedQueries.length || !mcpConnections.length) return empty;
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 32_000);
+    try {
+      const response = await fetch("/api/mcp", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "collect-evidence", phase, queries: normalizedQueries, maxCalls }),
+        signal: controller.signal,
+      });
+      const payload = await response.json().catch(() => ({})) as Partial<InternalMcpEvidenceReport> & { error?: string };
+      if (!response.ok) throw new Error(payload.error || `MCP evidence failed (${response.status})`);
+      const report: InternalMcpEvidenceReport = {
+        phase,
+        sources: normalizeRetrievedSources(payload.sources),
+        attempts: Array.isArray(payload.attempts) ? payload.attempts : [],
+        connectionsScanned: Number(payload.connectionsScanned || 0),
+        toolsDiscovered: Number(payload.toolsDiscovered || 0),
+      };
+      setInternalMcpEvidenceReports((current) => ({
+        ...current,
+        [phase]: mergeInternalMcpEvidenceReports(current[phase], report),
+      }));
+      reportClientGenerationLoopEvent("generation_loop_phase", {
+        phase: `mcp-${phase}`,
+        accepted: report.sources.length > 0,
+        beforeCount: report.connectionsScanned,
+        afterCount: report.sources.length,
+        reason: report.sources.length
+          ? `MCP Evidence Router 通过 ${report.attempts.filter((item) => item.status === "completed").length} 次只读调用取得 ${report.sources.length} 份证据`
+          : "已检查可用 MCP，但没有取得可编译证据；继续使用其他来源或安全降级",
+      });
+      return report;
+    } catch (error) {
+      const reason = error instanceof Error && error.name === "AbortError" ? "内部 MCP 取证超过 32 秒" : error instanceof Error ? error.message : "内部 MCP 取证失败";
+      const failedReport: InternalMcpEvidenceReport = { ...empty, error: reason };
+      setInternalMcpEvidenceReports((current) => ({
+        ...current,
+        [phase]: mergeInternalMcpEvidenceReports(current[phase], failedReport),
+      }));
+      reportClientGenerationLoopEvent("generation_loop_failed", {
+        phase: `mcp-${phase}`,
+        reason,
+      });
+      return empty;
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+
   async function runBuildTimeKnowledgeCompiler(basePlan: CapabilityPlan): Promise<KnowledgePack> {
     setBuildLoop((current) => ({ ...current, status: "checking", phase: "knowledge" }));
+    setInternalMcpEvidenceReports((current) => ({ ...current, "knowledge-compile": undefined }));
     showLoopBusy("正在判断哪些领域知识能真正改变 Skill 的专业判断与工作分支");
     const rawPlan = await callAI<unknown>("knowledge-plan", {
       idea,
@@ -7406,6 +7910,7 @@ export default function Home() {
       capabilityPlan: basePlan,
     });
     const plan = normalizeKnowledgePlan(rawPlan);
+    const workflowMcpEnabled = mcpConnections.length > 0;
     if (!plan.required) {
       const skipped: KnowledgePack = {
         ...EMPTY_KNOWLEDGE_PACK,
@@ -7417,55 +7922,67 @@ export default function Home() {
       setKnowledgePack(skipped);
       return skipped;
     }
-    if (!researchReady) {
-      const unavailable: KnowledgePack = {
-        ...EMPTY_KNOWLEDGE_PACK,
-        status: "unavailable",
-        summary: `已识别 ${plan.knowledgeGaps.length} 个专业知识缺口，但专业知识联网尚未配置；本次不会把模型常识伪装成来源知识。`,
-        plan,
-        generatedAt: new Date().toISOString(),
-      };
-      setKnowledgePack(unavailable);
-      return unavailable;
-    }
-
     const researching: KnowledgePack = {
       ...EMPTY_KNOWLEDGE_PACK,
       status: "researching",
-      summary: `正在围绕 ${plan.domain} 检索 ${plan.queries.length} 个专业问题`,
+      summary: `正在围绕 ${plan.domain} 通过${workflowMcpEnabled ? `已授权 MCP${researchReady ? "与" : ""}` : ""}${researchReady ? "网页检索" : workflowMcpEnabled ? "" : "现有资料"}核对 ${plan.queries.length} 个专业问题`,
       plan,
       generatedAt: new Date().toISOString(),
     };
     setKnowledgePack(researching);
     setBusyExecutionKind("loop");
-    setBusyExecutionNote(`正在检索：${plan.queries[0] || plan.knowledgeGaps[0]}`);
+    setBusyExecutionNote(workflowMcpEnabled
+      ? `正在查询已授权的专业知识 MCP：${plan.queries[0] || plan.knowledgeGaps[0]}`
+      : researchReady
+        ? `正在检索专业知识：${plan.queries[0] || plan.knowledgeGaps[0]}`
+        : "正在根据现有资料整理专业判断");
     try {
-      const controller = new AbortController();
-      const timeout = window.setTimeout(() => controller.abort(), 58_000);
-      let response: Response;
-      try {
-        response = await fetch("/api/research", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            provider: researchProvider,
-            apiKey: researchApiKey,
-            baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
-            queries: plan.queries,
-          }),
-          signal: controller.signal,
-        });
-      } finally {
-        window.clearTimeout(timeout);
+      const mcpReport = workflowMcpEnabled
+        ? await retrieveInternalMcpEvidence("knowledge-compile", plan.queries, 3)
+        : { phase: "knowledge-compile" as const, sources: [], attempts: [], connectionsScanned: 0, toolsDiscovered: 0 };
+      let sources = mcpReport.sources;
+      let webResearchIssue = "";
+      if (researchReady) {
+        setBusyExecutionNote(workflowMcpEnabled
+          ? `MCP 已返回 ${mcpReport.sources.length} 份证据，正在补充网页一手来源`
+          : "正在读取并筛选网页一手来源");
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), 58_000);
+        try {
+          const response = await fetch("/api/research", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              provider: researchProvider,
+              apiKey: researchApiKey,
+              baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
+              queries: plan.queries,
+            }),
+            signal: controller.signal,
+          });
+          const rawResponse = await response.text();
+          let payload: { sources?: unknown; error?: string } = {};
+          try { payload = JSON.parse(rawResponse) as { sources?: unknown; error?: string }; } catch { /* handled below */ }
+          if (!response.ok) throw new Error(payload.error || `专业知识检索失败（${response.status}）`);
+          sources = dedupeResearchSources([...sources, ...normalizeRetrievedSources(payload.sources)], 18);
+        } catch (error) {
+          webResearchIssue = error instanceof Error && error.name === "AbortError" ? "网页检索超过 58 秒" : error instanceof Error ? error.message : "网页检索失败";
+          if (!sources.length) throw error;
+        } finally {
+          window.clearTimeout(timeout);
+        }
       }
-      const rawResponse = await response.text();
-      let payload: { sources?: unknown; error?: string } = {};
-      try { payload = JSON.parse(rawResponse) as { sources?: unknown; error?: string }; } catch { /* handled below */ }
-      if (!response.ok) throw new Error(payload.error || `专业知识检索失败（${response.status}）`);
-      let sources = normalizeRetrievedSources(payload.sources);
-      if (!sources.length) throw new Error("联网结果缺少可用于编译的正文和来源地址");
+      if (!sources.length) {
+        throw new Error(researchReady
+          ? workflowMcpEnabled
+            ? "MCP 与网页结果均缺少可用于编译的正文和来源地址"
+            : "网页结果缺少可用于编译的正文和来源地址"
+          : workflowMcpEnabled
+            ? "已连接的 MCP 没有返回可编译证据，网页检索也未配置；不会把模型常识伪装成来源知识"
+            : "网页检索未配置；不会把模型常识伪装成来源知识");
+      }
 
-      const compiling: KnowledgePack = { ...researching, status: "compiling", sources, summary: `已找到 ${sources.length} 个来源，正在提炼会改变 Skill 行为的专业规则` };
+      const compiling: KnowledgePack = { ...researching, status: "compiling", sources, summary: `已取得 ${sources.length} 个来源${workflowMcpEnabled ? `（MCP ${mcpReport.sources.length}）` : ""}，正在提炼会改变 Skill 行为的专业规则${webResearchIssue ? `；网页补充未完成：${webResearchIssue}` : ""}` };
       setKnowledgePack(compiling);
       setBusyExecutionNote(`已读取 ${sources.length} 个来源，正在核对适用条件、例外和失败处理`);
       let evidencePayload = buildKnowledgeEvidencePayload(sources);
@@ -7495,29 +8012,34 @@ export default function Home() {
         try {
           const followupQueries = needsCompilerRepair ? [] : buildFollowupResearchQueries(plan, densityGate.missingDimensions);
           if (followupQueries.length > 0) {
-            const followupController = new AbortController();
-            const followupTimeout = window.setTimeout(() => followupController.abort(), 45_000);
-            let followupResponse: Response;
-            try {
-              followupResponse = await fetch("/api/research", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                  provider: researchProvider,
-                  apiKey: researchApiKey,
-                  baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
-                  queries: followupQueries,
-                }),
-                signal: followupController.signal,
-              });
-            } finally {
-              window.clearTimeout(followupTimeout);
+            if (workflowMcpEnabled) {
+              const followupMcp = await retrieveInternalMcpEvidence("knowledge-compile", followupQueries, 2);
+              sources = dedupeResearchSources([...sources, ...followupMcp.sources], 18);
             }
-            if (followupResponse.ok) {
-              const followupPayload = await followupResponse.json() as { sources?: unknown };
-              sources = dedupeResearchSources([...sources, ...normalizeRetrievedSources(followupPayload.sources)], 18);
-              evidencePayload = buildKnowledgeEvidencePayload(sources);
+            if (researchReady) {
+              const followupController = new AbortController();
+              const followupTimeout = window.setTimeout(() => followupController.abort(), 45_000);
+              try {
+                const followupResponse = await fetch("/api/research", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    provider: researchProvider,
+                    apiKey: researchApiKey,
+                    baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
+                    queries: followupQueries,
+                  }),
+                  signal: followupController.signal,
+                });
+                if (followupResponse.ok) {
+                  const followupPayload = await followupResponse.json() as { sources?: unknown };
+                  sources = dedupeResearchSources([...sources, ...normalizeRetrievedSources(followupPayload.sources)], 18);
+                }
+              } finally {
+                window.clearTimeout(followupTimeout);
+              }
             }
+            evidencePayload = buildKnowledgeEvidencePayload(sources);
           }
           setBusyExecutionNote(needsCompilerRepair
             ? `正在把 ${pack.diagnostics.validatorRejectedCount} 条校验反馈送回 Knowledge Compiler，重新生成可执行规则`
@@ -7563,6 +8085,7 @@ export default function Home() {
 
   async function compileSkill() {
     let goalLoopError = "";
+    let durableBuild: DurableWorkflowJournal | null = null;
     let generationPlan = ensureTaskCapabilities(capabilityPlan, idea, demoAnswers);
     setCapabilityPlan(generationPlan);
     const unresolvedMcp = generationPlan.items.find((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup");
@@ -7576,6 +8099,10 @@ export default function Home() {
     setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "contract", stopReason: "正在固定 Goal 与能力契约" });
     try {
       if (!hasRealModel) throw new Error("模型配置已缺失，请重新连接");
+      durableBuild = await DurableWorkflowJournal.start("build", {
+        goal: idea.slice(0, 2_000),
+        hasRepresentativeTask: Boolean(demoAnswers.__previewInput?.trim()),
+      });
       let liveKnowledgePack = EMPTY_KNOWLEDGE_PACK;
       try {
         liveKnowledgePack = await runBuildTimeKnowledgeCompiler(generationPlan);
@@ -7600,6 +8127,17 @@ export default function Home() {
         plan: generationPlan,
         loop: loopPlan,
         sourceEvidence: `${sourceInsightText}\n${liveKnowledgeText}`,
+      });
+      await durableBuild?.complete("intent", { goal: canonicalIR.identity.stableGoal, skillName: canonicalIR.identity.skillName });
+      await durableBuild?.complete("representative-task", { available: Boolean(demoAnswers.__previewInput?.trim()) });
+      await durableBuild?.complete("contract", { semanticDigest: semanticSkillIRDigest(canonicalIR) });
+      await durableBuild?.complete("capability-plan", {
+        activeCapabilityIds: generationPlan.items.filter(capabilityIsActive).map((item) => item.id),
+      });
+      await durableBuild?.complete("knowledge-compile", {
+        status: liveKnowledgePack.status,
+        sourceCount: liveKnowledgePack.sources.length,
+        adoptedRuleCount: liveKnowledgePack.atoms.length,
       });
       setBuildLoop((current) => ({ ...current, phase: "contract" }));
       setBusyPhaseIndex(1);
@@ -7629,8 +8167,19 @@ export default function Home() {
       compiledFiles = contractRepair.files;
       let audit = contractRepair.audit;
       const repairRounds = initialStaticRepair.rounds + contractRepair.rounds + contractRepair.nestedP0Rounds;
+      await durableBuild?.complete("bundle", {
+        files: Object.keys(compiledFiles).sort(),
+        executionReady: contractRepair.validation.executionReady,
+        contractReady: contractRepair.validation.contractReady,
+        repairRounds,
+      });
 
       if (contractRepair.passed) {
+        await durableBuild?.complete("freeze", {
+          revision: skillBundleRevision(compiledFiles),
+          executionReady: contractRepair.validation.executionReady,
+          contractReady: contractRepair.validation.contractReady,
+        });
         try {
           const goalLoopResult = await runOptimizationLoop(compiledFiles, generationPlan);
           compiledFiles = goalLoopResult.files;
@@ -7644,6 +8193,7 @@ export default function Home() {
           notifyGenerationLoopResult(failedState);
         }
       } else {
+        await durableBuild?.fail(new Error("P1 Contract Gate did not converge"));
         const blockedState: GenerationLoopState = {
           ...DEFAULT_GENERATION_LOOP,
           status: "attention",
@@ -7692,6 +8242,7 @@ export default function Home() {
           ? `已完成生成、质检和 ${repairRounds} 轮定向修复`
           : "已完成目标拆解、循环设计和生成质检");
     } catch (error) {
+      await durableBuild?.fail(error);
       const message = error instanceof Error ? error.message : "AI Skill 生成失败";
       setAiGenerationIssue(message);
       setBuildLoop((current) => ({ ...current, status: "attention", issues: [message] }));
@@ -7743,6 +8294,118 @@ export default function Home() {
       setAiGenerationIssue(message);
       setRetryAction("rerun-optimization-loop");
       setToast(`${message}；当前 Skill 文件没有被覆盖`);
+    } finally {
+      optimizationRunInFlight.current = false;
+      finishBusy();
+    }
+  }
+
+  async function rerunMultiSceneComparison() {
+    if (optimizationRunInFlight.current) return;
+    if (!files["SKILL.md"]) {
+      setToast("当前还没有可评测的 Skill 文件");
+      return;
+    }
+    if (!hasRealModel) {
+      setToast("模型配置已缺失，请重新连接");
+      return;
+    }
+    optimizationRunInFlight.current = true;
+    beginBusy("evaluate", "rerun-multi-scene-comparison", 0);
+    showLoopBusy("正在重跑普通 AI 与当前 Skill 的冻结多场景对照，不会生成或应用优化候选");
+    setAiGenerationIssue("");
+    try {
+      const restoredPlan = reconcileCapabilityPlanWithCanonicalIR(capabilityPlan, parseCanonicalSkillIR(files));
+      // A benchmark-only rerun must evaluate the exact Bundle currently shown in
+      // the editor. Re-projecting here can normalize bytes and create a different
+      // digest, which makes freshly collected evidence look stale immediately.
+      const currentFiles = { ...files };
+      const evalBank = harnessRunnableEvalBank(parseAndSplitEvalCases(currentFiles["evals/evals.json"] || ""), restoredPlan);
+      const requiredCapabilityIds = harnessVerifiableCapabilityIds(restoredPlan);
+      // Keep the project-level held-out suite stable across Bundle revisions.
+      // Re-sampling from a candidate's own eval bank makes historical scores
+      // incomparable and lets a regenerated Skill silently change its exam.
+      const selectionCases = generationLoop.benchmarkSuiteCases.length >= 2
+        ? generationLoop.benchmarkSuiteCases
+        : sampleOptimizationCases(evalBank, "selection", OPTIMIZATION_SELECTION_SAMPLE, { requiredCapabilityIds });
+      if (selectionCases.length < 2) throw new Error("当前评测集没有足够的独立保留任务，无法重跑多场景对照");
+
+      setGenerationLoop((current) => ({
+        ...current,
+        phase: "rollout",
+        stopReason: "正在重新执行普通 AI 与当前 Skill 的冻结多场景对照",
+      }));
+      reportClientGenerationLoopEvent("generation_loop_phase", {
+        phase: "benchmark-only",
+        reason: `只重跑 ${selectionCases.length} 个冻结场景的基线、当前 Skill 与匿名对照，不进入候选优化`,
+      });
+
+      const baselineHarness = await runIsolatedEvalHarness({ cases: selectionCases, configuration: "without_skill", repeats: 2 });
+      const currentHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: currentFiles, configuration: "with_skill", repeats: 2 });
+      const blindResult = await runBlindHarnessComparison(baselineHarness, currentHarness);
+      const baselineMetrics = summarizeGenerationEvidence(baselineHarness.evidence);
+      const currentMetrics = summarizeGenerationEvidence(currentHarness.evidence);
+      const revision = skillBundleRevision(files);
+      const blindWinner = blindResult.revealedWinner === "left" ? "baseline" : blindResult.revealedWinner === "tie" ? "tie" : "candidate";
+      const comparison = compareHarnessBenchmarks(baselineHarness, currentHarness, blindWinner);
+      const comparisonIssues = comparison.cases
+        .filter((item) => !item.skillPassed || item.delta < 0)
+        .map((item) => `${item.caseId}：${item.baselineScore}→${item.skillScore}${item.failureReason ? `；${item.failureReason}` : ""}${item.dimensionGaps.length ? `；落后维度 ${item.dimensionGaps.join("、")}` : ""}`)
+        .slice(0, 8);
+      const nextStatus: GenerationLoopState["status"] = comparison.verdict === "improved" ? "passed" : comparison.verdict === "equivalent" ? "stable" : "attention";
+      const nextStopReason = comparison.verdict === "improved"
+        ? `正式对照完成：当前 Skill 稳定优于普通 AI ${comparison.lift} 分`
+        : comparison.verdict === "equivalent"
+          ? "正式对照完成：当前 Skill 与普通 AI 表现接近，未宣称获得增益"
+          : comparison.lift > 0
+            ? `正式对照完成：当前 Skill 总分高于普通 AI ${comparison.lift} 分，但冻结通过率或匿名质量对照未达到接受门槛，暂不接受为有效候选`
+            : comparison.lift === 0
+              ? "正式对照完成：当前 Skill 总分与普通 AI 持平，但冻结通过率或匿名质量对照未达到接受门槛"
+              : `正式对照发现回退：当前 Skill 比普通 AI 低 ${Math.abs(comparison.lift)} 分，未接受为有效候选`;
+
+      setGenerationLoop((current) => ({
+        ...current,
+        status: nextStatus,
+        phase: "complete",
+        baselineScore: baselineMetrics.score,
+        bestScore: currentMetrics.score,
+        baselineQualityScore: comparison.baselineScore,
+        bestQualityScore: comparison.skillScore,
+        comparisonConfidence: blindResult.confidence,
+        comparisonRevision: revision,
+        comparisonStage: current.comparisonStage === "initial" ? "initial" : "optimized",
+        comparisonCaseCount: selectionCases.length,
+        comparisonVerdict: comparison.verdict,
+        comparisonEvidence: comparison.cases,
+        benchmarkSuiteCases: selectionCases,
+        lift: comparison.lift,
+        passRate: currentMetrics.passRate,
+        contractDigest: currentHarness.contract.digest,
+        benchmarkCases: selectionCases.length,
+        benchmarkRepeatsPerCase: Math.min(baselineHarness.benchmark.repeatsPerCase, currentHarness.benchmark.repeatsPerCase),
+        benchmarkRuns: baselineHarness.benchmark.runs + currentHarness.benchmark.runs,
+        baselineStddev: baselineHarness.benchmark.repeatScoreStddev,
+        bestStddev: currentHarness.benchmark.repeatScoreStddev,
+        meanDurationMs: Math.round((baselineHarness.benchmark.meanDurationMs + currentHarness.benchmark.meanDurationMs) / 2),
+        blindWinner,
+        issues: comparisonIssues,
+        stopReason: nextStopReason,
+      }));
+      reportClientGenerationLoopEvent("generation_loop_finished", {
+        phase: "benchmark-only",
+        accepted: comparison.verdict === "improved",
+        verdict: comparison.verdict,
+        contractDigest: currentHarness.contract.digest,
+        cases: comparison.cases,
+        reason: `正式对照已绑定当前 Bundle ${revision.slice(0, 12)}：${comparison.baselineScore} → ${comparison.skillScore}；${nextStopReason}`,
+      });
+      setToast(nextStopReason);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "多场景正式对照没有完成";
+      setAiGenerationIssue(message);
+      setRetryAction("rerun-multi-scene-comparison");
+      setToast(`${message}；当前 Skill 与旧评测结果均未被覆盖`);
+      reportClientGenerationLoopEvent("generation_loop_failed", { phase: "benchmark-only", reason: message });
     } finally {
       optimizationRunInFlight.current = false;
       finishBusy();
@@ -7856,19 +8519,77 @@ export default function Home() {
     setToast("已加入自定义 MCP；确认安装与授权后才会写成可调用");
   }
 
+  async function handleDemoChatFiles(event: ChangeEvent<HTMLInputElement>) {
+    const selected = Array.from(event.target.files || []).slice(0, Math.max(0, 3 - demoChatAttachments.length));
+    event.target.value = "";
+    if (!selected.length) {
+      if (demoChatAttachments.length >= 3) setToast("每轮最多添加 3 个文件");
+      return;
+    }
+    setDemoChatFilesLoading(true);
+    setDemoChatError("");
+    try {
+      const parsed = await Promise.all(selected.map(async (file, index): Promise<DemoChatAttachment> => {
+        const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+        if (isPdf && file.size > 8 * 1024 * 1024) throw new Error(`${file.name} 超过 8 MB`);
+        if (!isPdf && file.size > 2_000_000) throw new Error(`${file.name} 超过 2 MB`);
+
+        let extracted = "";
+        if (isPdf) {
+          const form = new FormData();
+          form.append("file", file, file.name);
+          const response = await fetch("/api/parse-pdf", { method: "POST", body: form });
+          const data = await response.json() as { error?: string; text?: string; scannedLikely?: boolean };
+          if (!response.ok) throw new Error(`${file.name}：${data.error || "解析失败"}`);
+          if (data.scannedLikely || !data.text?.trim()) throw new Error(`${file.name} 没有可读取文字，请先完成 OCR`);
+          extracted = data.text;
+        } else {
+          extracted = await file.text();
+        }
+        const textLimit = 12_000;
+        return {
+          id: `demo-file-${Date.now()}-${index}`,
+          name: file.name,
+          type: file.type || "text/plain",
+          size: file.size,
+          text: extracted.slice(0, textLimit),
+          truncated: extracted.length > textLimit,
+        };
+      }));
+      setDemoChatAttachments((current) => [...current, ...parsed].slice(0, 3));
+      setToast(`已加入 ${parsed.length} 个文件，会随下一条消息发送`);
+    } catch (error) {
+      setDemoChatError(error instanceof Error ? error.message : "文件读取失败");
+    } finally {
+      setDemoChatFilesLoading(false);
+    }
+  }
+
+  function removeDemoChatAttachment(id: string) {
+    setDemoChatAttachments((current) => current.filter((item) => item.id !== id));
+  }
+
   async function sendDemoChatMessage() {
     const message = demoChatInput.trim();
-    if (!message || !skillDemo || demoChatBusy) return;
+    const attachments = demoChatAttachments;
+    if ((!message && !attachments.length) || !skillDemo || demoChatBusy || demoChatFilesLoading) return;
     if (!hasRealModel) {
       setToast("继续对话前需要先连接模型");
       setSettingsOpen(true);
       return;
     }
     const sequence = demoChatSequence + 1;
-    const userMessage: DemoChatMessage = { id: `user-${demoRunCount}-${sequence}`, role: "user", content: message.slice(0, 3_000) };
+    const visibleMessage = message || `请结合我刚上传的${attachments.length === 1 ? "文件" : `${attachments.length} 个文件`}继续。`;
+    const userMessage: DemoChatMessage = {
+      id: `user-${demoRunCount}-${sequence}`,
+      role: "user",
+      content: visibleMessage.slice(0, 3_000),
+      attachments: attachments.length ? attachments : undefined,
+    };
     const conversation = [...demoConversation, userMessage].slice(-12);
     setDemoConversation(conversation);
     setDemoChatInput("");
+    setDemoChatAttachments([]);
     setDemoChatError("");
     setDemoChatBusy(true);
     setDemoChatSequence(sequence);
@@ -7882,7 +8603,7 @@ export default function Home() {
         skill: files,
         demo: skillDemo,
         conversation,
-        message,
+        message: visibleMessage,
       });
       const reply = typeof result.reply === "string" ? result.reply.trim().slice(0, 12_000) : "";
       if (!reply) throw new Error("AI 没有完成这轮回复");
@@ -7890,9 +8611,59 @@ export default function Home() {
     } catch (error) {
       setDemoConversation((current) => current.filter((item) => item.id !== userMessage.id));
       setDemoChatInput(message);
+      setDemoChatAttachments(attachments);
       setDemoChatError(error instanceof Error ? error.message : "继续对话失败，请重试");
     } finally {
       setDemoChatBusy(false);
+    }
+  }
+
+  async function reevaluateDemoConversation() {
+    if (!skillDemo || demoConversationScoreBusy) return;
+    const completedReplies = demoConversation.filter((item) => item.role === "assistant");
+    const completedTurns = completedReplies.length;
+    const latestReplyId = completedReplies.at(-1)?.id || "";
+    if (!latestReplyId) {
+      setToast("先继续对话一轮，AI 回复后即可更新评分");
+      return;
+    }
+    if (latestReplyId === demoConversationScoredReplyId) {
+      setToast("当前对话已经评分；继续对话后可再次更新");
+      return;
+    }
+    if (!hasRealModel) {
+      setToast("重新评分前需要先连接模型");
+      setSettingsOpen(true);
+      return;
+    }
+    setDemoConversationScoreBusy(true);
+    setDemoChatError("");
+    try {
+      const review = await callAI<{ results?: EvalResult[]; feedbackOptions?: unknown }>("evaluate", {
+        idea,
+        sourceText: contextBundle,
+        answers: interviewEvidence,
+        loopPlan,
+        skill: files,
+        demo: skillDemo,
+        conversationEvidence: demoConversation,
+      });
+      const normalized = normalizeEvalResults(review.results, files, demoAnswers);
+      if (normalized.length !== 5) throw new Error("AI 没有完成五项对话证据评估");
+      const fallback = createDemoFeedbackFallback(skillDemo, normalized, createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0));
+      const hasVisibleMismatch = normalized.some((item) => item.coverage !== "not-covered" && item.score < 90 && !/无实质缺陷|完全符合|准确|流程正确|本轮未覆盖|不构成缺陷/i.test(item.issue || ""));
+      setEvals(normalized);
+      setFeedbackOptions(hasVisibleMismatch ? normalizeFeedbackOptions(review.feedbackOptions, fallback) : []);
+      setFeedbackReasons([]);
+      setFeedbackCustom("");
+      setEvalRan(true);
+      setDemoConversationScoredTurns(completedTurns);
+      setDemoConversationScoredReplyId(latestReplyId);
+      setToast(`已更新本次场景评分（${completedTurns} 轮对话）；顶部多场景对照需单独重新运行`);
+    } catch (error) {
+      setDemoChatError(error instanceof Error ? error.message : "对话证据重新评分失败");
+    } finally {
+      setDemoConversationScoreBusy(false);
     }
   }
 
@@ -7953,6 +8724,9 @@ export default function Home() {
         setDemoConversation([]);
         setDemoChatSequence(0);
         setDemoChatInput("");
+        setDemoChatAttachments([]);
+        setDemoConversationScoredTurns(0);
+        setDemoConversationScoredReplyId("");
         setDemoChatError("");
         setDemoReviewPending(true);
         setEvalRan(false);
@@ -7985,6 +8759,7 @@ export default function Home() {
       return;
     }
     const hadResult = evalRan;
+    setEvalDetailsOpen(false);
     beginBusy("evaluate", "evaluate");
     try {
       const savedDemo = demoReviewPending ? skillDemo : null;
@@ -8410,6 +9185,8 @@ export default function Home() {
       setDemoConversation([]);
       setDemoChatSequence(0);
       setDemoChatInput("");
+      setDemoConversationScoredTurns(0);
+      setDemoConversationScoredReplyId("");
       setDemoChatError("");
       setDemoReviewPending(false);
       setEvals(reviewed.results);
@@ -8582,48 +9359,108 @@ export default function Home() {
 
   function renderSkillDemoCard(pendingReview: boolean) {
     if (!skillDemo) return null;
+    const completedConversationTurns = demoConversation.filter((message) => message.role === "assistant").length;
+    const latestCompletedReplyId = [...demoConversation].reverse().find((message) => message.role === "assistant")?.id || "";
+    const conversationScoreIsFresh = Boolean(latestCompletedReplyId) && demoConversationScoredReplyId === latestCompletedReplyId;
+    const hasNewConversationEvidence = Boolean(latestCompletedReplyId) && !conversationScoreIsFresh;
     return (
       <section className={`skill-demo-card ${pendingReview ? "review-pending" : ""}`}>
         <div className="skill-demo-head">
-          <div><span>第 {Math.max(1, demoRunCount)} 次 · 代表性任务试跑</span><h3>{skillDemo.title}</h3><p>{skillDemo.scenario}</p></div>
-          {pendingReview
-            ? <div className="demo-score pending"><small>Demo 已保存</small><strong>✓</strong><span>等待评估</span></div>
-            : <div className="demo-score"><small>综合观察</small><strong>{averageEvalScore}</strong><span>/ 100</span></div>}
+          <div className="skill-demo-title"><span>第 {Math.max(1, demoRunCount)} 次试跑</span><h3>{skillDemo.title}</h3><p>{skillDemo.scenario}</p></div>
+          <div className="skill-demo-aside">
+            {pendingReview
+              ? <div className="demo-score pending"><small>已保存</small><strong>✓</strong><span>等待评估</span></div>
+              : observedEvals.length
+                ? <div className="demo-score"><small>{demoConversationScoredTurns > 0 ? `当前单场景 · ${demoConversationScoredTurns} 轮对话` : `当前单场景 · ${observedEvals.length} 项证据`}</small><strong>{averageEvalScore}</strong><span>/ 100</span><em>不与多场景总分直接比较</em></div>
+                : <div className="demo-score pending"><small>本轮证据</small><strong>0</strong><span>项可评分</span></div>}
+            {!pendingReview && <div className="demo-head-actions">
+              <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
+              <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "评分中…" : conversationScoreIsFresh ? "本次评分已更新" : "更新本次评分"}</span></button>
+            </div>}
+          </div>
         </div>
-        <div className="demo-prompt"><span>本次输入</span><p>{skillDemo.userPrompt}</p></div>
-        <div className={`demo-output ${demoExpanded ? "expanded" : ""}`}>
-          <div><span>Skill 实际产出</span><button onClick={() => setDemoExpanded((current) => !current)}>{demoExpanded ? "收起结果" : "展开完整结果"}</button></div>
-          <pre>{skillDemo.output}</pre>
+        <div className="demo-initial-transcript">
+          <div className="demo-message user initial-turn">
+            <span>你</span>
+            <div className="demo-message-body">
+              <small>本次输入</small>
+              <p>{skillDemo.userPrompt}</p>
+            </div>
+          </div>
+          <div className="demo-message assistant initial-turn">
+            <span>AI</span>
+            <div className="demo-message-body demo-output">
+              <div><small>Skill 实际产出</small></div>
+              <pre>{skillDemo.output}</pre>
+            </div>
+          </div>
         </div>
-        <div className="demo-observations">
-          <div><span>本次确实做了</span><ul>{skillDemo.appliedRules.map((item) => <li key={item}>{item}</li>)}</ul></div>
-          <div className="demo-uncertainties"><span>仍无法确定</span>{skillDemo.uncertainties.length ? <ul>{skillDemo.uncertainties.map((item) => <li key={item}>{item}</li>)}</ul> : <p>本轮没有主动声明无法确定的事项。</p>}</div>
-        </div>
+        <details className="demo-diagnostics">
+          <summary><strong>查看本轮诊断</strong><span>{skillDemo.appliedRules.length} 项完成{skillDemo.uncertainties.length ? `，${skillDemo.uncertainties.length} 项待确认` : ""}</span><small>展开</small></summary>
+          <div className="demo-observations">
+            <div><span>已经做到</span><ul>{skillDemo.appliedRules.map((item) => <li key={item}>{item}</li>)}</ul></div>
+            <div className="demo-uncertainties"><span>还需确认</span>{skillDemo.uncertainties.length ? <ul>{skillDemo.uncertainties.map((item) => <li key={item}>{item}</li>)}</ul> : <p>本轮没有需要额外确认的事项。</p>}</div>
+          </div>
+        </details>
         <div className="demo-conversation">
-          <div className="demo-conversation-heading"><strong>围绕这份结果接着说</strong></div>
+          <div className="demo-conversation-heading"><div><strong>继续对话</strong><small>补充材料或修改意见，AI 会基于当前结果继续处理。</small></div></div>
           {demoConversation.length > 0 && (
             <div className="demo-message-list" aria-live="polite">
-              {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? "你" : "AI"}</span><p>{message.content}</p></div>)}
+              {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? "你" : "AI"}</span><div className="demo-message-body"><p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
               {demoChatBusy && <div className="demo-message assistant pending"><span>AI</span><p><i /><i /><i /></p></div>}
             </div>
           )}
+          {demoChatAttachments.length > 0 && <div className="demo-chat-files" aria-label="待发送文件">{demoChatAttachments.map((attachment) => <span key={attachment.id}><b>{attachment.name}</b>{attachment.truncated && <small>已读取前段内容</small>}<button type="button" onClick={() => removeDemoChatAttachment(attachment.id)} aria-label={`移除 ${attachment.name}`}>×</button></span>)}</div>}
           <div className="demo-chat-composer">
+            <input
+              ref={demoChatFileInputRef}
+              className="demo-chat-file-input"
+              type="file"
+              multiple
+              accept=".pdf,.md,.txt,.json,.csv,.html,.js,.ts,.tsx,.py"
+              onChange={handleDemoChatFiles}
+              tabIndex={-1}
+            />
+            <button className="demo-chat-attach" type="button" onClick={() => demoChatFileInputRef.current?.click()} disabled={demoChatBusy || demoChatFilesLoading || demoChatAttachments.length >= 3} aria-label={demoChatFilesLoading ? "正在读取文件" : "添加文件"}>{demoChatFilesLoading ? <span>读取中</span> : <img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/paperclip.svg" alt="" aria-hidden="true" />}</button>
             <textarea
               value={demoChatInput}
               onChange={(event) => { setDemoChatInput(event.target.value); setDemoChatError(""); }}
               onKeyDown={(event) => { if (event.key === "Enter" && !event.shiftKey) { event.preventDefault(); void sendDemoChatMessage(); } }}
               placeholder="继续追问、补充条件，或让它基于这份结果再改一版…"
               aria-label="继续与 Demo 对话"
-              rows={2}
+              rows={1}
             />
-            <button type="button" onClick={() => void sendDemoChatMessage()} disabled={!demoChatInput.trim() || demoChatBusy}>{demoChatBusy ? "回复中…" : "发送"}<span>↑</span></button>
+            <button className="demo-chat-send" type="button" onClick={() => void sendDemoChatMessage()} disabled={(!demoChatInput.trim() && !demoChatAttachments.length) || demoChatBusy || demoChatFilesLoading}><span>{demoChatBusy ? "回复中…" : "发送"}</span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/send.svg" alt="" aria-hidden="true" /></button>
           </div>
-          {demoChatError && <div className="demo-chat-error" role="alert"><span>{demoChatError}</span><button type="button" onClick={() => void sendDemoChatMessage()} disabled={demoChatBusy || !demoChatInput.trim()}>重试</button></div>}
+          {demoChatError && <div className="demo-chat-error" role="alert"><span>{demoChatError}</span><button type="button" onClick={() => void sendDemoChatMessage()} disabled={demoChatBusy || (!demoChatInput.trim() && !demoChatAttachments.length)}>重试</button></div>}
         </div>
-        <div className="demo-actions">{pendingReview && <small>这份 Demo 已经保存；后续失败不会要求重新生成。</small>}<button className="secondary-button" onClick={runEvaluation} disabled={busy}>{pendingReview ? busy ? "正在完成评估…" : "继续完成评估" : "换个场景再试跑"}</button></div>
+        {pendingReview && <div className="demo-actions"><small>本次结果已保存。</small><button className="secondary-button" onClick={runEvaluation} disabled={busy}>{busy ? "正在完成评估…" : "继续完成评估"}</button></div>}
       </section>
     );
   }
+
+  const knowledgeMcpReport = internalMcpEvidenceReports["knowledge-compile"];
+  const knowledgeMcpUrls = new Set(knowledgePack.sources.filter((source) => source.origin === "mcp").map((source) => source.url));
+  const knowledgeMcpAdoptedCount = knowledgePack.atoms.filter((atom) => atom.sourceUrls.some((url) => knowledgeMcpUrls.has(url))).length;
+  const knowledgeMcpCompletedCalls = knowledgeMcpReport?.attempts.filter((attempt) => attempt.status === "completed").length || 0;
+  const knowledgeMcpReceiptState = !knowledgeMcpReport
+    ? "idle"
+    : knowledgeMcpReport.error
+      ? "error"
+      : knowledgeMcpReport.sources.length > 0
+        ? "used"
+        : knowledgeMcpReport.connectionsScanned > 0
+          ? "empty"
+          : "unconfigured";
+  const knowledgeMcpReceiptTitle = knowledgeMcpReceiptState === "used"
+    ? `MCP 已提供 ${knowledgeMcpReport?.sources.length || 0} 份可追溯证据`
+    : knowledgeMcpReceiptState === "unconfigured"
+      ? "本轮没有可用的知识 MCP 连接"
+      : knowledgeMcpReceiptState === "error"
+        ? "MCP 取证本轮未完成"
+        : knowledgeMcpReceiptState === "empty"
+          ? "MCP 已检查，但没有证据通过编译"
+          : "本版没有 MCP 证据进入知识包";
 
   return (
     <main className="app-shell">
@@ -9129,6 +9966,28 @@ export default function Home() {
                     <div className="knowledge-pack-metrics"><span><b>{knowledgePack.sources.length}</b> 个来源</span><span><b>{knowledgePack.atoms.length}</b> 条采用</span><span><b>{knowledgePack.coverage.score}%</b> 维度覆盖</span><span><b>{knowledgePack.valueDensity}</b> 价值密度</span></div>
                   </div>
                   {knowledgePack.plan.knowledgeGaps.length > 0 && <div className="knowledge-gap-row"><span>本次重点寻找</span>{knowledgePack.plan.knowledgeGaps.map((gap) => <em key={gap}>{gap}</em>)}</div>}
+                  {mcpConnections.length > 0 && knowledgeMcpReport && <div className={`knowledge-mcp-receipt ${knowledgeMcpReceiptState}`}>
+                    <div className="knowledge-mcp-receipt-copy">
+                      <span>INTERNAL MCP · 生成器取证回执</span>
+                      <strong>{knowledgeMcpReceiptTitle}</strong>
+                      <p>{knowledgeMcpReceiptState === "used"
+                        ? `扫描 ${knowledgeMcpReport?.connectionsScanned || 0} 个连接、发现 ${knowledgeMcpReport?.toolsDiscovered || 0} 个 Tool，完成 ${knowledgeMcpCompletedCalls} 次只读调用；其中 ${knowledgeMcpAdoptedCount} 条 Knowledge Atom 使用了 MCP 来源。`
+                        : knowledgeMcpReceiptState === "unconfigured"
+                          ? "Evidence Router 已运行，但当前会话没有授权任何可检索的 MCP Server。本页专业知识来自网页检索，不会把网页来源冒充成 MCP。"
+                          : knowledgeMcpReceiptState === "empty"
+                            ? `扫描 ${knowledgeMcpReport?.connectionsScanned || 0} 个连接、发现 ${knowledgeMcpReport?.toolsDiscovered || 0} 个 Tool，但没有返回满足只读、可自动构造参数且正文可编译的证据。`
+                            : knowledgeMcpReceiptState === "error"
+                              ? knowledgeMcpReport?.error || "内部 MCP 调用失败，已安全降级到其他来源。"
+                              : "这份结果生成时尚未保存 MCP 扫描回执；现有来源列表中没有 MCP 来源。下次生成会在这里显示连接、Tool、调用和采纳结果。"}</p>
+                    </div>
+                    <div className="knowledge-mcp-receipt-metrics" aria-label="MCP 取证统计">
+                      <span><b>{knowledgeMcpReport?.connectionsScanned ?? "—"}</b> 连接</span>
+                      <span><b>{knowledgeMcpReport?.toolsDiscovered ?? "—"}</b> Tools</span>
+                      <span><b>{knowledgeMcpReport?.sources.length ?? 0}</b> 证据</span>
+                      <span><b>{knowledgeMcpAdoptedCount}</b> 采用</span>
+                    </div>
+                    {knowledgeMcpReport?.attempts.length ? <details><summary>查看 MCP 调用记录</summary><ul>{knowledgeMcpReport.attempts.map((attempt, index) => <li key={`${attempt.query}-${attempt.toolName}-${index}`}><b>{attempt.status === "completed" ? "已返回" : attempt.status === "skipped" ? "已跳过" : attempt.status === "input_required" ? "需补充输入" : attempt.status === "authorization_required" ? "需授权" : "失败"}</b><span>{attempt.toolName || "未找到检索 Tool"}{attempt.query ? ` · ${attempt.query}` : ""}</span>{attempt.reason ? <em>{attempt.reason}</em> : null}</li>)}</ul></details> : null}
+                  </div>}
                   {knowledgePack.sources.length > 0 && (knowledgePack.diagnostics?.candidateCount || 0) > 0 && <div className="knowledge-validation-note">联网检索已完成。Knowledge Compiler 共检查 {knowledgePack.diagnostics?.candidateCount || 0} 条候选，保留 {knowledgePack.atoms.length} 条；权威来源有 {knowledgePack.diagnostics?.authoritativeSourceCount || 0} 个，其中 {knowledgePack.diagnostics?.authoritativeSourceUseCount || 0} 个已进入运行规则。{(knowledgePack.diagnostics?.validatorRejectedCount || 0) > 0 ? `${knowledgePack.diagnostics?.validatorRejectedCount || 0} 条已带着具体原因进入自动修复。` : "其余候选属于模型主动放弃的泛化或冲突建议。"}</div>}
                   {knowledgePack.atoms.length > 0 && (
                     <details className="knowledge-atom-details">
@@ -9204,7 +10063,7 @@ export default function Home() {
                   <div><span>独立评分 · 当前 Skill</span><strong>{generationLoop.benchmarkRuns ? generationLoop.bestScore : "—"}</strong></div>
                   <div className={generationLoop.lift > 0 ? "positive" : ""}><span>独立评分 Lift</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.lift >= 0 ? "+" : ""}${generationLoop.lift}` : "—"}</strong></div>
                   <div><span>冻结断言通过率</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.passRate}%` : "—"}</strong></div>
-                  <div><span>匿名 A/B 质量分</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.baselineQualityScore} / ${generationLoop.bestQualityScore}` : "—"}</strong></div>
+                  <div><span>冻结场景正式总分</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.baselineQualityScore} / ${generationLoop.bestQualityScore}` : "—"}</strong></div>
                   <div><span>匿名 A/B 结果</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 胜" : generationLoop.blindWinner === "baseline" ? "普通 AI 胜" : generationLoop.blindWinner === "tie" ? "两者持平" : "—"}</strong></div>
                   <div><span>试跑设计</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkCases} 场景 × 每版 ${generationLoop.benchmarkRepeatsPerCase} 次` : "—"}</strong></div>
                   <div><span>重复运行稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? `Skill σ ${generationLoop.bestStddev} · 基线 σ ${generationLoop.baselineStddev ?? "—"}` : "未测（每场景仅 1 次）"}</strong></div>
@@ -9257,35 +10116,43 @@ export default function Home() {
           {step === "evaluate" && (
             <div className="stage-content eval-stage">
               <div className="stage-heading-row">
-                <div><h2>它真的懂你吗？</h2><p>先让 Skill 完成一个代表性任务。你看到结果后，再决定下一轮具体改什么。</p></div>
-                {evalRan && <span className="status-pill success">第 {Math.max(1, demoRunCount)} 次试跑完成</span>}
+                <div><h2>验证效果</h2><p>让 Skill 真正完成一次任务，再分清哪些已经做好、哪些还能再提升、哪些还没有测到。</p></div>
               </div>
 
-              <div className="personalization-loop-card">
-                <div className="loop-card-copy"><span>验证与优化 Loop</span><strong>每一轮都必须产生新 Demo</strong><p>结构检查只负责发现文件问题；“懂不懂你”必须由真实结果和你的判断来决定。</p></div>
-                <div className="loop-track" aria-label="验证与优化循环">
-                  {["生成试跑任务", "按 Skill 产出", "AI 对照找差距", "你选择要改的点", "重写并再次试跑"].map((label, index) => <span className={evalRan && index < 3 ? "done" : (feedbackReasons.length || feedbackCustom.trim()) && index === 3 ? "active" : ""} key={label}><i>{index + 1}</i>{label}</span>)}
-                </div>
-                <b>已试跑 {demoRunCount} 次</b>
-              </div>
-
-              {generationLoop.benchmarkRuns > 0 && generationLoop.comparisonRevision === currentBundleRevision && (
-                <section className={`user-proof-card ${generationLoop.blindWinner}`}>
-                  <div className="user-proof-copy"><span>{generationLoop.comparisonStage === "initial" ? "当前版本正式对照 · 本轮未采纳新候选" : "优化后正式对照 · 已绑定最终版本"}</span><strong>{generationLoop.blindWinner === "candidate" ? "专属 Skill 在匿名比较中更好" : generationLoop.blindWinner === "baseline" ? "当前 Skill 还没有稳定超过普通 AI" : "当前 Skill 与普通 AI 表现接近"}</strong><p>{generationLoop.comparisonStage === "initial" ? "Optimization Loop 已完成，但没有候选同时通过保留任务与匿名比较；这里展示的是本轮重新执行的当前版本，不是旧缓存。" : generationLoop.blindWinner === "candidate" ? "系统按逐项标准重新汇总分数，并把匿名结果绑定到最终 Bundle 版本。" : "系统保留真实结果，没有用结构完整度或模型自报总分把它包装成已经有效。"}</p></div>
+              {generationLoop.benchmarkRuns > 0 && generationLoop.comparisonRevision === currentBundleRevision && (() => {
+                const comparisonPresentation = describeMultiSceneComparison(generationLoop);
+                return (
+                <section className={`user-proof-card ${comparisonPresentation.tone}`}>
+                  <div className="user-proof-copy"><span>4 场景正式对照总分 · 与下方单场景分口径不同</span><strong>{comparisonPresentation.title}</strong><p>{comparisonPresentation.detail}</p></div>
                   <div className="user-proof-metrics">
-                    <div><span>普通 AI 质量</span><strong>{generationLoop.baselineQualityScore}</strong></div>
-                    <div><span>你的 Skill 质量</span><strong>{generationLoop.bestQualityScore}</strong></div>
+                    <div><span>普通 AI · 4 场景总分</span><strong>{generationLoop.baselineQualityScore}</strong></div>
+                    <div><span>你的 Skill · 4 场景总分</span><strong>{generationLoop.bestQualityScore}</strong></div>
                     {(() => {
                       const qualityDelta = generationLoop.bestQualityScore - generationLoop.baselineQualityScore;
-                      return <div className={qualityDelta > 0 ? "positive" : qualityDelta < 0 ? "negative" : ""}><span>盲评变化</span><strong>{qualityDelta >= 0 ? "+" : ""}{qualityDelta}</strong></div>;
+                      return <div className={qualityDelta > 0 ? "positive" : qualityDelta < 0 ? "negative" : ""}><span>多场景变化</span><strong>{qualityDelta >= 0 ? "+" : ""}{qualityDelta}</strong></div>;
                     })()}
                     <div><span>评测证据</span><strong>{generationLoop.comparisonCaseCount} 个场景 · 每版每场景 {generationLoop.benchmarkRepeatsPerCase} 次</strong></div>
                   </div>
+                  <button className="user-proof-refresh" type="button" onClick={() => void rerunMultiSceneComparison()} disabled={busy}>重新跑多场景对照 <span>→</span></button>
+                  {generationLoop.comparisonEvidence.length > 0 && (
+                    <details className="comparison-case-evidence">
+                      <summary>查看每个冻结场景的真实得分与扣分原因</summary>
+                      <ul>{generationLoop.comparisonEvidence.map((item) => (
+                        <li key={item.caseId} className={item.delta < 0 ? "regressed" : item.delta > 0 ? "improved" : "equivalent"}>
+                          <strong>{item.caseId}</strong>
+                          <span>{item.baselineScore} → {item.skillScore}（{item.delta >= 0 ? "+" : ""}{item.delta}）</span>
+                          {(item.failureReason || item.dimensionGaps.length > 0) && <p>{[item.failureReason, item.dimensionGaps.length ? `落后维度：${item.dimensionGaps.join("、")}` : ""].filter(Boolean).join("；")}</p>}
+                        </li>
+                      ))}</ul>
+                    </details>
+                  )}
                 </section>
-              )}
+                );
+              })()}
               {generationLoop.benchmarkRuns > 0 && generationLoop.comparisonRevision !== currentBundleRevision && (
                 <section className="user-proof-card attention">
                   <div className="user-proof-copy"><span>最终版本对照尚未完成</span><strong>旧版本分数已隐藏</strong><p>Bundle 在最近一次匿名比较后发生了变化。系统不会把旧结果冒充为当前版本证据，请重新运行 Optimization Loop。</p></div>
+                  <button className="user-proof-refresh" type="button" onClick={() => void rerunMultiSceneComparison()} disabled={busy}>重新验证当前版本 <span>→</span></button>
                 </section>
               )}
 
@@ -9319,27 +10186,60 @@ export default function Home() {
                     </section>
                   )}
                   {renderSkillDemoCard(false)}
-                  <div className="eval-section-heading"><div><span>AI 对照报告</span><h3>五个关键维度</h3><p>保留可行动的不足与影响；完整证据仍用于内部复评，不再挤占页面空间。</p></div></div>
-                  <div className="eval-list">
+                  <section className={`eval-report-panel ${evalDetailsOpen ? "expanded" : "collapsed"}`} aria-label="本轮效果报告">
+                    <div className={`eval-report-summary ${needsWorkEvals.length ? "needs-work" : pendingEvals.length ? "partial" : "ready"}`}>
+                      <div className="eval-report-verdict">
+                        <span>本轮结论</span>
+                        <strong>{evaluationHeadline}</strong>
+                        <p>{evaluationSummary}</p>
+                      </div>
+                      <div className="eval-report-counts" aria-label="本轮证据状态">
+                        <div><strong>{strongEvals.length}</strong><span>表现符合要求</span></div>
+                        <div><strong>{needsWorkEvals.length}</strong><span>还能再提升</span></div>
+                        <div><strong>{pendingEvals.length}</strong><span>还没有测到</span></div>
+                      </div>
+                      <button type="button" className="eval-report-toggle" onClick={() => setEvalDetailsOpen((current) => !current)} aria-expanded={evalDetailsOpen} aria-controls="eval-report-details">
+                        {evalDetailsOpen ? "收起" : "展开"}<img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" />
+                      </button>
+                    </div>
+                    <div id="eval-report-details" className="eval-report-details" hidden={!evalDetailsOpen}>
+                      <div className="eval-list" aria-label="五项效果验证">
                     {evals.map((result, index) => {
                       const history = optimizationHistory[result.label];
                       const delta = history ? result.score - history.before.score : 0;
                       const analyzingThis = optimizationOpen && optimizationTargetIndex === index && optimizationActive;
+                      const pending = result.coverage === "not-covered";
+                      const statusLabel = pending
+                        ? "还没测到"
+                        : result.score >= DEMO_SCORING_POLICY.observedGoodFloor
+                          ? "这次表现符合要求"
+                          : result.score >= DEMO_SCORING_POLICY.observedWarningFloor
+                            ? "有一个明显差距"
+                            : "优先提升";
                       return (
-                        <div className={`eval-row ${history ? "optimized" : ""}`} key={result.label}>
+                        <article className={`eval-row ${history ? "optimized" : ""} ${pending ? "pending" : result.tone}`} key={result.label}>
                           <div className="eval-row-head">
-                            <span className={`eval-dot ${result.tone}`} />
                             <span className="eval-title-line"><strong>{result.label}</strong>{history && <em>复评 {delta >= 0 ? "+" : ""}{delta}</em>}</span>
-                            <span className={`eval-score-value ${result.coverage === "not-covered" ? "not-covered" : ""}`}>{result.coverage === "not-covered" ? <strong>待验证</strong> : <>{history && <del>{history.before.score}</del>}<strong>{result.score}</strong><small>/100</small></>}</span>
-                            <button className="eval-optimize-button" onClick={() => result.coverage === "not-covered" ? void runEvaluation() : void openOptimization(index)} disabled={optimizationActive}>{result.coverage === "not-covered" ? "换场景验证" : analyzingThis ? "正在分析…" : history ? "继续优化" : "单项优化"}<span>↗</span></button>
+                            <span className={`eval-status ${pending ? "pending" : result.tone}`}>{statusLabel}</span>
                           </div>
-                          <p className="eval-summary">{result.detail}</p>
-                          <div className="eval-issue-compact"><span>可以继续优化</span><p>{result.issue || "本轮暂未发现明显不足。"}</p></div>
-                          <p className="eval-impact"><span>实际影响</span>{result.impact || "这会影响结果是否真正可用。"}</p>
-                        </div>
+                          <div className={`eval-row-body ${pending ? "pending" : result.score < DEMO_SCORING_POLICY.observedGoodFloor ? "has-gap" : "good"}`}>
+                            <div className="eval-observation"><span>{pending ? "为什么还不能判断" : "本轮看到的表现"}</span><p>{pending ? result.issue : result.strength || result.detail}</p></div>
+                            {!pending && result.score < DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-next-gap"><span>还能再提升的地方</span><p>{result.issue || "本轮暂未发现明确差距。"}</p></div>}
+                            {!pending && result.score >= DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-good-note"><span>结论</span><p>{result.detail}</p></div>}
+                          </div>
+                          <div className="eval-row-actions">
+                            <details className="eval-evidence-details">
+                              <summary>查看判断依据 <span>⌄</span></summary>
+                              <div><p><strong>观察依据</strong>{result.evidence || "请结合上面的 Demo 判断。"}</p><p><strong>对实际使用的影响</strong>{result.impact || "这会影响结果是否真正可用。"}</p>{!pending && <p><strong>内部观察分</strong>{history && <del>{history.before.score}</del>} {result.score}/100</p>}</div>
+                            </details>
+                            {(pending || result.score < DEMO_SCORING_POLICY.observedGoodFloor || history) && <button className="eval-optimize-button" onClick={() => pending ? void runEvaluation() : void openOptimization(index)} disabled={optimizationActive || busy}>{pending ? "换场景验证" : analyzingThis ? "正在分析…" : history ? "继续优化" : "优化这一项"}<span>→</span></button>}
+                          </div>
+                        </article>
                       );
                     })}
-                  </div>
+                      </div>
+                    </div>
+                  </section>
                   <div className={`finding-card ${bundleAudit.blockers.length ? "" : "resolved"}`}>
                     <span className="finding-icon">{bundleAudit.blockers.length ? "!" : "✓"}</span>
                     <div><strong>{bundleAudit.blockers.length ? `文件发布检查还有 ${bundleAudit.blockers.length} 项` : "文件发布检查已通过"}</strong><p>{bundleAudit.blockers.length ? "这是文件结构、隐私和能力接入检查，与上面的 Demo 效果报告分开处理。" : bundleAudit.warnings.length ? "还有少量不会阻止下载的提醒，但不代表 Demo 已经符合你的主观标准。" : "文件可以正常发布；是否真的像你，仍以 Demo 和你的判断为准。"}</p></div>
@@ -9485,6 +10385,25 @@ export default function Home() {
               {researchProvider === "firecrawl" && <label className="form-field"><span>Firecrawl API Key {researchCredentialStored && <em className="stored-credential">已加密保存</em>}</span><input type="password" autoComplete="off" value={researchApiKey} onChange={(event) => setResearchApiKey(event.target.value)} placeholder={researchCredentialStored ? "已安全保存；输入新 Key 可替换" : "fc-••••••••••••"} /></label>}
               {researchProvider === "searxng" && <label className="form-field"><span>SearXNG 地址</span><input value={researchBaseUrl} onChange={(event) => setResearchBaseUrl(event.target.value)} placeholder="https://search.your-domain.com" /></label>}
               <small className="research-privacy-note">检索服务只收到 AI 生成的专业问题和它自身的授权凭据；不会收到大模型 API Key、上传文件全文、原始业务材料或个人联系方式。网页证据会经过来源过滤后再交给模型编译。</small>
+              <details className="internal-mcp-settings">
+                <summary>
+                  <span><strong>Workflow MCP 证据源</strong><small>供 Knowledge Compiler 与 Optimization Research 调用</small></span>
+                  <em>{!mcpConnectionsLoaded ? "正在读取…" : mcpConnections.length ? `${mcpConnections.length} 个已连接` : "尚未连接"}</em>
+                </summary>
+                <div className="internal-mcp-settings-body">
+                  <p>这里只连接生成器内部工作流要读取的 MCP Server。系统只会自动调用可识别的只读检索 Tool，并在最终页展示来源、调用与采纳记录。</p>
+                  {mcpConnections.length > 0 && <div className="internal-mcp-connection-list">{mcpConnections.map((connection) => (
+                    <div key={connection.id}><span><strong>{connection.name}</strong><small>{connection.serverUrl}</small></span><em>{connection.configured ? "已授权" : "无需 Token"}</em><button type="button" onClick={() => void removeMcpConnection(connection.id)} disabled={mcpConnectionBusy}>移除</button></div>
+                  ))}</div>}
+                  <div className="internal-mcp-connection-form">
+                    <label className="form-field"><span>名称</span><input value={mcpConnectionName} onChange={(event) => setMcpConnectionName(event.target.value)} placeholder="例如：团队知识库" /></label>
+                    <label className="form-field"><span>MCP Server URL</span><input value={mcpServerUrl} onChange={(event) => setMcpServerUrl(event.target.value)} placeholder="https://mcp.example.com" /></label>
+                    <label className="form-field"><span>Bearer Token（可选）</span><input type="password" autoComplete="off" value={mcpBearerToken} onChange={(event) => setMcpBearerToken(event.target.value)} placeholder="只在 Server 要求时填写" /></label>
+                    <button type="button" onClick={() => void registerMcpConnection()} disabled={mcpConnectionBusy}>{mcpConnectionBusy ? "正在验证…" : "连接并发现 Tools"}</button>
+                  </div>
+                  {mcpConnectionIssue && <div className="internal-mcp-connection-error" role="alert">{mcpConnectionIssue}</div>}
+                </div>
+              </details>
             </section>
             <div className="modal-footer">
               <button className="secondary-button" onClick={() => void clearPersistedCredentials()} disabled={!hasApiKey && !researchApiKey.trim() && !researchCredentialStored}>清除已保存凭据</button>

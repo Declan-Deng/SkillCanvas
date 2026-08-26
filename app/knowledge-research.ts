@@ -22,6 +22,13 @@ export type RetrievedKnowledgeSource = {
   retrievedAt: string;
   authorityTier: SourceAuthorityTier;
   authorityReason: string;
+  origin?: "web" | "mcp";
+  mcpTrace?: {
+    connectionId: string;
+    connectionName: string;
+    toolName: string;
+    runId: string;
+  };
 };
 
 export type KnowledgeAtomType = "official_rule" | "evidence_backed_practice" | "decision_rule" | "failure_pattern" | "exception" | "terminology" | "reference_insight";
@@ -42,7 +49,7 @@ export type KnowledgeAtom = {
   writeTo: string[];
 };
 
-export type KnowledgeEvidenceInput = Pick<RetrievedKnowledgeSource, "id" | "query" | "title" | "url" | "excerpt" | "publishedAt" | "retrievedAt">;
+export type KnowledgeEvidenceInput = Pick<RetrievedKnowledgeSource, "id" | "query" | "title" | "url" | "excerpt" | "publishedAt" | "retrievedAt" | "authorityTier" | "authorityReason" | "origin" | "mcpTrace">;
 
 export type KnowledgePackStatus = "idle" | "not-needed" | "unavailable" | "researching" | "compiling" | "ready" | "partial" | "error";
 
@@ -241,6 +248,10 @@ export function normalizeRetrievedSources(value: unknown): RetrievedKnowledgeSou
       authorityReason: authorityTier === authority.tier
         ? authority.reason
         : clean(raw.authorityReason, authority.reason, 220),
+      origin: raw.origin === "mcp" ? "mcp" as const : "web" as const,
+      ...(raw.origin === "mcp" && raw.mcpTrace && typeof raw.mcpTrace === "object"
+        ? { mcpTrace: raw.mcpTrace as RetrievedKnowledgeSource["mcpTrace"] }
+        : {}),
     }];
   }).slice(0, 20);
 }

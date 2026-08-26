@@ -17,19 +17,27 @@ export type GateOutcome = {
 };
 
 export const DEMO_SCORING_POLICY = {
-  id: "demo-observation-rubric-v1",
+  id: "shared-five-dimension-rubric-v2",
   /** These thresholds classify the visible quality of this one observed output.
    * They never claim general reliability; evidence scope lives on GateOutcome. */
   observedGoodFloor: 85,
   observedWarningFloor: 60,
 } as const;
 
+export function qualityScoringPolicyPrompt() {
+  return `Shared five-dimension scoring policy ${DEMO_SCORING_POLICY.id}:
+- Use exactly the five product dimensions supplied by the caller and score every observed dimension from 0 to 100.
+- 50 means materially incomplete or not usable without major repair.
+- 70 means usable in part, with an important visible defect.
+- 85 means solid and complete for the observed task, with visible room to improve.
+- 95 means excellent, with only negligible defects.
+- 100 is reserved for exhaustive, directly verified completion with no unsupported claim and no meaningful observed gap.
+- Passing binary checks does not by itself justify 100. Judge observable behavior, not confidence, length, formatting polish, or stated intent.`;
+}
+
 export function demoScoringPolicyPrompt() {
-  return `Demo scoring policy ${DEMO_SCORING_POLICY.id}:
-- 0-${DEMO_SCORING_POLICY.observedWarningFloor - 1}: the observed result has a material usability or contract failure.
-- ${DEMO_SCORING_POLICY.observedWarningFloor}-${DEMO_SCORING_POLICY.observedGoodFloor - 1}: usable in part, with a concrete visible gap.
-- ${DEMO_SCORING_POLICY.observedGoodFloor}-100: strong to exceptional performance in this observed run.
-Score only the visible quality of this output. Do not impose a special high-score ceiling because this is a single run. Evidence scope and general reliability are represented separately by the Demo GateOutcome and the repeated held-out Optimization outcome.`;
+  return `${qualityScoringPolicyPrompt()}
+For this Demo, score only the visible quality of this one observed scenario. Do not impose a special high-score ceiling merely because it is a single run. Evidence scope and general reliability are shown separately; a single-scenario score is not directly interchangeable with a repeated multi-scenario benchmark.`;
 }
 
 export function buildGateOutcome(input: {
