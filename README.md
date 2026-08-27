@@ -220,11 +220,16 @@ Build Loop 负责从确认后的蓝图生成并冻结初始 Bundle：
   → 任务样例
   → Skill 契约
   → 能力图
+  → Capability Delta（裸模型会什么 / Skill 必须额外教什么）
   → 专业知识编译
   → 产物计划
   → 生成 Bundle
   → 冻结架构
 ```
+
+Capability Delta 先删除裸模型已经能稳定完成的通用理解、改写与规划，只保留会改变运行决策、失败恢复、边界处理或验收方式的能力差值。Domain Knowledge 随后只围绕这些差值采集四类证据：Decision Rules、Failure Modes、Edge Cases、Verification Methods。任一必需类别没有证据时，Skill 会被明确标记为知识不足，不会用泛化“最佳实践”补齐篇幅。
+
+运行 Workflow 不是文字步骤列表。每个 Step 必须声明 `requires[] / produces[] / mutates[]`；编译器根据产物依赖执行拓扑排序，并在 Bundle 生成前拦截未满足依赖、重复 Producer 和循环依赖。
 
 Build Gate 把“检测方式”和“问题级别”分开：确定性检查不等于 P0。
 
@@ -286,7 +291,7 @@ Optimization Loop 不再修改用户 Goal，也不接受“模型觉得更好”
 ```text
 Build:
 intent → representative-task → contract → capability-plan
-       → knowledge-compile → bundle → freeze
+       → capability-delta → knowledge-compile → bundle → freeze
 
 Optimization:
 held-out-split → baseline → execute → grade → diagnose
@@ -331,6 +336,18 @@ Grader 除了分数和 Issue，还会返回：
 - `preserve`：下一轮不能破坏的已有行为。
 
 Optimizer 只消费 Train 证据提出有限数量的 Canonical Mutation；held-out 原文不会泄漏给修改 Agent。修改预算相当于 Textual Learning Rate，用来限制为了某个 Case 写特判。
+
+每条未通过的 Eval Case 会先经过 Failure Attribution，再进入 Patch Planner。归因不是一个仅供展示的标签，而是编译器级修改边界：
+
+| 失败类型 | 只允许修改的 Canonical 区域 | 典型修复 |
+| --- | --- | --- |
+| 缺决策规则 | `domainEvidence` | 增加或收窄一个带适用条件的 Decision Rule |
+| 缺例外 | `riskBranches` | 增加边界、Fallback 或停止/转向条件 |
+| 缺工具知识 | 被归因的 `capability` | 修正可用性、参数、调用回执或降级行为 |
+| 缺验证 | `outputs` / `evaluationPlan` | 增加可观察的完成检查或 Eval 断言 |
+| instruction 冲突 | `requirements` / `constraints` | 删除或收窄相互矛盾的指令 |
+
+归因后的失败不能提交整包文件替换，也不能顺手修改其他语义区域。新增 Decision Rule 还必须保留外部 `source_urls` 或失败训练用例的 `eval_case_ids`；`references/domain-playbook.md` 会把这条来源投影出来。Planner 若越界，Patch 会在候选执行前被拒绝。这样“反哺 Skill”是对缺失节点的局部学习，不是把同一份 Skill 重新生成一遍。
 
 ### 5. One Commit Path、回滚与决策账本
 

@@ -3,6 +3,68 @@ import { COMPILER_OWNED_SEMANTIC_PATHS, isImplementationBytePath, normalizeCanon
 export type IssuePriority = "P0" | "P1" | "P2" | "P3";
 export type CapabilityScope = "global" | "task-specific" | "conditional" | "optional";
 export type EvalFamily = "trigger" | "capability" | "grounding" | "integration";
+export type EvalFailureType = "missing_decision_rule" | "missing_exception" | "missing_tool_knowledge" | "missing_verification" | "instruction_conflict";
+
+export type FailureAttribution = {
+  type: EvalFailureType;
+  label: string;
+  owner: "domainEvidence" | "riskBranches" | "capabilities" | "evaluationPlan" | "requirements";
+  allowedMutationTypes: string[];
+  evidence: string;
+};
+
+export const FAILURE_ATTRIBUTION_MUTATIONS: Record<EvalFailureType, string[]> = {
+  missing_decision_rule: ["domain-evidence.add", "domain-evidence.update", "domain-evidence.remove"],
+  missing_exception: ["risk-branch.add", "risk-branch.update", "risk-branch.remove"],
+  missing_tool_knowledge: ["capability.update"],
+  missing_verification: ["output.update", "eval-source.add", "eval-source.update", "eval-source.remove"],
+  instruction_conflict: ["requirement.update", "requirement.remove", "constraint.update", "constraint.remove"],
+};
+
+const FAILURE_LABELS: Record<EvalFailureType, string> = {
+  missing_decision_rule: "缺决策规则",
+  missing_exception: "缺例外或失败分支",
+  missing_tool_knowledge: "缺工具知识",
+  missing_verification: "缺验证",
+  instruction_conflict: "instruction 冲突",
+};
+
+const FAILURE_OWNERS: Record<EvalFailureType, FailureAttribution["owner"]> = {
+  missing_decision_rule: "domainEvidence",
+  missing_exception: "riskBranches",
+  missing_tool_knowledge: "capabilities",
+  missing_verification: "evaluationPlan",
+  instruction_conflict: "requirements",
+};
+
+/** Attribute an observable Eval failure to one compiler-owned semantic surface.
+ * The model may provide evidence, but it cannot choose a broader edit surface. */
+export function attributeEvalFailure(evidence: string, family: EvalFamily = "capability"): FailureAttribution {
+  const value = evidence.trim();
+  const conflict = /冲突|矛盾|互相抵触|不一致的指令|优先级错误|覆盖了用户|contradict|conflict|incompatible instruction|priority inversion/i;
+  const tool = /\b(?:MCP|API|tool|browser|search|filesystem|command|adapter)\b|工具|调用|连接|授权|参数|回执|可用性|降级路径/i;
+  const verification = /验证|验收|核对|检查|断言|评分器|证据不足|没有证明|未验证|verify|validation|acceptance|assertion|grader|unchecked/i;
+  const exception = /例外|边界|异常|空值|缺失输入|格式错误|不可用|失败恢复|回退|停止条件|edge case|exception|boundary|malformed|missing input|fallback|failure recovery/i;
+  const decision = /决策|判断规则|选择条件|优先级|取舍|分类规则|映射规则|decision rule|heuristic|routing rule|tie.?breaker/i;
+  const type: EvalFailureType = conflict.test(value)
+    ? "instruction_conflict"
+    : tool.test(value) || family === "integration"
+      ? "missing_tool_knowledge"
+      : verification.test(value)
+        ? "missing_verification"
+        : exception.test(value)
+          ? "missing_exception"
+          : decision.test(value)
+            ? "missing_decision_rule"
+            : "missing_decision_rule";
+  return {
+    type,
+    label: FAILURE_LABELS[type],
+    owner: FAILURE_OWNERS[type],
+    allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS[type],
+    evidence: value.slice(0, 1_200),
+  };
+}
 
 export type PipelineIssue = {
   id: string;
@@ -12,6 +74,9 @@ export type PipelineIssue = {
   evidence: string;
   files: string[];
   capabilityId?: string;
+  failureType?: EvalFailureType;
+  allowedMutationTypes?: string[];
+  evalCaseIds?: string[];
 };
 
 export type ScopedCapability = {
@@ -146,7 +211,7 @@ export function optimizationPolicyFor(issues: PipelineIssue[]) {
     priority,
     selected,
     allowSemanticOptimization: priority !== "P0",
-    allowResearch: priority === "P2" && selected.some((item) => /knowledge|domain|research|知识|领域/i.test(`${item.type} ${item.evidence}`)),
+    allowResearch: priority === "P2" && selected.some((item) => /knowledge|domain|research|decision_rule|知识|领域|决策规则/i.test(`${item.type} ${item.evidence}`)),
     requireStaticRerun: priority === "P0",
   };
 }
@@ -424,8 +489,28 @@ export function validatePatchPlan(input: {
   const missingDecisionContext = (input.requiredDecisionIds || []).filter((id) => !consumedDecisionIds.has(id));
   if (missingDecisionContext.length) errors.push(`Patch Plan 没有确认消费历史决策：${missingDecisionContext.join("、")}`);
   const selectedPriority = selectHighestPriorityIssues(input.issues)[0]?.priority;
+  const selectedIssues = input.plan.issueIds.flatMap((id) => input.issues.find((item) => item.id === id) || []);
+  const attributedIssues = selectedIssues.filter((item) => item.failureType && item.allowedMutationTypes?.length);
   if (!input.plan.issueIds.every((id) => knownIssueIds.has(id))) errors.push("Patch Plan 引用了 Critic 没有提出的问题");
   if (selectedPriority && input.plan.issueIds.some((id) => input.issues.find((item) => item.id === id)?.priority !== selectedPriority)) errors.push(`当前只能修复最高优先级 ${selectedPriority}`);
+  if (attributedIssues.length) {
+    const allowed = new Set(attributedIssues.flatMap((item) => item.allowedMutationTypes || []));
+    const disallowed = input.plan.canonicalMutations.filter((mutation) => !allowed.has(mutation.type));
+    if (disallowed.length) errors.push(`Eval failure 已归因，当前只允许修改 ${[...allowed].join("、")}；越界 mutation：${disallowed.map((item) => item.type).join("、")}`);
+    if (input.plan.operations.length) errors.push("Eval failure 已归因后只能修改对应 Canonical SkillIR 区域，不能改写实现文件或重新生成整包");
+    if (!input.plan.canonicalMutations.length) errors.push("Eval failure 已归因，但 Patch Plan 没有返回对应的 CanonicalMutation");
+    input.plan.canonicalMutations.filter((mutation) => mutation.type === "domain-evidence.add").forEach((mutation) => {
+      const evidence = mutation.evidence;
+      const sourceUrls = Array.isArray(evidence.source_urls) ? evidence.source_urls.filter((item) => typeof item === "string" && /^https?:\/\//i.test(item)) : [];
+      const evalCaseIds = Array.isArray(evidence.eval_case_ids) ? evidence.eval_case_ids.filter((item) => typeof item === "string" && Boolean(item.trim())) : [];
+      if (!sourceUrls.length && !evalCaseIds.length) errors.push("新增决策规则必须保留 source_urls 或 eval_case_ids 作为失败反哺证据，不能写成模型常识");
+    });
+    const toolCapabilityIds = attributedIssues.filter((item) => item.failureType === "missing_tool_knowledge").map((item) => item.capabilityId).filter((id): id is string => Boolean(id));
+    const wrongToolTarget = input.plan.canonicalMutations.find((mutation) => mutation.type === "capability.update"
+      && toolCapabilityIds.length > 0
+      && !toolCapabilityIds.includes(mutation.capabilityId));
+    if (wrongToolTarget) errors.push(`工具知识失败只能修改被归因的能力：${toolCapabilityIds.join("、")}`);
+  }
   const changedPaths = new Set(input.plan.operations.map((item) => item.path));
   const newFiles = input.plan.operations.filter((item) => item.action === "create" && !(item.path in input.files));
   const newCapabilities = input.plan.canonicalMutations.filter((item) => item.type === "capability.add");

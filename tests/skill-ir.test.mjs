@@ -121,6 +121,55 @@ test("the canonical runtime projection always satisfies the workflow heading gat
   assert.equal(hasExecutableWorkflowHeading(projected), true);
 });
 
+test("Canonical SkillIR compilation blocks a workflow with unmet artifact dependencies", () => {
+  const plan = fixturePlan();
+  plan.workflowSteps = [{
+    id: "rewrite-before-extraction",
+    capabilityIds: ["core-resume"],
+    when: "a resume request arrives",
+    input: "structured resume record",
+    action: "rewrite the resume",
+    output: "rewritten resume",
+    fallback: "stop and report the missing extraction result",
+    requires: ["resume-record"],
+    produces: ["rewritten-resume"],
+    mutates: [],
+  }];
+
+  assert.throws(() => compileSkillIR({
+    skillName: "invalid-resume-workflow",
+    idea: "根据 JD 修改简历",
+    answers: { inputs: "目标 JD；真实经历" },
+    plan,
+    loop: { mode: "hybrid", goal: "交付岗位匹配的简历", maxRounds: 3, stopConditions: [], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "根据 JD 修改简历", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  }), /WORKFLOW_DAG_INVALID.*resume-record/);
+});
+
+test("Canonical SkillIR compilation blocks workflow steps without an active capability owner", () => {
+  const plan = fixturePlan();
+  plan.workflowSteps = [{
+    id: "orphan-step",
+    capabilityIds: ["missing-capability"],
+    when: "always",
+    input: "request",
+    action: "perform an unowned operation",
+    output: "result",
+    fallback: "stop",
+    requires: ["$request"],
+    produces: ["orphan-output"],
+    mutates: [],
+  }];
+  assert.throws(() => compileSkillIR({
+    skillName: "orphan-workflow",
+    idea: "根据 JD 修改简历",
+    answers: { inputs: "目标 JD；真实经历" },
+    plan,
+    loop: { mode: "hybrid", goal: "交付岗位匹配的简历", maxRounds: 3, stopConditions: [], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "根据 JD 修改简历", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  }), /WORKFLOW_DAG_INVALID.*capability owner/);
+});
+
 test("canonical runtime projection links every compiler-owned knowledge resource", () => {
   const ir = compile();
   ir.domainEvidence = [{ rule: "Use evidence-backed terminology", evidence_type: "official_rule", confidence: 0.95 }];
@@ -256,6 +305,37 @@ test("canonical mutation normalization accepts common provider aliases without w
     { type: "input.update", inputId: "input-target-jd", changes: { required: true } },
     { type: "requirement.update", requirementId: "requirement-goal", changes: { hard: true } },
   ]);
+});
+
+test("failure feedback mutates only canonical domain evidence and risk branches", () => {
+  const baseline = compile();
+  const candidate = applySkillIRMutations(baseline, normalizeCanonicalMutations([
+    {
+      type: "domain_evidence_add",
+      evidence: {
+        id: "decision-jd-priority",
+        rule: "当 JD 明确列出必备条件时，先映射有直接证据的经历，再处理可迁移能力",
+        category: "decision_rules",
+        applies_when: "JD 同时包含必备和加分条件",
+        exception: "用户明确要求采用不同排序时服从当前指令",
+        evidence_type: "evidence_backed_practice",
+        confidence: 0.82,
+      },
+    },
+    {
+      type: "risk_branch_add",
+      branch: {
+        id: "missing-jd-exception",
+        condition: "目标 JD 缺失",
+        action: "只分析现有简历并请求最少必要的 JD 信息",
+        stopOrRedirect: "停止岗位定制步骤，不虚构职位要求",
+      },
+    },
+  ])).ir;
+  assert.equal(validateCanonicalSkillIR(candidate).valid, true);
+  assert.ok(candidate.domainEvidence.some((item) => item.id === "decision-jd-priority"));
+  assert.ok(candidate.riskBranches.some((item) => item.id === "missing-jd-exception"));
+  assert.match(projectSkillMarkdown(candidate), /目标 JD 缺失/);
 });
 
 test("runtime projector emits kind-specific executable protocols", () => {

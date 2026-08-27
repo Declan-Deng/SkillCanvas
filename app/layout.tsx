@@ -25,9 +25,12 @@ export async function generateMetadata(): Promise<Metadata> {
     title,
     description,
     icons: {
-      icon: [{ url: "/skillcanvas-icon.png", type: "image/png" }],
-      shortcut: "/skillcanvas-icon.png",
-      apple: [{ url: "/skillcanvas-icon.png", type: "image/png" }],
+      icon: [
+        { url: "/favicon.ico?v=20260827", sizes: "32x32", type: "image/x-icon" },
+        { url: "/skillcanvas-browser-icon.png?v=20260827", sizes: "64x64", type: "image/png" },
+      ],
+      shortcut: "/favicon.ico?v=20260827",
+      apple: [{ url: "/skillcanvas-apple-icon.png", sizes: "180x180", type: "image/png" }],
     },
     openGraph: {
       title,

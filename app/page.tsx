@@ -74,7 +74,9 @@ import {
 } from "./generation-loop-core";
 import {
   DEFAULT_MUTATION_BUDGET,
+  FAILURE_ATTRIBUTION_MUTATIONS,
   applyPatchPlan,
+  attributeEvalFailure,
   auditCrossArtifactConsistency,
   canonicalCapabilityContract,
   capabilityOwnsArtifacts,
@@ -90,6 +92,7 @@ import {
   validatePatchPlan,
   type CapabilityScope,
   type EvalFamily,
+  type EvalFailureType,
   type PipelineIssue,
 } from "./skill-pipeline-core";
 import { classifyBundleIssue, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
@@ -163,6 +166,8 @@ import {
   type ResearchProviderId,
 } from "./knowledge-research";
 import { dedupeResearchSources } from "./research-core";
+import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta";
+import { normalizeWorkflowDagSteps, type WorkflowDagStep } from "./workflow-dag";
 import { verifyBundleScriptTests, verifyExecutionsInLocalSandbox } from "./eval-workflow-service";
 import { DurableWorkflowJournal } from "./workflow-client";
 import { completedNumericDecisionFixture, confirmedCorrectionEvalEvidence, confirmedOutputFields, ensureConfirmedCorrectionContract, ensureInformationDependencyContract, ensureProductiveCheckpointContract, ensureRuntimeKnowledgeRoutes, productiveCheckpointRequested, reconcileContractFacingFieldLabels, semanticIssueContradictsBundleBranchClaim, semanticIssueContradictsOwnMissingFieldClaim } from "./workflow-compiler";
@@ -361,6 +366,7 @@ type CapabilityPlan = {
   riskBranches: RiskBranch[];
   failureModes: string[];
   items: CapabilityItem[];
+  workflowSteps: WorkflowDagStep[];
 };
 
 type LoopMode = "turn-based" | "goal-driven" | "hybrid";
@@ -419,6 +425,8 @@ type GenerationSemanticIssue = {
   evidence: string;
   route: "scope" | "research" | "workflow" | "tool" | "state" | "output" | "eval" | "consistency" | "simplify";
   files: string[];
+  failureType?: EvalFailureType;
+  allowedMutationTypes?: string[];
 };
 
 type GenerationSemanticAudit = {
@@ -547,6 +555,7 @@ type FileExplanation = {
 
 type OptimizationSuggestion = {
   id: string;
+  issueIds: string[];
   title: string;
   detail: string;
   impact: string;
@@ -672,6 +681,8 @@ const AI_MODE_LABELS: Record<string, string> = {
   preview: "生成第一版理解预演",
   interview: "生成下一轮理解问题",
   blueprint: "整理需求与能力蓝图",
+  "blueprint-foundation": "整理六个需求模块",
+  "blueprint-plan": "规划能力与执行闭环",
   build: "生成完整 Skill 候选",
   repair: "重写有问题的文件",
   "eval-execute": "在隔离上下文中执行冻结任务",
@@ -1010,6 +1021,18 @@ const DEFAULT_CAPABILITY_PLAN: CapabilityPlan = {
     { id: "external-action", condition: "下一步涉及外部发送、费用或不可逆动作", action: "先展示将执行的动作和影响", stopOrRedirect: "获得明确确认后才继续" },
   ],
   failureModes: ["套用通用模板而没有完成领域任务", "声明使用资料或工具但没有可观察证据", "把质量分数当成任务目标"],
+  workflowSteps: [{
+    id: "resolve-request",
+    capabilityIds: ["core-reasoning"],
+    when: "每次触发 Skill 时",
+    input: "当前请求、必要上下文和约束",
+    action: "解析输入、执行核心语义任务并形成可检查结果",
+    output: "满足输出契约的真实结果",
+    fallback: "缺少阻断输入时停止依赖分支并请求最少必要信息",
+    requires: ["$request"],
+    produces: ["core-result"],
+    mutates: [],
+  }],
   items: [
     { id: "core-reasoning", kind: "llm", name: "领域任务推理", path: "SKILL.md", layer: "runtime", requirement: "理解用户目标并完成核心语义任务", purpose: "保留需要语义判断、取舍和表达的专业工作", reason: "这类工作无法通过固定脚本可靠完成", status: "generate", input: "当前请求、必要上下文和约束", output: "满足输出契约的真实结果", fallback: "标出未知内容并请求最小必要信息", routingCondition: "每次触发 Skill 时", deterministicAdvantage: "无；该能力需要上下文理解", evaluationCriteria: ["核心任务被真正完成", "输出体现输入中的关键差异"] },
     { id: "eval-plan", kind: "eval", name: "领域回归测试", path: "evals/", layer: "evaluation", requirement: "证明核心能力、触发边界和失败分支可重复", purpose: "用真实任务验证行为，而不只检查目录结构", reason: "每个可发布 Skill 都需要可执行回归证据", status: "generate", input: "10–20 条代表性任务与 Agent 结果", output: "逐项分数、证据和失败原因", fallback: "至少运行结构检查并明确尚未执行的行为测试", routingCondition: "构建后、修改后或发布前", deterministicAdvantage: "固定数据结构、评分汇总和文件检查可重复", evaluationCriteria: ["覆盖核心领域能力", "包含不应触发和失败模式", "评分器与预期一一对应"] },
@@ -1391,6 +1414,7 @@ function reconcileCapabilityPlanWithCanonicalIR(plan: CapabilityPlan, ir: SkillI
       validation: output.validation,
     } : plan.outputContract,
     failureModes: ir.evaluationPlan.failureModes,
+    workflowSteps: ir.runtimeContract.workflow,
     items,
   };
 }
@@ -1403,6 +1427,8 @@ function createCanonicalSkillIR(input: {
   loop: LoopPlan;
   sourceEvidence?: string;
   files?: Record<string, string>;
+  capabilityDelta?: CapabilityDelta;
+  knowledgeAssessment?: SkillIR["knowledgeAssessment"];
 }) {
   const files = input.files || {};
   const sourceEvidence = input.sourceEvidence || "";
@@ -1451,6 +1477,8 @@ function createCanonicalSkillIR(input: {
       }).map((item) => item.requirement).join("\n"),
       `${userEvidence}\n${sourceEvidence}`,
     ),
+    capabilityDelta: input.capabilityDelta || EMPTY_CAPABILITY_DELTA,
+    knowledgeAssessment: input.knowledgeAssessment,
   });
   // Uploaded examples are implementation resources consumed by the primary
   // semantic capability. Record the path in Canonical SkillIR so the runtime
@@ -3743,6 +3771,7 @@ function normalizeOptimizationPlan(value: unknown): OptimizationPlan | null {
     seen.add(id);
     return [{
       id,
+      issueIds: Array.isArray(candidate.issueIds) ? candidate.issueIds.filter((issueId): issueId is string => typeof issueId === "string" && Boolean(issueId.trim())).map((issueId) => issueId.trim()).slice(0, 8) : [],
       title: candidate.title.trim().slice(0, 80),
       detail: candidate.detail.trim().slice(0, 500),
       impact: typeof candidate.impact === "string" ? candidate.impact.trim().slice(0, 240) : "改善该维度的可验证质量",
@@ -3754,12 +3783,62 @@ function normalizeOptimizationPlan(value: unknown): OptimizationPlan | null {
   return suggestions.length >= 2 ? { diagnosis: raw.diagnosis.trim().slice(0, 1_000), suggestions } : null;
 }
 
+function pipelineIssuesFromEvalFailures(evidence: OptimizationEvidenceReport): PipelineIssue[] {
+  const caseById = new Map(evidence.failedCases.map((item) => [item.caseId, item]));
+  const rootSignals = evidence.failedCases.length
+    ? evidence.failedCases.map((failedCase) => {
+      const sharedProblem = evidence.textualFeedback.criticalProblems.find((problem) => problem.caseIds.includes(failedCase.caseId));
+      return {
+        id: failedCase.caseId,
+        evidence: [failedCase.failureSummary, failedCase.observedEvidence, sharedProblem?.critique].filter(Boolean).join("；"),
+        caseIds: [failedCase.caseId],
+        capabilityIds: failedCase.capabilityIds.length ? failedCase.capabilityIds : sharedProblem?.affectedCapabilities || [],
+        family: failedCase.family,
+      };
+    })
+    : evidence.textualFeedback.criticalProblems.length
+      ? evidence.textualFeedback.criticalProblems.map((problem) => ({
+        id: problem.id,
+        evidence: problem.critique,
+        caseIds: problem.caseIds,
+        capabilityIds: problem.affectedCapabilities,
+        family: "capability" as EvalFamily,
+      }))
+      : evidence.failurePatterns.map((failure, index) => ({ id: `pattern-${index + 1}`, evidence: failure, caseIds: [], capabilityIds: [], family: "capability" as EvalFamily }));
+  return rootSignals.map((signal, index) => {
+    const relatedCase = signal.caseIds.flatMap((id) => caseById.get(id) || [])[0];
+    const family = signal.family || relatedCase?.family || "capability";
+    const attribution = attributeEvalFailure(signal.evidence, family);
+    const capabilityId = signal.capabilityIds[0] || relatedCase?.capabilityIds[0];
+    const filesByOwner: Record<typeof attribution.owner, string[]> = {
+      domainEvidence: ["references/domain-playbook.md", "evals/skill-ir.json"],
+      riskBranches: ["SKILL.md", "evals/skill-ir.json"],
+      capabilities: ["references/tooling.md", "integrations/tool-contracts.json", "evals/skill-ir.json"],
+      evaluationPlan: ["references/output-contract.md", "evals/evals.json", "evals/skill-ir.json"],
+      requirements: ["SKILL.md", "evals/skill-ir.json"],
+    };
+    return {
+      id: `eval-${attribution.type}-${signal.id || index + 1}`.slice(0, 120),
+      priority: attribution.type === "missing_decision_rule" ? "P2" : "P1",
+      type: `EVAL_${attribution.type.toUpperCase()}`,
+      source: "eval",
+      evidence: `${attribution.label}${signal.caseIds.length ? `（${signal.caseIds.join("、")}）` : ""}：${signal.evidence}`,
+      files: filesByOwner[attribution.owner],
+      ...(capabilityId ? { capabilityId } : {}),
+      failureType: attribution.type,
+      allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS[attribution.type],
+      evalCaseIds: signal.caseIds,
+    };
+  });
+}
+
 function normalizeGenerationSemanticAudit(value: unknown): GenerationSemanticAudit | null {
   if (!value || typeof value !== "object") return null;
   const raw = value as { summary?: unknown; issues?: unknown; unnecessaryFiles?: unknown };
   if (!Array.isArray(raw.issues)) return null;
   const lenses = new Set<GenerationSemanticIssue["lens"]>(["scope", "knowledge", "workflow", "tool", "state", "output", "eval", "consistency", "efficiency"]);
   const routes = new Set<GenerationSemanticIssue["route"]>(["scope", "research", "workflow", "tool", "state", "output", "eval", "consistency", "simplify"]);
+  const failureTypes = new Set<EvalFailureType>(["missing_decision_rule", "missing_exception", "missing_tool_knowledge", "missing_verification", "instruction_conflict"]);
   const issues = raw.issues.slice(0, 12).flatMap((entry, index) => {
     if (!entry || typeof entry !== "object") return [];
     const item = entry as Record<string, unknown>;
@@ -3770,6 +3849,8 @@ function normalizeGenerationSemanticAudit(value: unknown): GenerationSemanticAud
     const priority = ["P1", "P2", "P3"].includes(String(item.priority))
       ? item.priority as GenerationSemanticIssue["priority"]
       : route === "research" ? "P2" : route === "simplify" ? "P3" : "P1";
+    const declaredFailureType = failureTypes.has(item.failureType as EvalFailureType) ? item.failureType as EvalFailureType : undefined;
+    const failureAttribution = declaredFailureType ? attributeEvalFailure(item.evidence.trim(), lens === "tool" ? "integration" : "capability") : null;
     return [{
       id: typeof item.id === "string" && item.id.trim() ? item.id.trim().slice(0, 80) : `semantic-${index + 1}`,
       lens,
@@ -3780,6 +3861,7 @@ function normalizeGenerationSemanticAudit(value: unknown): GenerationSemanticAud
       evidence: item.evidence.trim().slice(0, 600),
       route,
       files: Array.isArray(item.files) ? item.files.filter((path): path is string => typeof path === "string" && isSafeSkillFilePath(path)).slice(0, 5) : [],
+      ...(failureAttribution ? { failureType: failureAttribution.type, allowedMutationTypes: failureAttribution.allowedMutationTypes } : {}),
     }];
   });
   return {
@@ -3988,6 +4070,8 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
     outputIds: ir.outputs.map((item) => item.id),
     constraintIds: ir.constraints.map((item) => item.id),
     knowledgeIds: ir.knowledgeRequirements.map((item) => item.id),
+    domainEvidenceIds: ir.domainEvidence.flatMap((item) => item && typeof item === "object" && !Array.isArray(item) && typeof (item as Record<string, unknown>).id === "string" ? [String((item as Record<string, unknown>).id)] : []),
+    riskBranchIds: ir.riskBranches.map((item) => item.id),
     evalCaseIds: ir.evaluationPlan.cases.map((item) => String(item.id || "")).filter(Boolean),
     // Give the Planner the current editable values next to their IDs. This is
     // intentionally compact: it prevents update-to-the-same-value plans without
@@ -3999,6 +4083,8 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
       inputs: ir.inputs.map((item) => ({ id: item.id, name: item.name, required: item.required, missingBehavior: item.missingBehavior, resolution: item.resolution })),
       outputs: ir.outputs.map((item) => ({ id: item.id, name: item.name, mode: item.mode, requiredSections: item.requiredSections, validation: item.validation, producerCapabilityIds: item.producerCapabilityIds })),
       constraints: ir.constraints.map((item) => ({ id: item.id, statement: item.statement, hard: item.hard, provenance: item.provenance, appliesTo: item.appliesTo })),
+      domainEvidence: ir.domainEvidence,
+      riskBranches: ir.riskBranches,
     },
     inputAddShape: {
       id: "input-stable-id",
@@ -4016,6 +4102,23 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
         reversibleOnly: true,
         stopCondition: "condition that ends resolution",
       },
+    },
+    domainEvidenceAddShape: {
+      id: "stable-decision-rule-id",
+      rule: "behavior-changing decision rule supported by the failure evidence",
+      category: "decision_rules",
+      applies_when: "observable condition",
+      exception: "known exception or explicit unknown",
+      evidence_type: "official_rule|evidence_backed_practice|eval_failure",
+      confidence: 0.8,
+      source_urls: ["exact source URL when externally grounded"],
+      eval_case_ids: ["exact failed training case id when learned from Eval"],
+    },
+    riskBranchAddShape: {
+      id: "stable-exception-id",
+      condition: "observable exception or failure condition",
+      action: "bounded recovery action",
+      stopOrRedirect: "explicit stop or redirect condition",
     },
   };
 }
@@ -4038,6 +4141,8 @@ function allowedP1MutationTypes(issues: PipelineIssue[]) {
     "state.update",
     "constraint.add", "constraint.update", "constraint.remove",
     "knowledge.add", "knowledge.update", "knowledge.remove",
+    "domain-evidence.add", "domain-evidence.update", "domain-evidence.remove",
+    "risk-branch.add", "risk-branch.update", "risk-branch.remove",
     "eval-source.add", "eval-source.update", "eval-source.remove",
   ];
 }
@@ -4172,6 +4277,20 @@ function normalizeCapabilityPlan(value: unknown): CapabilityPlan | null {
     },
     riskBranches: riskBranches.length ? riskBranches : DEFAULT_CAPABILITY_PLAN.riskBranches,
     failureModes: list(raw.failureModes, DEFAULT_CAPABILITY_PLAN.failureModes, 10),
+    workflowSteps: normalizeWorkflowDagSteps(raw.workflowSteps).length
+      ? normalizeWorkflowDagSteps(raw.workflowSteps)
+      : items.filter((item) => item.kind !== "eval").map((item, index, active) => ({
+        id: `step-${index + 1}-${item.id}`,
+        capabilityIds: [item.id],
+        when: item.activationCondition || item.routingCondition,
+        input: item.input,
+        action: item.purpose || item.requirement,
+        output: item.output,
+        fallback: item.fallback,
+        requires: index === 0 ? ["$request"] : [`capability:${active[index - 1].id}:output`],
+        produces: [`capability:${item.id}:output`],
+        mutates: [],
+      })),
     items,
   };
 }
@@ -4399,6 +4518,24 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
       evaluationCriteria: Array.from(new Set([...item.evaluationCriteria, "人类可读列名与脚本机器字段可双向映射", `最终 CSV 严格使用确认列名及顺序：${csvFields.join("、")}`])),
     }
     : item) : items;
+  const normalizedWorkflow = normalizeWorkflowDagSteps(plan.workflowSteps);
+  const activeRuntimeIds = new Set(schemaAlignedItems.filter((item) => item.kind !== "eval" && capabilityIsActive(item)).map((item) => item.id));
+  const routedIds = new Set(normalizedWorkflow.flatMap((step) => step.capabilityIds));
+  const workflowSteps = [
+    ...normalizedWorkflow.map((step) => ({ ...step, capabilityIds: step.capabilityIds.filter((id) => activeRuntimeIds.has(id)) })).filter((step) => step.capabilityIds.length > 0),
+    ...schemaAlignedItems.filter((item) => activeRuntimeIds.has(item.id) && !routedIds.has(item.id)).map((item) => ({
+      id: `step-capability-${item.id}`,
+      capabilityIds: [item.id],
+      when: item.activationCondition || item.routingCondition,
+      input: item.input,
+      action: item.purpose || item.requirement,
+      output: item.output,
+      fallback: item.fallback,
+      requires: ["$request"],
+      produces: [`capability:${item.id}:output`],
+      mutates: [],
+    })),
+  ];
   return {
     ...plan,
     stateModel,
@@ -4415,6 +4552,7 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
       requiredSections: requiredSections.length ? requiredSections : ["核心结果"],
     },
     items: schemaAlignedItems,
+    workflowSteps,
   };
 }
 
@@ -4749,6 +4887,8 @@ export default function Home() {
   const [autoSelectedQuestionIds, setAutoSelectedQuestionIds] = useState<Set<string>>(() => new Set());
   const [customQuestionIds, setCustomQuestionIds] = useState<Set<string>>(() => new Set());
   const [blueprint, setBlueprint] = useState<BlueprintSection[]>(DEFAULT_BLUEPRINT);
+  const [blueprintExpanded, setBlueprintExpanded] = useState(false);
+  const blueprintGridRef = useRef<HTMLDivElement | null>(null);
   const [capabilityPlan, setCapabilityPlan] = useState<CapabilityPlan>(DEFAULT_CAPABILITY_PLAN);
   const [loopPlan, setLoopPlan] = useState<LoopPlan>(DEFAULT_LOOP_PLAN);
   const [buildLoop, setBuildLoop] = useState<BuildLoopState>(DEFAULT_BUILD_LOOP);
@@ -4813,6 +4953,7 @@ export default function Home() {
   const [settingsClosing, setSettingsClosing] = useState(false);
   const [generationNoticeOpen, setGenerationNoticeOpen] = useState(false);
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">("default");
+  const notificationTested = useRef(false);
   const loopStartedAt = useRef(0);
   const [provider, setProvider] = useState<ProviderId>("deepseek");
   const [model, setModel] = useState(PROVIDERS.deepseek.model);
@@ -5147,6 +5288,25 @@ export default function Home() {
     setNotificationPermission("Notification" in window ? window.Notification.permission : "unsupported");
     /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
+
+  useEffect(() => {
+    const grid = blueprintGridRef.current;
+    if (step !== "blueprint" || !grid) return;
+    const syncExpandedHeight = () => {
+      const cards = Array.from(grid.children).filter((child): child is HTMLElement => child instanceof HTMLElement);
+      const expandedHeight = cards.reduce((height, card) => Math.max(height, card.offsetTop + card.offsetHeight), 0);
+      if (expandedHeight > 0) grid.style.setProperty("--blueprint-expanded-height", `${expandedHeight}px`);
+    };
+    const frame = window.requestAnimationFrame(syncExpandedHeight);
+    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(syncExpandedHeight);
+    Array.from(grid.children).forEach((card) => observer?.observe(card));
+    window.addEventListener("resize", syncExpandedHeight);
+    return () => {
+      window.cancelAnimationFrame(frame);
+      observer?.disconnect();
+      window.removeEventListener("resize", syncExpandedHeight);
+    };
+  }, [blueprint.length, step]);
 
   useEffect(() => {
     if (!sessionHydrated) return;
@@ -5514,8 +5674,54 @@ export default function Home() {
       setToast("没有开启通知；SkillCanvas 仍会在页面内保留完整结果");
       return permission;
     }
+    if (!notificationTested.current) {
+      notificationTested.current = true;
+      const delivered = await deliverBrowserNotification("SkillCanvas 通知已开启", {
+        body: "生成完成、暂停或失败时会通过这里提醒你。",
+        tag: "skillcanvas-notification-test",
+      });
+      if (!delivered) {
+        setToast("浏览器已授权，但系统通知投递失败；请检查浏览器或系统的通知设置");
+        return permission;
+      }
+    }
     setToast("完成通知已开启，长时间 Loop 结束后会提醒你");
     return permission;
+  }
+
+  function reportNotificationDelivery(event: "notification_delivery_succeeded" | "notification_delivery_failed", reason: string) {
+    void fetch("/api/client-log", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ event, phase: document.visibilityState, reason }),
+    }).catch(() => undefined);
+  }
+
+  async function deliverBrowserNotification(title: string, options: NotificationOptions) {
+    if (!("Notification" in window) || window.Notification.permission !== "granted") return false;
+    const notificationOptions: NotificationOptions = {
+      icon: "/skillcanvas-notification-icon.png",
+      ...options,
+    };
+    try {
+      if ("serviceWorker" in navigator) {
+        const registration = await navigator.serviceWorker.register("/notification-sw.js", { scope: "/" });
+        await registration.showNotification(title, notificationOptions);
+        reportNotificationDelivery("notification_delivery_succeeded", "service-worker");
+        return true;
+      }
+    } catch (error) {
+      reportNotificationDelivery("notification_delivery_failed", `service-worker: ${error instanceof Error ? error.message : "unknown"}`);
+    }
+    try {
+      const notification = new window.Notification(title, notificationOptions);
+      notification.onclick = () => { window.focus(); notification.close(); };
+      reportNotificationDelivery("notification_delivery_succeeded", "window-notification");
+      return true;
+    } catch (error) {
+      reportNotificationDelivery("notification_delivery_failed", `window-notification: ${error instanceof Error ? error.message : "unknown"}`);
+      return false;
+    }
   }
 
   function startGenerationWithoutNotification() {
@@ -5538,16 +5744,10 @@ export default function Home() {
       : state.status === "stable"
         ? "冻结评测全部通过，但没有候选证明额外提升；已安全保留当前最佳版本。"
       : `${state.stopReason || "Loop 已停止并保留当前最佳版本。"}`;
-    try {
-      const notification = new window.Notification(title, {
-        body: `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220),
-        tag: "skillcanvas-generation-loop",
-      });
-      notification.onclick = () => { window.focus(); notification.close(); };
-    } catch {
-      // Page state and diagnostics remain the source of truth when a browser
-      // or operating system suppresses a notification.
-    }
+    void deliverBrowserNotification(title, {
+      body: `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220),
+      tag: "skillcanvas-generation-loop",
+    });
   }
 
   function updateProvider(next: ProviderId) {
@@ -5792,49 +5992,74 @@ export default function Home() {
     setActiveAiMode(mode);
     setBusyExecutionKind("model");
     setBusyExecutionNote(AI_MODE_LABELS[mode] || `执行 ${mode}`);
-    const controller = new AbortController();
-    const timeoutMs = ["build", "repair", "eval-execute", "eval-grade", "eval-compare", "optimization-diagnose", "optimization-patch-plan", "optimization-research", "personalize", "optimization-evidence", "demo", "evaluate"].includes(mode)
-      ? 106_000
-      : ["preview", "optimize", "blueprint"].includes(mode)
-        ? 82_000
-        : 60_000;
-    const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
-    try {
-      const response = await fetch("/api/ai", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ mode, provider, model, baseUrl, apiKey, ...payload }),
-        signal: controller.signal,
-      });
-      const raw = await response.text();
-      let data: { content?: string; error?: string; requestId?: string } = {};
-      try { data = JSON.parse(raw) as { content?: string; error?: string; requestId?: string }; } catch { /* handled below */ }
-      if (!response.ok || !data.content) {
-        const requestHint = data.requestId ? `（请求 ${data.requestId}）` : "";
-        throw new Error(`${data.error || `模型请求失败（${response.status || "网络中断"}）`}${requestHint}`);
-      }
-      return jsonFromText<T>(data.content);
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-        void fetch("/api/client-log", {
+    const compatibleTimeoutMs = ["build", "repair", "personalize"].includes(mode)
+      ? 170_000
+      : ["blueprint", "blueprint-foundation", "blueprint-plan", "eval-execute", "eval-grade", "eval-compare", "optimization-evidence"].includes(mode)
+        ? 148_000
+        : ["preview", "interview", "demo", "evaluate", "optimization-diagnose", "optimization-patch-plan", "optimization-research"].includes(mode)
+          ? 132_000
+          : 108_000;
+    const timeoutMs = provider === "compatible"
+      ? compatibleTimeoutMs
+      : ["build", "repair", "eval-execute", "eval-grade", "eval-compare", "optimization-diagnose", "optimization-patch-plan", "optimization-research", "personalize", "optimization-evidence", "demo", "evaluate"].includes(mode)
+        ? 106_000
+        : ["preview", "optimize", "blueprint", "blueprint-foundation", "blueprint-plan"].includes(mode)
+          ? 82_000
+          : 60_000;
+    const requestBody = JSON.stringify({ mode, provider, model, baseUrl, apiKey, ...payload });
+    let lastError: unknown = null;
+    for (let transportAttempt = 1; transportAttempt <= 2; transportAttempt += 1) {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const response = await fetch("/api/ai", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ event: "ai_client_timeout", mode, phase: busyStage, elapsedMs: timeoutMs, reason: `浏览器在 ${Math.round(timeoutMs / 1_000)} 秒停止等待` }),
-        }).catch(() => undefined);
-        throw new Error(`${AI_MODE_LABELS[mode] || mode}等待超过 ${Math.round(timeoutMs / 1_000)} 秒，已自动结束；当前内容已保留，可以直接重试该节点`);
+          body: requestBody,
+          signal: controller.signal,
+        });
+        const raw = await response.text();
+        let data: { content?: string; error?: string; requestId?: string } = {};
+        try { data = JSON.parse(raw) as { content?: string; error?: string; requestId?: string }; } catch { /* handled below */ }
+        if (!response.ok || !data.content) {
+          const requestHint = data.requestId ? `（请求 ${data.requestId}）` : "";
+          const responseError = new Error(`${data.error || `模型请求失败（${response.status || "网络中断"}）`}${requestHint}`);
+          throw responseError;
+        }
+        return jsonFromText<T>(data.content);
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          void fetch("/api/client-log", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ event: "ai_client_timeout", mode, phase: busyStage, elapsedMs: timeoutMs, reason: `浏览器在 ${Math.round(timeoutMs / 1_000)} 秒停止等待` }),
+          }).catch(() => undefined);
+          throw new Error(`${AI_MODE_LABELS[mode] || mode}等待超过 ${Math.round(timeoutMs / 1_000)} 秒，已自动结束；当前内容已保留，可以直接重试该节点`);
+        }
+        const networkFailure = error instanceof TypeError || (error instanceof Error && /failed to fetch|networkerror|network connection lost|load failed/i.test(error.message));
+        if (networkFailure && transportAttempt === 1) {
+          lastError = error;
+          void fetch("/api/client-log", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ event: "ai_client_transport_retry", mode, phase: busyStage, reason: error instanceof Error ? error.message : "network error" }),
+          }).catch(() => undefined);
+          continue;
+        }
+        if (networkFailure) {
+          void fetch("/api/client-log", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ event: "ai_client_network_error", mode, phase: busyStage, elapsedMs: busyElapsed * 1_000, reason: error instanceof Error ? error.message : "network error" }),
+          }).catch(() => undefined);
+          throw new Error(`${AI_MODE_LABELS[mode] || mode}请求连续两次中断，当前内容已保留，请重试当前节点`);
+        }
+        throw error;
+      } finally {
+        window.clearTimeout(timeout);
       }
-      if (error instanceof TypeError || (error instanceof Error && /failed to fetch|networkerror|load failed/i.test(error.message))) {
-        void fetch("/api/client-log", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ event: "ai_client_network_error", mode, phase: busyStage, elapsedMs: busyElapsed * 1_000, reason: error instanceof Error ? error.message : "network error" }),
-        }).catch(() => undefined);
-        throw new Error(`${mode} 请求在等待模型时中断，当前内容已保留，请直接重试这一步`);
-      }
-      throw error;
-    } finally {
-      window.clearTimeout(timeout);
     }
+    throw lastError instanceof Error ? lastError : new Error(`${AI_MODE_LABELS[mode] || mode}请求没有完成`);
   }
 
   async function runIsolatedEvalHarness(input: {
@@ -6109,6 +6334,7 @@ export default function Home() {
       ]);
       const trainingEvidence = trainingHarness.evidence;
       const baselineEvidence = baselineHarness.evidence;
+      const trainingFailureIssues = optimizationPolicyFor(pipelineIssuesFromEvalFailures(trainingEvidence)).selected;
       setOptimizationSession({
         cases: evalBank,
         trainCaseIds: trainCases.map((item) => item.id),
@@ -6132,6 +6358,7 @@ export default function Home() {
         evaluation: target,
         dimension: target.label,
         rolloutEvidence: trainingEvidence,
+        failureAttributions: trainingFailureIssues,
         rejectedHistory,
       });
       const plan = normalizeOptimizationPlan(result);
@@ -6163,6 +6390,11 @@ export default function Home() {
         ...rejectedOptimizations.filter((item) => item.dimension === before.label),
       ].slice(-6);
       const canonicalTargets = canonicalMutationTargetCatalog(files);
+      const trainingFailureIssues = optimizationPolicyFor(pipelineIssuesFromEvalFailures(optimizationSession.trainingEvidence)).selected;
+      const selectedFailureIssueIds = new Set(selected.flatMap((item) => item.issueIds));
+      const selectedFailureIssues = selectedFailureIssueIds.size
+        ? trainingFailureIssues.filter((item) => selectedFailureIssueIds.has(item.id))
+        : trainingFailureIssues;
       const noOpFeedback: string[] = [];
       let optimized: OptimizationEditResponse | null = null;
       let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate> | null = null;
@@ -6179,11 +6411,46 @@ export default function Home() {
           dimension: before.label,
           optimizationPlan: selected,
           rolloutEvidence: optimizationSession.trainingEvidence,
+          failureAttributions: selectedFailureIssues,
           rejectedHistory,
           canonicalTargets,
           priorAttemptFeedback: noOpFeedback,
           attempt,
         });
+        if (selectedFailureIssues.length) {
+          const hasImplementationEdits = Object.keys(optimized.implementationFiles || {}).length > 0
+            || Object.keys(optimized.createdFiles || {}).length > 0
+            || Object.keys(optimized.updatedFiles || {}).length > 0
+            || (Array.isArray(optimized.edits) && optimized.edits.length > 0);
+          const attributedPlan = normalizePatchPlan({
+            strategy: "repair_contract",
+            issueIds: selectedFailureIssues.map((item) => item.id),
+            canonicalMutations: optimized.canonicalMutations,
+            operations: [],
+            impact: {
+              scope: "conditional",
+              affectedCapabilities: selectedFailureIssues.flatMap((item) => item.capabilityId ? [item.capabilityId] : []),
+              affectedArtifacts: selectedFailureIssues.flatMap((item) => item.files),
+              mustNotAffect: optimizationSession.trainingEvidence.textualFeedback.preserve,
+              regressionFamilies: ["capability"],
+            },
+          });
+          const attributedValidation = attributedPlan
+            ? validatePatchPlan({ plan: attributedPlan, issues: selectedFailureIssues, files, capabilities: capabilityPlan.items, budget: DEFAULT_MUTATION_BUDGET })
+            : { valid: false, errors: ["没有返回可归因的 CanonicalMutation"] };
+          if (hasImplementationEdits || !attributedValidation.valid) {
+            noOpFeedback.push(`第 ${attempt} 次候选越过了 Eval failure 的局部修改边界：${hasImplementationEdits ? "不允许修改 implementation files；" : ""}${attributedValidation.errors.join("；")}`);
+            continue;
+          }
+          optimized = {
+            ...optimized,
+            canonicalMutations: attributedPlan?.canonicalMutations || [],
+            implementationFiles: {},
+            edits: [],
+            createdFiles: {},
+            updatedFiles: {},
+          };
+        }
         const applied = applyOptimizationEdits(files, optimized);
         const candidate = applyCanonicalCandidate({
           currentFiles: files,
@@ -6415,6 +6682,7 @@ export default function Home() {
     setPreviewFeedbackCustom("");
     setInterviewReadiness(EMPTY_INTERVIEW_READINESS);
     setBlueprint(DEFAULT_BLUEPRINT);
+    setBlueprintExpanded(false);
     setCapabilityPlan(DEFAULT_CAPABILITY_PLAN);
     setLoopPlan(DEFAULT_LOOP_PLAN);
     setBuildLoop(DEFAULT_BUILD_LOOP);
@@ -6611,10 +6879,16 @@ export default function Home() {
     try {
       if (!hasRealModel) throw new Error("模型配置已缺失，请重新连接");
       setBusyPhaseIndex(1);
-      const result = await callAI<{ sections: BlueprintSection[]; capabilityPlan?: unknown; loopPlan?: unknown }>("blueprint", {
+      const foundation = await callAI<{ sections: BlueprintSection[] }>("blueprint-foundation", {
         idea,
         sourceText: contextBundle,
         answers: interviewEvidence,
+      });
+      if (!Array.isArray(foundation.sections) || foundation.sections.length !== 6) throw new Error("模型没有返回完整的六个需求蓝图模块");
+      setBusyPhaseIndex(2);
+      const result = await callAI<{ capabilityPlan?: unknown; loopPlan?: unknown }>("blueprint-plan", {
+        idea,
+        blueprintFoundation: { sections: foundation.sections },
         capabilityCatalog: CAPABILITY_LIBRARY.map((item) => ({
           id: item.id,
           kind: item.kind,
@@ -6627,19 +6901,18 @@ export default function Home() {
           connection: item.connection,
         })),
       });
-      setBusyPhaseIndex(2);
-      if (!Array.isArray(result.sections) || result.sections.length !== 6) throw new Error("模型没有返回完整的六个需求蓝图模块");
       const normalizedCapabilities = normalizeCapabilityPlan(result.capabilityPlan);
       if (!normalizedCapabilities) throw new Error("模型没有返回完整的能力与资源计划");
       const plannedCapabilities = ensureTaskCapabilities(normalizedCapabilities, idea, demoAnswers);
       const plannedLoop = normalizeLoopPlan(result.loopPlan, deriveLoopPlan(idea, demoAnswers, plannedCapabilities));
       const confirmedAnswerText = Object.values(demoAnswers).join("\n");
-      const normalizedBlueprint = result.sections.map((item, index) => ({ ...item, content: reconcileDataMutationPolicy(item.content, confirmedAnswerText), index: item.index || String.fromCharCode(65 + index) }));
+      const normalizedBlueprint = foundation.sections.map((item, index) => ({ ...item, content: reconcileDataMutationPolicy(item.content, confirmedAnswerText), index: item.index || String.fromCharCode(65 + index) }));
       setBlueprint(reconcileBlueprintProvenance(normalizedBlueprint, `${idea}\n${confirmedAnswerText}`));
       setCapabilityPlan(plannedCapabilities);
       setMcpDrafts(Object.fromEntries(plannedCapabilities.items.filter((item) => item.kind === "mcp").map((item) => [item.id, item.connection?.server || ""])));
       setLoopPlan(plannedLoop);
       markComplete("interview");
+      setBlueprintExpanded(false);
       setStep("blueprint");
       setRetryAction(null);
     } catch (error) {
@@ -7323,7 +7596,7 @@ export default function Home() {
       ...makeContractIssues(audit.blockers),
       ...crossArtifact.issues,
       ...closure.issues.map((item) => ({ id: item.id, priority: item.severity === "critical" ? "P1" as const : "P3" as const, type: item.type.toUpperCase().replaceAll("-", "_"), source: "closure" as const, evidence: item.detail, files: item.files, capabilityId: item.capabilityId })),
-      ...semantic.issues.map((item) => ({ id: item.id, priority: item.priority, type: item.type, source: "semantic" as const, evidence: item.evidence, files: item.files, capabilityId: item.capabilityId || undefined })),
+      ...semantic.issues.map((item) => ({ id: item.id, priority: item.priority, type: item.type, source: "semantic" as const, evidence: item.evidence, files: item.files, capabilityId: item.capabilityId || undefined, failureType: item.failureType, allowedMutationTypes: item.allowedMutationTypes })),
     ];
     const includeAnonymousBaselineEvidence = (issues: PipelineIssue[], comparison: typeof blindResult): PipelineIssue[] => comparison.revealedWinner === "left"
       ? [...issues, {
@@ -7335,17 +7608,9 @@ export default function Home() {
         files: ["SKILL.md"],
       }]
       : issues;
-    const includeHeldOutFailureEvidence = (issues: PipelineIssue[], evidence: OptimizationEvidenceReport): PipelineIssue[] => [
-      ...issues,
-      ...evidence.failurePatterns.map((failure, index) => ({
-        id: `heldout-assertion-${index + 1}`,
-        priority: "P1" as const,
-        type: "HELDOUT_ASSERTION_FAILURE",
-        source: "semantic" as const,
-        evidence: `独立保留任务的冻结断言失败，必须修复运行行为而不是放宽评测：${failure}`,
-        files: ["SKILL.md"],
-      })),
-    ];
+    const includeHeldOutFailureEvidence = (issues: PipelineIssue[], evidence: OptimizationEvidenceReport): PipelineIssue[] => {
+      return [...issues, ...pipelineIssuesFromEvalFailures(evidence)];
+    };
     let bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit, bestBundleValidation), blindResult), bestEvidence);
 
     const initialCritical = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
@@ -7363,7 +7628,8 @@ export default function Home() {
       }
       const density = estimateDomainValueDensity(bestFiles);
       let researchDecision: unknown = null;
-      if (issuePolicy.allowResearch && density.shouldResearch) {
+      const hasDecisionRuleFailure = issuePolicy.selected.some((item) => item.failureType === "missing_decision_rule");
+      if (issuePolicy.allowResearch && (density.shouldResearch || hasDecisionRuleFailure)) {
         setGenerationLoop((current) => ({ ...current, phase: "diagnose", stopReason: `第 ${round} 轮：领域知识价值密度 ${density.score}，正在判断是否值得进入 Research Loop` }));
         const initialResearchRaw = await callAI<unknown>("optimization-research", {
           ...evidencePayload,
@@ -7899,7 +8165,7 @@ export default function Home() {
     }
   }
 
-  async function runBuildTimeKnowledgeCompiler(basePlan: CapabilityPlan): Promise<KnowledgePack> {
+  async function runBuildTimeKnowledgeCompiler(basePlan: CapabilityPlan, capabilityDelta: CapabilityDelta): Promise<KnowledgePack> {
     setBuildLoop((current) => ({ ...current, status: "checking", phase: "knowledge" }));
     setInternalMcpEvidenceReports((current) => ({ ...current, "knowledge-compile": undefined }));
     showLoopBusy("正在判断哪些领域知识能真正改变 Skill 的专业判断与工作分支");
@@ -7908,9 +8174,26 @@ export default function Home() {
       sourceText: contextBundle,
       answers: interviewEvidence,
       capabilityPlan: basePlan,
+      capabilityDelta,
     });
-    const plan = normalizeKnowledgePlan(rawPlan);
+    const plan = normalizeKnowledgePlan({
+      ...(rawPlan && typeof rawPlan === "object" ? rawPlan as Record<string, unknown> : {}),
+      required: capabilityDelta.skillMustTeach.length > 0,
+      capabilityDeltaGapIds: capabilityDelta.skillMustTeach.map((item) => item.id),
+    });
     const workflowMcpEnabled = mcpConnections.length > 0;
+    if (capabilityDelta.skillMustTeach.length > 0 && !plan.required) {
+      const insufficient: KnowledgePack = {
+        ...EMPTY_KNOWLEDGE_PACK,
+        status: "unavailable",
+        summary: "Capability Delta 已发现专属能力差值，但四类知识检索计划不完整；本 Skill 已标记为知识不足，不会用泛化内容补齐。",
+        sufficiency: "insufficient",
+        plan,
+        generatedAt: new Date().toISOString(),
+      };
+      setKnowledgePack(insufficient);
+      return insufficient;
+    }
     if (!plan.required) {
       const skipped: KnowledgePack = {
         ...EMPTY_KNOWLEDGE_PACK,
@@ -7989,6 +8272,7 @@ export default function Home() {
       const compiled = await callAI<unknown>("knowledge-compile", {
         idea,
         answers: interviewEvidence,
+        capabilityDelta,
         knowledgePlan: plan,
         researchSources: evidencePayload,
       });
@@ -8047,6 +8331,7 @@ export default function Home() {
           const refined = await callAI<unknown>("knowledge-compile", {
             idea,
             answers: interviewEvidence,
+            capabilityDelta,
             knowledgePlan: { ...plan, knowledgeGaps: densityGate.missingDimensions.length ? densityGate.missingDimensions : plan.knowledgeGaps },
             researchSources: evidencePayload,
             priorKnowledgePack: serializeKnowledgePackForRefinement(pack, evidencePayload),
@@ -8103,9 +8388,30 @@ export default function Home() {
         goal: idea.slice(0, 2_000),
         hasRepresentativeTask: Boolean(demoAnswers.__previewInput?.trim()),
       });
+      const buildIdentity = deriveSkillIdentity(idea, demoAnswers);
+      await durableBuild?.complete("intent", { goal: loopPlan.goal || idea, skillName: buildIdentity.name });
+      await durableBuild?.complete("representative-task", { available: Boolean(demoAnswers.__previewInput?.trim()) });
+      await durableBuild?.complete("contract", { outputMode: generationPlan.outputContract.mode, riskBranchCount: generationPlan.riskBranches.length });
+      await durableBuild?.complete("capability-plan", {
+        activeCapabilityIds: generationPlan.items.filter(capabilityIsActive).map((item) => item.id),
+      });
       let liveKnowledgePack = EMPTY_KNOWLEDGE_PACK;
+      setBuildLoop((current) => ({ ...current, status: "checking", phase: "capability" }));
+      showLoopBusy("正在比较裸模型能力与这个 Skill 必须额外教会的行为");
+      const liveCapabilityDelta = normalizeCapabilityDelta(await callAI<unknown>("capability-delta", {
+        idea,
+        sourceText: contextBundle,
+        answers: interviewEvidence,
+        blueprint,
+        capabilityPlan: generationPlan,
+      }));
+      await durableBuild?.complete("capability-delta", {
+        status: liveCapabilityDelta.status,
+        gapCount: liveCapabilityDelta.skillMustTeach.length,
+        gapIds: liveCapabilityDelta.skillMustTeach.map((item) => item.id),
+      });
       try {
-        liveKnowledgePack = await runBuildTimeKnowledgeCompiler(generationPlan);
+        liveKnowledgePack = await runBuildTimeKnowledgeCompiler(generationPlan, liveCapabilityDelta);
       } catch (error) {
         const message = error instanceof Error ? error.message : "专业知识规划没有完成";
         liveKnowledgePack = {
@@ -8116,9 +8422,18 @@ export default function Home() {
         };
         setKnowledgePack(liveKnowledgePack);
       }
-      generationPlan = attachCompiledKnowledgeCapability(generationPlan, liveKnowledgePack);
+      // Knowledge compilation may add the conditional domain playbook or
+      // disable a previously planned one. Reconcile the runtime DAG again so
+      // every active capability has a route and every disabled capability is
+      // removed before Canonical SkillIR is compiled.
+      generationPlan = ensureTaskCapabilities(
+        attachCompiledKnowledgeCapability(generationPlan, liveKnowledgePack),
+        idea,
+        demoAnswers,
+      );
       setCapabilityPlan(generationPlan);
       const liveKnowledgeText = serializeKnowledgePack(liveKnowledgePack);
+      const liveKnowledgeProjection = applyKnowledgePackToFiles({ "SKILL.md": "" }, liveKnowledgePack);
       const liveBuildContext = [contextBundle, liveKnowledgeText ? `# Build-time professional knowledge pack\n${liveKnowledgeText}` : ""].filter(Boolean).join("\n\n").slice(0, 70_000);
       const canonicalIR = createCanonicalSkillIR({
         skillName: deriveSkillIdentity(idea, demoAnswers).name,
@@ -8127,15 +8442,19 @@ export default function Home() {
         plan: generationPlan,
         loop: loopPlan,
         sourceEvidence: `${sourceInsightText}\n${liveKnowledgeText}`,
-      });
-      await durableBuild?.complete("intent", { goal: canonicalIR.identity.stableGoal, skillName: canonicalIR.identity.skillName });
-      await durableBuild?.complete("representative-task", { available: Boolean(demoAnswers.__previewInput?.trim()) });
-      await durableBuild?.complete("contract", { semanticDigest: semanticSkillIRDigest(canonicalIR) });
-      await durableBuild?.complete("capability-plan", {
-        activeCapabilityIds: generationPlan.items.filter(capabilityIsActive).map((item) => item.id),
+        files: liveKnowledgeProjection,
+        capabilityDelta: liveCapabilityDelta,
+        knowledgeAssessment: {
+          status: liveKnowledgePack.sufficiency,
+          requiredCategories: liveKnowledgePack.plan.requiredCategories,
+          coveredCategories: liveKnowledgePack.categoryCoverage.covered,
+          missingCategories: liveKnowledgePack.categoryCoverage.missing,
+        },
       });
       await durableBuild?.complete("knowledge-compile", {
         status: liveKnowledgePack.status,
+        sufficiency: liveKnowledgePack.sufficiency,
+        missingCategories: liveKnowledgePack.categoryCoverage.missing,
         sourceCount: liveKnowledgePack.sources.length,
         adoptedRuleCount: liveKnowledgePack.atoms.length,
       });
@@ -9747,6 +10066,7 @@ export default function Home() {
                 <div className="question-list">
                 {questions.map((question, index) => {
                   const currentAnswer = answers[question.id] || "";
+                  const helperId = `question-helper-${interviewRoundIndex}-${index}`;
                   const selectedOptions = question.options.filter((option) => question.selectionMode === "multiple"
                     ? currentAnswer.split("；").includes(option)
                     : currentAnswer === option);
@@ -9757,7 +10077,20 @@ export default function Home() {
                       <span className="question-number">{String(index + 1).padStart(2, "0")}</span>
                       <span className="question-copy">
                         <span className="question-meta"><b>{question.dimension}</b><i>{question.selectionMode === "multiple" ? "可多选" : "单选"}</i></span>
-                        <strong>{question.label}</strong><small>{question.helper}</small>
+                        <span className="question-title-row">
+                          <strong>{question.label}</strong>
+                          <span className="question-helper">
+                            <button
+                              type="button"
+                              className="question-helper-trigger"
+                              aria-label={`查看说明：${question.helper}`}
+                              aria-describedby={helperId}
+                            >
+                              <span aria-hidden="true">!</span>
+                            </button>
+                            <span className="question-helper-tooltip" id={helperId} role="tooltip">{question.helper}</span>
+                          </span>
+                        </span>
                       </span>
                       <div className="question-answer">
                         <div className={`question-options ${question.selectionMode}`} role={question.selectionMode === "single" ? "radiogroup" : "group"} aria-label={question.label}>
@@ -9820,8 +10153,22 @@ export default function Home() {
                 <div>
                   <h2>这就是 AI 目前理解的你</h2>
                 </div>
+                <button
+                  type="button"
+                  className={`blueprint-stack-toggle ${blueprintExpanded ? "expanded" : ""}`}
+                  aria-controls="blueprint-sections"
+                  aria-expanded={blueprintExpanded}
+                  onClick={() => setBlueprintExpanded((current) => !current)}
+                >
+                  <span>{blueprintExpanded ? "收起" : "展开"}</span>
+                  <i aria-hidden="true">⌄</i>
+                </button>
               </div>
-              <div className="blueprint-grid">
+              <div
+                className={`blueprint-grid ${blueprintExpanded ? "is-expanded" : "is-stacked"}`}
+                id="blueprint-sections"
+                ref={blueprintGridRef}
+              >
                 {blueprint.map((section) => (
                   <article className={`blueprint-card ${section.status}`} key={section.id}>
                     <div className="blueprint-top">
@@ -9833,6 +10180,7 @@ export default function Home() {
                     </div>
                     <textarea
                       value={section.content}
+                      tabIndex={blueprintExpanded ? 0 : -1}
                       onChange={(event) => setBlueprint((current) => current.map((item) => item.id === section.id ? { ...item, content: event.target.value } : item))}
                       aria-label={`${section.title}内容`}
                     />

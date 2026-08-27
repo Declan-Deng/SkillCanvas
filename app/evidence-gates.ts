@@ -325,6 +325,7 @@ export function deriveDomainEvidence(reference: string, userEvidence: string, so
           source_urls: sourceUrls,
           confidence: Number(item.confidence || 0),
           evidence_type: evidenceType,
+          category: String(item.category || "decision_rules"),
           hard_constraint_allowed: ["official_rule", "user_preference"].includes(evidenceType),
         }];
       });

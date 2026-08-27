@@ -5,6 +5,8 @@ import {
   resolveContentPermission,
   type ContentPermission,
 } from "./evidence-gates.ts";
+import { EMPTY_CAPABILITY_DELTA, type CapabilityDelta } from "./capability-delta.ts";
+import { assertWorkflowDag, normalizeWorkflowDagSteps, type WorkflowDagStep } from "./workflow-dag.ts";
 
 export type SkillIRProvenance = "user_explicit" | "user_example" | "source_grounded" | "domain_inferred" | "generator_default";
 export type SkillIRRuleType = "hard_constraint" | "heuristic" | "preference" | "proxy_metric";
@@ -74,6 +76,13 @@ export type SkillIR = {
     controllableOutcomes: string[];
     uncontrollableOutcomes: string[];
     observableIndicators: string[];
+  };
+  capabilityDelta: CapabilityDelta;
+  knowledgeAssessment: {
+    status: "sufficient" | "insufficient" | "not-required";
+    requiredCategories: string[];
+    coveredCategories: string[];
+    missingCategories: string[];
   };
   tasks: Array<{
     id: string;
@@ -170,15 +179,7 @@ export type SkillIR = {
   };
   runtimeContract: {
     instructionPriority: string[];
-    workflow: Array<{
-      id: string;
-      capabilityIds: string[];
-      when: string;
-      input: string;
-      action: string;
-      output: string;
-      fallback: string;
-    }>;
+    workflow: WorkflowDagStep[];
     completionChecks: string[];
   };
   controlModel: Record<string, unknown>;
@@ -349,6 +350,7 @@ type PlanInput = {
   riskBranches: Array<{ id: string; condition: string; action: string; stopOrRedirect: string }>;
   failureModes: string[];
   items: CapabilityInput[];
+  workflowSteps?: WorkflowDagStep[];
 };
 
 type LoopInput = {
@@ -811,6 +813,8 @@ export function compileSkillIR(input: {
   domainEvidence?: unknown[];
   scopeProvenance?: unknown[];
   description?: string;
+  capabilityDelta?: CapabilityDelta;
+  knowledgeAssessment?: SkillIR["knowledgeAssessment"];
 }): SkillIR {
   const contentPermission = resolveContentPermission(input.answers);
   const domainEvidence = Array.isArray(input.domainEvidence) ? input.domainEvidence : [];
@@ -896,6 +900,26 @@ export function compileSkillIR(input: {
     ...outcomeModel.observableIndicators,
     ...input.plan.outputContract.validation,
   ]).filter((item) => !isDeclaredUncontrollable(item, outcomeModel.uncontrollableOutcomes));
+  const declaredWorkflow = normalizeWorkflowDagSteps(input.plan.workflowSteps);
+  const fallbackWorkflow = capabilities.filter((item) => item.kind !== "eval").map((item, index, all) => ({
+    id: `step-${index + 1}-${item.id}`,
+    capabilityIds: [item.id],
+    when: item.activationCondition || item.routingCondition,
+    input: item.input,
+    action: item.purpose || item.requirement,
+    output: item.output,
+    fallback: item.fallback,
+    requires: index === 0 ? ["$request"] : [`capability:${all[index - 1].id}:output`],
+    produces: [`capability:${item.id}:output`],
+    mutates: [],
+  }));
+  const workflowSource = declaredWorkflow.length ? declaredWorkflow.map((step) => ({
+    ...step,
+    capabilityIds: step.capabilityIds.filter((id) => capabilityIds.has(id)),
+  })) : fallbackWorkflow;
+  const ownerlessStep = workflowSource.find((step) => step.capabilityIds.length === 0);
+  if (ownerlessStep) throw new Error(`WORKFLOW_DAG_INVALID: Workflow step ${ownerlessStep.id} 没有可执行的 capability owner`);
+  const workflow = assertWorkflowDag(workflowSource, ["$request", "$source", "$confirmed", ...inputs.map((item) => `input:${item.id}`)]);
   const ir: SkillIR = {
     schemaVersion: "1.0",
     compiler: "skillcanvas",
@@ -907,6 +931,13 @@ export function compileSkillIR(input: {
       description: input.description?.trim() || `用于用户要求“${input.idea.trim()}”或提供相关材料继续处理时；执行已确认工作流并交付可检查结果。`,
     },
     outcomeModel,
+    capabilityDelta: input.capabilityDelta || EMPTY_CAPABILITY_DELTA,
+    knowledgeAssessment: input.knowledgeAssessment || {
+      status: "not-required",
+      requiredCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"],
+      coveredCategories: [],
+      missingCategories: [],
+    },
     tasks: [{
       id: taskId,
       intent: outcomeModel.ultimateGoal || input.idea.trim(),
@@ -992,15 +1023,7 @@ export function compileSkillIR(input: {
         "Working inferences",
         "Generator defaults",
       ],
-      workflow: capabilities.filter((item) => item.kind !== "eval").map((item, index) => ({
-        id: `step-${index + 1}-${item.id}`,
-        capabilityIds: [item.id],
-        when: item.activationCondition || item.routingCondition,
-        input: item.input,
-        action: item.purpose || item.requirement,
-        output: item.output,
-        fallback: item.fallback,
-      })),
+      workflow,
       completionChecks,
     },
     controlModel: {
@@ -1094,6 +1117,8 @@ export function projectSkillMarkdown(ir: SkillIR) {
     `## Goal\n\n${ir.identity.stableGoal}\n\nControllable outcomes:\n${markdownList(ir.outcomeModel.controllableOutcomes, ir.identity.intent)}\n\nDo not promise uncontrollable outcomes:\n${markdownList(ir.outcomeModel.uncontrollableOutcomes, "No additional external outcome is claimed.")}`,
     `## When to use\n\n${markdownList(ir.tasks.map((item) => item.activationCondition), ir.identity.intent)}`,
     `## Instruction priority\n\n${priority.map((item, index) => `${index + 1}. ${item}`).join("\n")}`,
+    ir.capabilityDelta?.skillMustTeach?.length ? `## Skill-specific capability delta\n\nTeach only behavior the bare model does not reliably provide:\n${markdownList(ir.capabilityDelta.skillMustTeach.map((item) => `**${item.taskDecision}:** ${item.requiredSkillBehavior} (${item.whySkillIsNeeded})`), "No defensible delta was identified; do not pad this Skill with generic advice.")}` : "",
+    ir.knowledgeAssessment?.status === "insufficient" ? `## Knowledge sufficiency\n\n- Status: \`insufficient\`\n- Missing required categories: ${ir.knowledgeAssessment.missingCategories.join(", ") || "unknown"}\n- Do not substitute generic best practices or model common sense for missing Decision Rules, Failure Modes, Edge Cases, or Verification Methods. Keep unsupported decisions visibly unknown.` : "",
     `## Inputs\n\n### Required\n\n${markdownList(requiredInputs.map(projectedInputName), "Current task request")}\n\n### Optional\n\n${markdownList(optionalInputs.map(projectedInputName), "No optional inputs")}`,
     `## Input resolution contract\n\n${markdownList(ir.inputs.map((item) => item.resolution
       ? `**${item.name}:** ${item.missingBehavior} (mode: \`${item.resolution.mode}\`; authority: \`${item.resolution.authority}\`)`
@@ -1101,7 +1126,7 @@ export function projectSkillMarkdown(ir: SkillIR) {
     `## Workflow\n\n${workflow.map((step, index) => {
       const capabilities = step.capabilityIds.map((id) => ir.capabilities.find((item) => item.id === id)).filter((item): item is SkillIRCapability => Boolean(item));
       const operations = capabilities.map((capability) => projectCapabilityRuntimeOperation(capability, ir.outputs));
-      return `${index + 1}. **${step.action}**\n   - When: ${step.when}\n   - Input: ${step.input}\n   - Runtime operation: ${operations.join(" ") || "`REASON` — execute the declared action using resolved inputs."}\n   - Output: ${step.output}\n   - If unavailable: ${step.fallback}`;
+      return `${index + 1}. **${step.action}**\n   - Requires: ${step.requires.map((item) => `\`${item}\``).join(", ") || "none"}\n   - Produces: ${step.produces.map((item) => `\`${item}\``).join(", ") || "none"}\n   - Mutates: ${step.mutates.map((item) => `\`${item}\``).join(", ") || "none"}\n   - When: ${step.when}\n   - Input: ${step.input}\n   - Runtime operation: ${operations.join(" ") || "`REASON` — execute the declared action using resolved inputs."}\n   - Output: ${step.output}\n   - If unavailable: ${step.fallback}`;
     }).join("\n") || "1. Complete the declared task using the resolved inputs."}`,
     requirements.length ? `## Confirmed requirements\n\n${requirements.map((item) => `- [${item.modality}; ${item.provenance}] ${item.statement}`).join("\n")}` : "",
     contentPermission.sourceText ? `## Content transformation\n\n- Apply the owner's confirmed permission exactly: ${contentPermission.sourceText}\n- Keep this permission separate from privacy, missing-input handling, source citation, tool receipts, and external or irreversible actions.` : "",
@@ -1172,7 +1197,8 @@ export function projectDomainPlaybook(ir: SkillIR) {
   if (!rules.length) return "";
   return `# Domain playbook\n\nCanonical source: \`evals/skill-ir.json\` (${skillIRDigest(ir)}). Runtime strength is determined by evidence type and confidence; advisory evidence must not become a hard constraint.\n\n${rules.map((item, index) => {
     const urls = Array.isArray(item.source_urls) ? item.source_urls.map(String).filter(Boolean) : [];
-    return `## ${index + 1}. ${String(item.rule || item.knowledge || "Domain decision rule")}\n\n- Evidence type: \`${String(item.evidence_type || "unknown")}\`\n- Confidence: ${String(item.confidence ?? "unknown")}\n- Applies when: ${String(item.applies_when || "the declared condition is satisfied")}\n- Exception: ${String(item.exception || "none declared")}\n- Runtime strength: ${item.hard_constraint_allowed === true ? "eligible for enforcement when no higher-priority user instruction conflicts" : "advisory only"}\n- Sources: ${urls.length ? urls.join(", ") : "no canonical URL recorded"}`;
+    const evalCaseIds = Array.isArray(item.eval_case_ids) ? item.eval_case_ids.map(String).filter(Boolean) : [];
+    return `## ${index + 1}. ${String(item.rule || item.knowledge || "Domain decision rule")}\n\n- Required category: \`${String(item.category || "decision_rules")}\`\n- Evidence type: \`${String(item.evidence_type || "unknown")}\`\n- Confidence: ${String(item.confidence ?? "unknown")}\n- Applies when: ${String(item.applies_when || "the declared condition is satisfied")}\n- Exception: ${String(item.exception || "none declared")}\n- Runtime strength: ${item.hard_constraint_allowed === true ? "eligible for enforcement when no higher-priority user instruction conflicts" : "advisory only"}\n- Sources: ${urls.length ? urls.join(", ") : "no canonical URL recorded"}\n- Eval failure evidence: ${evalCaseIds.length ? evalCaseIds.join(", ") : "none"}`;
   }).join("\n\n")}\n`;
 }
 

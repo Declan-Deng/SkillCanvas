@@ -1,4 +1,6 @@
 import { bindSkillIREvals, projectEvalBank, skillIRDigest, type SkillIR, type SkillIRCapability, type SkillIRRequirement } from "./skill-ir.ts";
+import { compileWorkflowDag, normalizeWorkflowDagSteps } from "./workflow-dag.ts";
+import { EMPTY_CAPABILITY_DELTA } from "./capability-delta.ts";
 
 export type CanonicalMutation =
   | { type: "identity.update"; changes: Partial<SkillIR["identity"]> }
@@ -24,6 +26,12 @@ export type CanonicalMutation =
   | { type: "knowledge.add"; knowledge: SkillIR["knowledgeRequirements"][number] }
   | { type: "knowledge.update"; knowledgeId: string; changes: Partial<SkillIR["knowledgeRequirements"][number]> }
   | { type: "knowledge.remove"; knowledgeId: string }
+  | { type: "domain-evidence.add"; evidence: Record<string, unknown> }
+  | { type: "domain-evidence.update"; evidenceId: string; changes: Record<string, unknown> }
+  | { type: "domain-evidence.remove"; evidenceId: string }
+  | { type: "risk-branch.add"; branch: SkillIR["riskBranches"][number] }
+  | { type: "risk-branch.update"; branchId: string; changes: Partial<SkillIR["riskBranches"][number]> }
+  | { type: "risk-branch.remove"; branchId: string }
   | { type: "eval-source.add"; testCase: Record<string, unknown> }
   | { type: "eval-source.update"; caseId: string; changes: Record<string, unknown> }
   | { type: "eval-source.remove"; caseId: string };
@@ -61,11 +69,15 @@ function array(value: unknown) {
 function canonicalMutationType(value: unknown) {
   const raw = text(value).toLowerCase().replace(/[\s-]+/g, "_");
   if (!raw) return "";
-  if (raw.includes(".")) return raw;
-  const direct = raw.match(/^(requirement|task|capability|input|output|constraint|knowledge|identity|state|eval_source)_(add|update|remove)$/);
-  if (direct) return `${direct[1].replace("eval_source", "eval-source")}.${direct[2]}`;
-  const reversed = raw.match(/^(add|update|remove)_(requirement|task|capability|input|output|constraint|knowledge|identity|state|eval_source)$/);
-  if (reversed) return `${reversed[2].replace("eval_source", "eval-source")}.${reversed[1]}`;
+  const canonicalOwner = (owner: string) => owner.replace("eval_source", "eval-source").replace("domain_evidence", "domain-evidence").replace("risk_branch", "risk-branch");
+  if (raw.includes(".")) {
+    const [owner, action] = raw.split(".", 2);
+    return `${canonicalOwner(owner)}.${action}`;
+  }
+  const direct = raw.match(/^(requirement|task|capability|input|output|constraint|knowledge|domain_evidence|risk_branch|identity|state|eval_source)_(add|update|remove)$/);
+  if (direct) return `${canonicalOwner(direct[1])}.${direct[2]}`;
+  const reversed = raw.match(/^(add|update|remove)_(requirement|task|capability|input|output|constraint|knowledge|domain_evidence|risk_branch|identity|state|eval_source)$/);
+  if (reversed) return `${canonicalOwner(reversed[2])}.${reversed[1]}`;
   return raw.replaceAll("_", ".");
 }
 
@@ -100,6 +112,12 @@ export function normalizeCanonicalMutations(value: unknown): CanonicalMutation[]
     if (type === "knowledge.add" && addedRecord("knowledge")) return [{ type, knowledge: addedRecord("knowledge") as SkillIR["knowledgeRequirements"][number] }];
     if (type === "knowledge.update" && targetId("knowledgeId", "knowledge_id")) return [{ type, knowledgeId: targetId("knowledgeId", "knowledge_id"), changes } as CanonicalMutation];
     if (type === "knowledge.remove" && targetId("knowledgeId", "knowledge_id")) return [{ type, knowledgeId: targetId("knowledgeId", "knowledge_id") }];
+    if (type === "domain-evidence.add" && addedRecord("evidence")) return [{ type, evidence: addedRecord("evidence") as Record<string, unknown> }];
+    if (type === "domain-evidence.update" && targetId("evidenceId", "evidence_id")) return [{ type, evidenceId: targetId("evidenceId", "evidence_id"), changes }];
+    if (type === "domain-evidence.remove" && targetId("evidenceId", "evidence_id")) return [{ type, evidenceId: targetId("evidenceId", "evidence_id") }];
+    if (type === "risk-branch.add" && addedRecord("branch")) return [{ type, branch: addedRecord("branch") as SkillIR["riskBranches"][number] }];
+    if (type === "risk-branch.update" && targetId("branchId", "branch_id")) return [{ type, branchId: targetId("branchId", "branch_id"), changes } as CanonicalMutation];
+    if (type === "risk-branch.remove" && targetId("branchId", "branch_id")) return [{ type, branchId: targetId("branchId", "branch_id") }];
     if (type === "eval-source.add" && addedRecord("testCase")) return [{ type, testCase: addedRecord("testCase") as Record<string, unknown> }];
     if (type === "eval-source.update" && targetId("caseId", "case_id")) return [{ type, caseId: targetId("caseId", "case_id"), changes }];
     if (type === "eval-source.remove" && targetId("caseId", "case_id")) return [{ type, caseId: targetId("caseId", "case_id") }];
@@ -119,17 +137,32 @@ function reconcileDerivedContracts(ir: SkillIR) {
     taskIdsByCapability.set(capabilityId, [...(taskIdsByCapability.get(capabilityId) || []), task.id]);
   }));
 
-  next.runtimeContract.workflow = next.capabilities
+  const activeCapabilityIds = new Set(next.capabilities
     .filter((capability) => capability.kind !== "eval" && capability.necessity.decision !== "exclude")
-    .map((capability, index) => ({
-      id: `step-${index + 1}-${capability.id}`,
-      capabilityIds: [capability.id],
-      when: capability.activationCondition || capability.routingCondition || "执行相关任务时",
-      input: capability.input,
-      action: capability.requirement || capability.purpose,
-      output: capability.output,
-      fallback: capability.fallback,
-    }));
+    .map((capability) => capability.id));
+  const retainedWorkflow = normalizeWorkflowDagSteps(next.runtimeContract.workflow).flatMap((step) => {
+    const capabilityIds = step.capabilityIds.filter((id) => activeCapabilityIds.has(id));
+    return capabilityIds.length ? [{ ...step, capabilityIds }] : [];
+  });
+  const routedCapabilityIds = new Set(retainedWorkflow.flatMap((step) => step.capabilityIds));
+  const appended = next.capabilities
+    .filter((capability) => activeCapabilityIds.has(capability.id) && !routedCapabilityIds.has(capability.id))
+    .map((capability, index) => {
+      const prior = retainedWorkflow.at(-1);
+      return {
+        id: `step-added-${index + 1}-${capability.id}`,
+        capabilityIds: [capability.id],
+        when: capability.activationCondition || capability.routingCondition || "执行相关任务时",
+        input: capability.input,
+        action: capability.requirement || capability.purpose,
+        output: capability.output,
+        fallback: capability.fallback,
+        requires: prior?.produces.length ? [prior.produces[0]] : ["$request"],
+        produces: [`capability:${capability.id}:output`],
+        mutates: [],
+      };
+    });
+  next.runtimeContract.workflow = [...retainedWorkflow, ...appended];
   next.runtimeContract.completionChecks = [...new Set([
     ...next.outputs.flatMap((output) => output.validation),
     ...next.tasks.flatMap((task) => task.successIndicators),
@@ -206,6 +239,12 @@ export function applySkillIRMutations(ir: SkillIR, mutations: CanonicalMutation[
     else if (mutation.type === "knowledge.add") next.knowledgeRequirements = [...next.knowledgeRequirements, mutation.knowledge];
     else if (mutation.type === "knowledge.update") next.knowledgeRequirements = replaceById(next.knowledgeRequirements, "id", mutation.knowledgeId, mutation.changes);
     else if (mutation.type === "knowledge.remove") next.knowledgeRequirements = next.knowledgeRequirements.filter((item) => item.id !== mutation.knowledgeId);
+    else if (mutation.type === "domain-evidence.add") next.domainEvidence = [...next.domainEvidence, mutation.evidence];
+    else if (mutation.type === "domain-evidence.update") next.domainEvidence = replaceById(next.domainEvidence.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item)), "id", mutation.evidenceId, mutation.changes);
+    else if (mutation.type === "domain-evidence.remove") next.domainEvidence = next.domainEvidence.filter((item) => !(item && typeof item === "object" && !Array.isArray(item) && String((item as Record<string, unknown>).id || "") === mutation.evidenceId));
+    else if (mutation.type === "risk-branch.add") next.riskBranches = [...next.riskBranches, mutation.branch];
+    else if (mutation.type === "risk-branch.update") next.riskBranches = replaceById(next.riskBranches, "id", mutation.branchId, mutation.changes);
+    else if (mutation.type === "risk-branch.remove") next.riskBranches = next.riskBranches.filter((item) => item.id !== mutation.branchId);
     else if (mutation.type === "eval-source.add") next.evaluationPlan.cases = [...next.evaluationPlan.cases, mutation.testCase];
     else if (mutation.type === "eval-source.update") next.evaluationPlan.cases = replaceById(next.evaluationPlan.cases, "id", mutation.caseId, mutation.changes);
     else if (mutation.type === "eval-source.remove") next.evaluationPlan.cases = next.evaluationPlan.cases.filter((item) => String(item.id) !== mutation.caseId);
@@ -226,6 +265,9 @@ export function validateCanonicalSkillIR(ir: SkillIR) {
   unique(ir.capabilities.map((item) => item.id), "capability");
   unique(ir.inputs.map((item) => item.id), "input");
   unique(ir.outputs.map((item) => item.id), "output");
+  unique(ir.riskBranches.map((item) => item.id), "risk-branch");
+  const domainEvidence = ir.domainEvidence.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object" && !Array.isArray(item));
+  unique(domainEvidence.map((item) => String(item.id || "")), "domain-evidence");
   const capabilityIds = new Set(ir.capabilities.map((item) => item.id));
   const inputIds = new Set(ir.inputs.map((item) => item.id));
   const outputIds = new Set(ir.outputs.map((item) => item.id));
@@ -241,6 +283,14 @@ export function validateCanonicalSkillIR(ir: SkillIR) {
   });
   ir.outputs.forEach((item) => item.producerCapabilityIds.forEach((id) => { if (!capabilityIds.has(id)) issues.push(`output ${item.id} references missing producer ${id}`); }));
   ir.inputs.forEach((item) => { if (!item.resolution?.mode || !item.missingBehavior?.trim()) issues.push(`input ${item.id} has no resolution contract`); });
+  ir.riskBranches.forEach((item) => {
+    if (!item.condition?.trim() || !item.action?.trim() || !item.stopOrRedirect?.trim()) issues.push(`risk-branch ${item.id} has an incomplete condition/action/fallback contract`);
+  });
+  domainEvidence.forEach((item) => {
+    if (!String(item.rule || item.knowledge || "").trim()) issues.push(`domain-evidence ${String(item.id || "<empty>")} has no behavior-changing rule`);
+  });
+  const dag = compileWorkflowDag(normalizeWorkflowDagSteps(ir.runtimeContract?.workflow), ["$request", "$source", "$confirmed", ...ir.inputs.map((item) => `input:${item.id}`)]);
+  issues.push(...dag.issues.map((item) => item.message));
   return { valid: issues.length === 0, issues };
 }
 
@@ -251,7 +301,15 @@ export function semanticSkillIRDigest(value: SkillIR | Record<string, string>) {
 }
 
 export function parseCanonicalSkillIR(files: Record<string, string>) {
-  try { return JSON.parse(files["evals/skill-ir.json"] || "") as SkillIR; }
+  try {
+    const parsed = JSON.parse(files["evals/skill-ir.json"] || "") as SkillIR;
+    return {
+      ...parsed,
+      capabilityDelta: parsed.capabilityDelta || EMPTY_CAPABILITY_DELTA,
+      knowledgeAssessment: parsed.knowledgeAssessment || { status: "not-required", requiredCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"], coveredCategories: [], missingCategories: [] },
+      runtimeContract: { ...parsed.runtimeContract, workflow: normalizeWorkflowDagSteps(parsed.runtimeContract?.workflow) },
+    };
+  }
   catch { return null; }
 }
 

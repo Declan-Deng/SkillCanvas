@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  compactInterviewEvidenceForRetry,
   compactSkillBundleForTrial,
   compactSourceContextForTrial,
 } from "../app/ai-context.ts";
@@ -29,6 +30,25 @@ test("trial source compaction retains evidence from multiple sections", () => {
   assert.match(compact, /# Source analysis/);
   assert.match(compact, /# Ideal output/);
   assert.match(compact, /# Constraints/);
+});
+
+test("blueprint retry compaction keeps every confirmed interview decision", () => {
+  const evidence = Array.from({ length: 16 }, (_, index) => ({
+    dimension: `dimension-${index + 1}`,
+    question: `Question ${index + 1} ${"Q".repeat(500)}`,
+    answer: `CONFIRMED-${index + 1} ${"A".repeat(500)}`,
+  }));
+  const compact = compactInterviewEvidenceForRetry(evidence, 8_000);
+  assert.ok(compact.length <= 8_000);
+  evidence.forEach((_, index) => assert.match(compact, new RegExp(`CONFIRMED-${index + 1}(?:\\D|$)`)));
+});
+
+test("single-section retry compaction keeps leading and trailing evidence", () => {
+  const source = `LEADING_FACT\n${"x".repeat(9_000)}\nTRAILING_FACT`;
+  const compact = compactSourceContextForTrial(source, 2_000);
+  assert.match(compact, /LEADING_FACT/);
+  assert.match(compact, /TRAILING_FACT/);
+  assert.match(compact, /CONTEXT_MIDDLE_OMITTED/);
 });
 
 test("trial bundle marks transport truncation instead of presenting a partial rule as a broken file", () => {

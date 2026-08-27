@@ -13,7 +13,10 @@ const ALLOWED_EVENTS = new Set([
   "generation_loop_finished",
   "generation_loop_failed",
   "ai_client_timeout",
+  "ai_client_transport_retry",
   "ai_client_network_error",
+  "notification_delivery_succeeded",
+  "notification_delivery_failed",
 ]);
 
 function cleanStrings(value: unknown, limit = 20) {
@@ -58,7 +61,9 @@ export async function POST(request: Request) {
     updatedPaths: cleanStrings(body.updatedPaths),
     reason: typeof body.reason === "string" ? body.reason.replace(/[\r\n]+/g, " ").slice(0, 300) : "",
   };
-  const diagnosticMode = event.startsWith("ai_client")
+  const diagnosticMode = event.startsWith("notification_")
+    ? "browser-notification"
+    : event.startsWith("ai_client")
     ? (typeof body.mode === "string" ? body.mode.replace(/[\r\n]+/g, " ").slice(0, 60) : "ai-client")
     : event.startsWith("generation_loop")
     ? "generation-loop"
@@ -69,7 +74,8 @@ export async function POST(request: Request) {
     entry.reason,
     entry.blockers.length ? `blockers: ${entry.blockers.join("；")}` : "",
   ].filter(Boolean).join(" | ").slice(0, 1_200);
-  recordAiDiagnostic(event === "generation_loop_failed" || event.startsWith("ai_client") ? "error" : "info", {
+  const level = event === "generation_loop_failed" || event.startsWith("ai_client") || event.endsWith("_failed") ? "error" : "info";
+  recordAiDiagnostic(level, {
     event: entry.event,
     mode: diagnosticMode,
     phase: typeof body.phase === "string" ? body.phase : undefined,
@@ -79,7 +85,7 @@ export async function POST(request: Request) {
   });
   await persistDiagnostic(tenant.tenantId, {
     timestamp: new Date().toISOString(),
-    level: event === "generation_loop_failed" || event.startsWith("ai_client") ? "error" : "info",
+    level,
     event: entry.event,
     mode: diagnosticMode,
     phase: typeof body.phase === "string" ? body.phase : undefined,

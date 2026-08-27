@@ -2151,10 +2151,75 @@ h3 {
   font-size: 15px;
 }
 
-.question-copy small {
-  color: var(--muted);
-  font-size: 11.25px;
-  line-height: 1.45;
+.question-title-row {
+  align-items: center;
+  display: inline-flex;
+  gap: 7px;
+  width: fit-content;
+}
+
+.question-helper {
+  display: inline-flex;
+  flex: 0 0 auto;
+  position: relative;
+}
+
+.question-helper-trigger {
+  align-items: center;
+  background: transparent;
+  border: 1.5px solid #9ba19e;
+  border-radius: 50%;
+  color: #858c89;
+  display: inline-flex;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  font-weight: 800;
+  height: 17px;
+  justify-content: center;
+  line-height: 1;
+  padding: 0;
+  width: 17px;
+}
+
+.question-helper-trigger:hover,
+.question-helper-trigger:focus-visible {
+  background: #efede7;
+  border-color: #777f7c;
+  color: #5f6865;
+  outline: 0;
+}
+
+.question-helper-trigger:focus-visible {
+  box-shadow: 0 0 0 3px rgba(119, 127, 124, 0.16);
+}
+
+.question-helper-tooltip {
+  background: #303735;
+  border-radius: 8px;
+  box-shadow: 0 9px 26px rgba(28, 38, 36, 0.17);
+  color: #f8f6f1;
+  font-size: 10.5px;
+  font-weight: 500;
+  left: 50%;
+  line-height: 1.5;
+  max-width: min(360px, calc(100vw - 48px));
+  opacity: 0;
+  padding: 9px 11px;
+  pointer-events: none;
+  position: absolute;
+  top: calc(100% + 8px);
+  transform: translate(-50%, -3px);
+  transition: opacity 120ms ease, transform 140ms var(--ease-out);
+  visibility: hidden;
+  width: max-content;
+  z-index: 4;
+}
+
+.question-helper:hover .question-helper-tooltip,
+.question-helper:focus-within .question-helper-tooltip {
+  opacity: 1;
+  transform: translate(-50%, 0);
+  visibility: visible;
 }
 
 .question-answer {
@@ -2200,6 +2265,7 @@ h3 {
   flex: 0 0 15px;
   height: 15px;
   justify-content: center;
+  margin-right: 4px;
   position: relative;
   transition: background 140ms ease, border-color 140ms ease, transform 130ms var(--ease-out);
   width: 15px;
@@ -2372,6 +2438,62 @@ h3 {
   display: grid;
   gap: 14px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
+  height: var(--blueprint-expanded-height, 742px);
+  position: relative;
+  transition: height 260ms var(--ease-in-out);
+}
+
+.blueprint-grid::after {
+  border-radius: 15px;
+  box-shadow: 0 24px 52px rgba(28, 38, 36, 0.16);
+  content: "";
+  height: 238px;
+  left: -3px;
+  opacity: 0;
+  pointer-events: none;
+  position: absolute;
+  right: -3px;
+  top: 84px;
+  transition: opacity 180ms ease;
+  z-index: 2;
+}
+
+.blueprint-grid.is-stacked {
+  height: 342px;
+}
+
+.blueprint-grid.is-stacked::after {
+  opacity: 1;
+}
+
+.blueprint-stack-toggle {
+  align-items: center;
+  background: var(--coral);
+  border: 1px solid var(--coral);
+  border-radius: 13px;
+  box-shadow: 0 8px 20px rgba(202, 74, 54, 0.18);
+  color: white;
+  display: inline-flex;
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 760;
+  gap: 9px;
+  min-height: 42px;
+  padding: 0 15px;
+  transition: background 150ms ease, box-shadow 180ms ease, transform 140ms var(--ease-out);
+}
+
+.blueprint-stack-toggle i {
+  display: inline-block;
+  font-size: 16px;
+  font-style: normal;
+  line-height: 1;
+  transform: translateY(-1px);
+  transition: transform 220ms var(--ease-in-out);
+}
+
+.blueprint-stack-toggle.expanded i {
+  transform: rotate(180deg) translateY(1px);
 }
 
 .blueprint-card {
@@ -2383,7 +2505,38 @@ h3 {
   min-height: 238px;
   padding: 18px;
   position: relative;
-  transition: border-color 160ms ease, box-shadow 180ms ease, transform 180ms var(--ease-out);
+  transform-origin: center top;
+  transition: border-color 160ms ease, box-shadow 220ms ease, transform 260ms var(--ease-in-out);
+}
+
+.blueprint-grid.is-stacked .blueprint-card {
+  pointer-events: none;
+}
+
+.blueprint-grid.is-stacked .blueprint-card:nth-child(1),
+.blueprint-grid.is-stacked .blueprint-card:nth-child(2) {
+  box-shadow: 0 8px 22px rgba(28, 38, 36, 0.07);
+  transform: translateY(0);
+  z-index: 1;
+}
+
+.blueprint-grid.is-stacked .blueprint-card:nth-child(3),
+.blueprint-grid.is-stacked .blueprint-card:nth-child(4) {
+  box-shadow: 0 14px 30px rgba(28, 38, 36, 0.1);
+  transform: translateY(-210px);
+  z-index: 2;
+}
+
+.blueprint-grid.is-stacked .blueprint-card:nth-child(5) {
+  box-shadow: none;
+  transform: translate(-3px, -420px) scale(1.018);
+  z-index: 3;
+}
+
+.blueprint-grid.is-stacked .blueprint-card:nth-child(6) {
+  box-shadow: none;
+  transform: translate(3px, -420px) scale(1.018);
+  z-index: 3;
 }
 
 .blueprint-card.attention {
@@ -8759,6 +8912,12 @@ h3 {
     transform: translateY(-1px);
   }
 
+  .blueprint-stack-toggle:hover {
+    background: var(--coral-dark);
+    box-shadow: 0 11px 24px rgba(202, 74, 54, 0.24);
+    transform: translateY(-1px);
+  }
+
   .starter-row button:hover,
   .question-options button:not(.selected):hover,
   .model-options > button:not(.selected):hover,
@@ -8769,12 +8928,12 @@ h3 {
   }
 
   .round-navigator button:not(:disabled):hover,
-  .blueprint-card:not(.attention):hover {
+  .blueprint-grid:not(.is-stacked) .blueprint-card:not(.attention):hover {
     border-color: var(--line-strong);
     box-shadow: 0 7px 22px rgba(28, 38, 36, 0.055);
   }
 
-  .blueprint-card.attention:hover {
+  .blueprint-grid:not(.is-stacked) .blueprint-card.attention:hover {
     border-color: var(--line);
     box-shadow:
       0 0 32px rgba(242, 190, 78, 0.34),
@@ -9337,6 +9496,48 @@ h3 {
   .loop-columns,
   .platform-grid {
     grid-template-columns: 1fr;
+  }
+
+  .blueprint-grid.is-stacked {
+    height: 540px;
+  }
+
+  .blueprint-grid::after {
+    top: 280px;
+  }
+
+  .blueprint-grid.is-stacked .blueprint-card:nth-child(1) {
+    transform: translateY(0);
+    z-index: 1;
+  }
+
+  .blueprint-grid.is-stacked .blueprint-card:nth-child(2) {
+    transform: translateY(-196px);
+    z-index: 2;
+  }
+
+  .blueprint-grid.is-stacked .blueprint-card:nth-child(3) {
+    transform: translateY(-392px);
+    z-index: 3;
+  }
+
+  .blueprint-grid.is-stacked .blueprint-card:nth-child(4) {
+    transform: translateY(-588px);
+    z-index: 4;
+  }
+
+  .blueprint-grid.is-stacked .blueprint-card:nth-child(5) {
+    transform: translateY(-784px) scale(1.008);
+    z-index: 5;
+  }
+
+  .blueprint-grid.is-stacked .blueprint-card:nth-child(6) {
+    transform: translateY(-980px) scale(1.018);
+    z-index: 6;
+  }
+
+  .blueprint-stack-toggle {
+    align-self: flex-end;
   }
 
   .tool-ability-heading {
@@ -10172,6 +10373,12 @@ h3 {
 
   .question-options button.auto-selected {
     animation: none;
+  }
+
+  .blueprint-grid,
+  .blueprint-card,
+  .blueprint-stack-toggle i {
+    transition-duration: 80ms;
   }
 
   .brief-stage > * {

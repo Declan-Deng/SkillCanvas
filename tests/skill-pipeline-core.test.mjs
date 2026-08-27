@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  FAILURE_ATTRIBUTION_MUTATIONS,
   applyPatchPlan,
+  attributeEvalFailure,
   auditCrossArtifactConsistency,
   capabilityOwnsArtifacts,
   caseProvidesCapabilityEvidence,
@@ -17,6 +19,124 @@ import {
   reconcileArtifactProducerCapabilities,
   validatePatchPlan,
 } from "../app/skill-pipeline-core.ts";
+
+test("Eval failures are attributed to one bounded Canonical SkillIR owner", () => {
+  assert.equal(attributeEvalFailure("缺少用于选择候选方案的判断规则").type, "missing_decision_rule");
+  assert.equal(attributeEvalFailure("空值和异常输入没有例外分支").type, "missing_exception");
+  assert.equal(attributeEvalFailure("MCP 参数错误且没有检查调用回执", "integration").type, "missing_tool_knowledge");
+  assert.equal(attributeEvalFailure("输出没有执行可观察的验收检查").type, "missing_verification");
+  assert.equal(attributeEvalFailure("系统规则与用户明确要求相互冲突").type, "instruction_conflict");
+  assert.deepEqual(FAILURE_ATTRIBUTION_MUTATIONS.missing_exception, ["risk-branch.add", "risk-branch.update", "risk-branch.remove"]);
+});
+
+test("attributed Eval failures reject whole-Skill or cross-owner patches", () => {
+  const issue = {
+    id: "eval-missing-exception",
+    priority: "P1",
+    type: "EVAL_MISSING_EXCEPTION",
+    source: "eval",
+    evidence: "缺例外：空值输入没有失败恢复",
+    files: ["SKILL.md"],
+    failureType: "missing_exception",
+    allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.missing_exception,
+  };
+  const wrong = normalizePatchPlan({
+    strategy: "repair_contract",
+    issueIds: [issue.id],
+    impact: { scope: "task-specific", affectedArtifacts: ["requirements"], regressionFamilies: ["capability"] },
+    canonicalMutations: [{ type: "requirement.add", requirement: { id: "generic", statement: "handle errors" } }],
+    operations: [{ action: "edit", path: "scripts/run.py", find: "old", replacement: "new" }],
+  });
+  assert.ok(wrong);
+  const wrongValidation = validatePatchPlan({ plan: wrong, issues: [issue], files: { "scripts/run.py": "old" }, capabilities: [] });
+  assert.equal(wrongValidation.valid, false);
+  assert.match(wrongValidation.errors.join("；"), /risk-branch|不能改写实现文件/);
+
+  const correct = normalizePatchPlan({
+    strategy: "repair_contract",
+    issueIds: [issue.id],
+    impact: { scope: "task-specific", affectedArtifacts: ["riskBranches"], regressionFamilies: ["capability"] },
+    canonicalMutations: [{ type: "risk-branch.add", branch: { id: "missing-input", condition: "required input is absent", action: "request the minimum missing input", stopOrRedirect: "stop dependent steps until supplied" } }],
+    operations: [],
+  });
+  assert.ok(correct);
+  assert.equal(validatePatchPlan({ plan: correct, issues: [issue], files: {}, capabilities: [] }).valid, true);
+});
+
+test("decision rules learned from Eval retain provenance instead of becoming model folklore", () => {
+  const issue = {
+    id: "eval-missing-decision-rule",
+    priority: "P2",
+    type: "EVAL_MISSING_DECISION_RULE",
+    source: "eval",
+    evidence: "case-routing-3 缺少判断何时停止自动补写的决策规则",
+    files: ["references/domain-playbook.md", "evals/skill-ir.json"],
+    failureType: "missing_decision_rule",
+    allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.missing_decision_rule,
+    evalCaseIds: ["case-routing-3"],
+  };
+  const withoutEvidence = normalizePatchPlan({
+    strategy: "distill_knowledge",
+    issueIds: [issue.id],
+    impact: { scope: "conditional", affectedArtifacts: ["domainEvidence"], regressionFamilies: ["capability"] },
+    canonicalMutations: [{
+      type: "domain-evidence.add",
+      evidence: { id: "stop-rule", rule: "遇到未知字段时停止", category: "decision_rules", applies_when: "字段来源未知" },
+    }],
+    operations: [],
+  });
+  assert.ok(withoutEvidence);
+  const rejected = validatePatchPlan({ plan: withoutEvidence, issues: [issue], files: {}, capabilities: [] });
+  assert.equal(rejected.valid, false);
+  assert.match(rejected.errors.join("；"), /source_urls|eval_case_ids/);
+
+  const withEvidence = normalizePatchPlan({
+    strategy: "distill_knowledge",
+    issueIds: [issue.id],
+    impact: { scope: "conditional", affectedArtifacts: ["domainEvidence"], regressionFamilies: ["capability"] },
+    canonicalMutations: [{
+      type: "domain-evidence.add",
+      evidence: {
+        id: "stop-rule",
+        rule: "字段没有可追溯来源时停止自动补写并请求确认",
+        category: "decision_rules",
+        applies_when: "输出字段没有用户材料或已授权来源",
+        exception: "用户已明确允许自由创作",
+        evidence_type: "eval_failure",
+        confidence: 0.8,
+        eval_case_ids: ["case-routing-3"],
+      },
+    }],
+    operations: [],
+  });
+  assert.ok(withEvidence);
+  assert.equal(validatePatchPlan({ plan: withEvidence, issues: [issue], files: {}, capabilities: [] }).valid, true);
+});
+
+test("tool failures can only update the attributed capability", () => {
+  const issue = {
+    id: "eval-tool-receipt",
+    priority: "P1",
+    type: "EVAL_MISSING_TOOL_KNOWLEDGE",
+    source: "eval",
+    evidence: "文件解析工具没有核对调用回执",
+    files: ["integrations/tool-contracts.json", "evals/skill-ir.json"],
+    capabilityId: "pdf-reader",
+    failureType: "missing_tool_knowledge",
+    allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.missing_tool_knowledge,
+  };
+  const wrongTarget = normalizePatchPlan({
+    strategy: "repair_contract",
+    issueIds: [issue.id],
+    impact: { scope: "conditional", affectedCapabilities: ["web-search"], regressionFamilies: ["integration"] },
+    canonicalMutations: [{ type: "capability.update", capabilityId: "web-search", changes: { fallback: "retry" } }],
+    operations: [],
+  });
+  assert.ok(wrongTarget);
+  const result = validatePatchPlan({ plan: wrongTarget, issues: [issue], files: {}, capabilities: [] });
+  assert.equal(result.valid, false);
+  assert.match(result.errors.join("；"), /pdf-reader/);
+});
 
 test("only structured execution issues can enter P0", () => {
   const contractIssues = makeContractIssues(["artifact_checker.py SyntaxError", "invalid JSON", "领域知识不够具体"]);

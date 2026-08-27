@@ -84,6 +84,22 @@ test("knowledge planning only enables research for executable gaps and queries",
   });
   assert.equal(enabled.required, true);
   assert.equal(enabled.freshness, "recent");
+  assert.deepEqual(enabled.requiredCategories, ["decision_rules", "failure_modes", "edge_cases", "verification_methods"]);
+  assert.equal(enabled.queries.length, 4);
+});
+
+test("domain knowledge remains explicitly insufficient until all four required categories have evidence", () => {
+  const plan = normalizeKnowledgePlan({ required: true, domain: "招聘", knowledgeGaps: ["筛选判断"], decisionDimensions: ["筛选判断"], queries: ["official screening rules"] });
+  const sources = normalizeRetrievedSources([{ url: sourceUrl, title: "Screening rules", excerpt: "A sufficiently detailed primary guide defines an evidence classification rule, an observable decision condition, and an exception." }]);
+  const pack = normalizeKnowledgePack({
+    plan,
+    sources,
+    raw: { atoms: [{ title: "证据分层", dimension: "筛选判断", category: "decision_rules", knowledge: "先区分直接证据、间接证据和未知项。", type: "decision_rule", appliesWhen: "材料需要与岗位要求逐项核对时", action: "逐项分类证据并记录未知项，再只基于直接证据作出匹配判断。", exception: "来源冲突时保留冲突，不强行合并。", sourceUrls: [sourceUrl], confidence: 0.9 }] },
+  });
+
+  assert.equal(pack.sufficiency, "insufficient");
+  assert.deepEqual(pack.categoryCoverage.covered, ["decision_rules"]);
+  assert.deepEqual(pack.categoryCoverage.missing, ["failure_modes", "edge_cases", "verification_methods"]);
 });
 
 test("vendor blogs cannot be compiled as official rules", () => {

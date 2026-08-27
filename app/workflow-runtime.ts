@@ -34,7 +34,7 @@ export type WorkflowInterruption = {
 };
 
 const KNOWN_PLANS: Record<Exclude<WorkflowKind, "mcp-call">, string[]> = {
-  build: ["intent", "representative-task", "contract", "capability-plan", "knowledge-compile", "bundle", "freeze"],
+  build: ["intent", "representative-task", "contract", "capability-plan", "capability-delta", "knowledge-compile", "bundle", "freeze"],
   optimization: ["held-out-split", "baseline", "execute", "grade", "diagnose", "mutate", "regression", "commit"],
 };
 
