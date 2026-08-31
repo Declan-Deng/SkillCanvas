@@ -4,17 +4,22 @@ import test from "node:test";
 
 import {
   auditSkillIRFiles,
+  auditUserEvidencePolarity,
   bindSkillIREvals,
   compileSkillIR,
   deriveTaskInputContract,
   ensureSkillIREvalCoverage,
   ensureSkillSemanticClosure,
   normalizeOutcomeModel,
+  normalizeKnowledgeAssessment,
   projectCapabilityManifest,
   projectCapabilityRuntimeOperation,
+  projectDomainPlaybook,
+  projectWorkflowRuntimeOperation,
   projectEvalBank,
   projectSkillMarkdown,
   projectToolContracts,
+  reconcileSkillIRActionPermissions,
   reconcileSkillIRContentPermission,
   reconcileSkillIRInputResolutions,
   reconcileSkillIRSourceEvidence,
@@ -26,6 +31,7 @@ import {
   validateCanonicalSkillIR,
 } from "../app/canonical-mutations.ts";
 import { countDuplicateAuthorRuntimeRules, hasExecutableWorkflowHeading } from "../app/gate-rules.ts";
+import { hasUnscopedActionPermissionConflict } from "../app/action-permission.ts";
 
 function fixturePlan() {
   return {
@@ -88,6 +94,28 @@ function fixturePlan() {
     ],
   };
 }
+
+test("knowledge sufficiency is recomputed from canonical four-category evidence", () => {
+  const partialEvidence = [{ category: "decision_rules" }, { category: "failure_modes" }];
+  assert.deepEqual(normalizeKnowledgeAssessment({
+    status: "sufficient",
+    requiredCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"],
+    coveredCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"],
+    missingCategories: [],
+  }, partialEvidence), {
+    status: "insufficient",
+    requiredCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"],
+    coveredCategories: [],
+    missingCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"],
+    observedCategories: [], requiredGapIds: [], coveredGapIds: [], missingGapIds: [], verifiedRuleCount: 0, advisoryRuleCount: 0,
+  });
+  assert.deepEqual(normalizeKnowledgeAssessment(undefined, []), {
+    status: "not-required",
+    requiredCategories: [],
+    coveredCategories: [],
+    missingCategories: [],
+  });
+});
 
 function compile() {
   return compileSkillIR({
@@ -170,6 +198,49 @@ test("Canonical SkillIR compilation blocks workflow steps without an active capa
   }), /WORKFLOW_DAG_INVALID.*capability owner/);
 });
 
+test("Canonical SkillIR preserves an input-required branch beside the productive path", () => {
+  const plan = fixturePlan();
+  plan.workflowSteps = [
+    {
+      id: "confirm-key-parts",
+      capabilityIds: ["core-resume"],
+      when: "关键信息缺失时",
+      input: "当前请求",
+      action: "请求用户确认会改变结果的关键信息",
+      output: "待确认问题",
+      fallback: "等待用户补充信息",
+      requires: ["$request"],
+      // Reproduce an older cached plan that illegally produced a built-in
+      // input token. The compiler must migrate it instead of pausing Build.
+      produces: ["$confirmed"],
+      mutates: [],
+    },
+    {
+      id: "produce-result",
+      capabilityIds: ["core-resume"],
+      when: "必要信息已经确认时",
+      input: "当前请求与已确认信息",
+      action: "完成核心任务",
+      output: "可交付结果",
+      fallback: "说明无法继续的原因",
+      requires: ["$confirmed"],
+      produces: ["result"],
+      mutates: [],
+    },
+  ];
+  const ir = compileSkillIR({
+    skillName: "generic-confirmation-workflow",
+    idea: "完成需要关键参数的任务",
+    answers: { inputs: "当前请求" },
+    plan,
+    loop: { mode: "hybrid", goal: "交付任务结果", maxRounds: 3, stopConditions: [], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "完成需要关键参数的任务", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  });
+  assert.deepEqual(ir.runtimeContract.workflow.find((item) => item.id === "confirm-key-parts")?.produces, ["$input_required"]);
+  assert.deepEqual(ir.runtimeContract.workflow.find((item) => item.id === "produce-result")?.produces, ["result", "$output"]);
+  assert.deepEqual(ir.runtimeContract.workflow.find((item) => item.id === "confirm-key-parts")?.resumeProduces, ["$confirmed"]);
+});
+
 test("canonical runtime projection links every compiler-owned knowledge resource", () => {
   const ir = compile();
   ir.domainEvidence = [{ rule: "Use evidence-backed terminology", evidence_type: "official_rule", confidence: 0.95 }];
@@ -242,6 +313,59 @@ test("owner content permission is canonical and removes conflicting generator de
   assert.doesNotMatch(JSON.stringify(reconciled), /禁止编造经历|不把未知当作事实|禁止编造量化数据/);
 });
 
+test("compiler deterministically scopes contradictory ask-first and autonomous runtime branches", () => {
+  const ir = compile();
+  const contradictory = "缺少信息时必须先询问用户确认，同时无需确认直接自主继续完成";
+  ir.capabilities[0].fallback = contradictory;
+  ir.inputs[0].missingBehavior = contradictory;
+  ir.runtimeContract.workflow[0].fallback = contradictory;
+  ir.riskBranches = [{ id: "risk-permission", condition: "输入不足", action: contradictory, stopOrRedirect: contradictory }];
+
+  const reconciled = reconcileSkillIRActionPermissions(ir);
+  const projected = projectSkillMarkdown(reconciled);
+  assert.doesNotMatch(JSON.stringify(reconciled), /同时无需确认直接自主继续完成/);
+  assert.match(projected, /根据依赖条件分别处理/);
+  assert.match(projected, /其余不依赖该信息的可逆工作可以自主继续/);
+});
+
+test("compiler makes repeated confirmation and analysis-only completion impossible", () => {
+  const ir = compile();
+  ir.runtimeContract.instructionPriority = [];
+  ir.runtimeContract.completionChecks = [];
+  ir.outputs[0].requiredSections = [];
+  ir.outputs[0].validation = [];
+
+  const reconciled = reconcileSkillIRActionPermissions(ir);
+  const projected = projectSkillMarkdown(reconciled);
+  assert.match(projected, /never ask the user to confirm information or authority they already provided/i);
+  assert.match(projected, /analysis, a plan, or questions alone do not complete the workflow/i);
+  assert.deepEqual(reconciled.outputs[0].requiredSections, ["可检查的主要结果"]);
+  assert.ok(reconciled.outputs[0].validation.some((item) => /实际结果已经生成/.test(item)));
+});
+
+test("projection repairs generated action conflicts but preserves conflicting user evidence for clarification", () => {
+  const ir = compile();
+  ir.capabilities[0].activationCondition = "必须先询问用户确认时";
+  ir.capabilities[0].fallback = "无需确认直接自主继续完成";
+  ir.requirements.push({
+    id: "owner-ambiguous-permission",
+    statement: "必须先询问用户确认，同时无需确认直接自主继续完成",
+    provenance: "user_explicit",
+    source: "interview.workflow",
+    confidence: 1,
+    modality: "MUST",
+    ruleType: "hard_constraint",
+    failureCost: "high",
+    hard: true,
+    mappedCapabilityIds: [ir.capabilities[0].id],
+  });
+
+  const projected = projectSkillMarkdown(reconcileSkillIRActionPermissions(ir));
+  const conflicts = projected.split("\n").filter(hasUnscopedActionPermissionConflict);
+  assert.deepEqual(conflicts, ["- [MUST; user_explicit] 必须先询问用户确认，同时无需确认直接自主继续完成"]);
+  assert.ok(auditUserEvidencePolarity(ir).some((issue) => issue.includes("USER_CONFIRMATION_CONFLICT")));
+});
+
 test("tool contracts preserve the canonical capability scope contract", () => {
   const ir = compile();
   const capability = ir.capabilities.find((item) => item.id === "core-resume");
@@ -289,7 +413,8 @@ test("canonical mutation survives projection and changes the semantic digest", (
     },
   };
   const candidate = applySkillIRMutations(baseline, [mutation]).ir;
-  assert.equal(validateCanonicalSkillIR(candidate).valid, true);
+  const validation = validateCanonicalSkillIR(candidate);
+  assert.equal(validation.valid, true, validation.issues.join("; "));
   assert.notEqual(semanticSkillIRDigest(candidate), semanticSkillIRDigest(baseline));
   assert.match(projectSkillMarkdown(candidate), /已有足够输入时直接生成，不重复追问/);
   assert.ok(candidate.runtimeContract.workflow.length > 0);
@@ -320,6 +445,7 @@ test("failure feedback mutates only canonical domain evidence and risk branches"
         exception: "用户明确要求采用不同排序时服从当前指令",
         evidence_type: "evidence_backed_practice",
         confidence: 0.82,
+        eval_case_ids: ["core-resume-regression"],
       },
     },
     {
@@ -332,7 +458,8 @@ test("failure feedback mutates only canonical domain evidence and risk branches"
       },
     },
   ])).ir;
-  assert.equal(validateCanonicalSkillIR(candidate).valid, true);
+  const validation = validateCanonicalSkillIR(candidate);
+  assert.equal(validation.valid, true, validation.issues.join("; "));
   assert.ok(candidate.domainEvidence.some((item) => item.id === "decision-jd-priority"));
   assert.ok(candidate.riskBranches.some((item) => item.id === "missing-jd-exception"));
   assert.match(projectSkillMarkdown(candidate), /目标 JD 缺失/);
@@ -372,6 +499,46 @@ test("runtime projector emits kind-specific executable protocols", () => {
   assert.match(artifact, /`SERIALIZE → VALIDATE`[\s\S]*`outputs\/\*\.pdf`[\s\S]*PDF opens/);
 });
 
+test("workflow operations consume node contracts, never the owner capability's whole task", () => {
+  for (const domain of ["compare equipment documents", "reconcile inventory batches"]) {
+    const capability = { ...compile().capabilities[0], kind: "llm", requirement: `Complete all of ${domain}`, purpose: domain, input: "all source material", output: "all final artifacts" };
+    const step = { id: "check", capabilityIds: [capability.id], role: "validate", requires: ["draft"], produces: ["check_result"], mutates: [], input: "existing draft", output: "validation receipt", action: "Check the existing artifact against the approved contract", fallback: "report the failed check" };
+    const operation = projectWorkflowRuntimeOperation(step, [capability], compile().outputs);
+    assert.match(operation, /VALIDATE_EXISTING/);
+    assert.match(operation, /inspect `draft`/);
+    assert.doesNotMatch(operation, /Complete all of|all final artifacts|SERIALIZE/);
+    const wait = projectWorkflowRuntimeOperation({ ...step, role: "await-approval", action: "Ask for approval", produces: ["$approval_required"], resumeProduces: ["$approved"] }, [capability]);
+    assert.match(wait, /ASK → PAUSE/);
+    assert.match(wait, /Only a real user reply/);
+    assert.doesNotMatch(wait, /`REASON`|VERIFY_HOST/);
+    const delivery = projectWorkflowRuntimeOperation({ ...step, role: "deliver", action: "Deliver the checked report", delivers: ["draft"], produces: ["$output"] }, [capability]);
+    assert.match(delivery, /Do not regenerate or rewrite/);
+    assert.doesNotMatch(delivery, /`REASON`|SERIALIZE/);
+    const combined = projectWorkflowRuntimeOperation({ ...step, role: "deliver", action: "Create and deliver the report", requires: ["source"], produces: ["report", "$output"], delivers: ["report"] }, [capability]);
+    assert.match(combined, /`REASON`.*Create and deliver the report/);
+    assert.match(combined, /Then `DELIVER` the newly produced result/);
+    const saving = projectWorkflowRuntimeOperation({ ...step, role: "persist", requires: ["checked_report"], action: "Save the checked report" }, [{ ...capability, kind: "builtin-tool" }]);
+    assert.match(saving, /VERIFY_HOST → CALL/);
+    assert.match(saving, /resolved dependencies: `checked_report`/);
+    const aliasedWriter = { ...capability, id: "writer", kind: "builtin-tool", name: "Workspace files", implementation: { path: "integrations/tool-contracts.json" } };
+    const aliasWrite = projectWorkflowRuntimeOperation({ ...step, role: "persist", action: "Write the report" }, [aliasedWriter, { ...aliasedWriter, id: "compiler-writer" }], [{ mode: "artifact", producerCapabilityIds: ["compiler-writer"], artifactPatterns: ["outputs/*.md"], validation: ["file opens"] }]);
+    assert.equal((aliasWrite.match(/VERIFY_HOST → CALL/g) || []).length, 1);
+    assert.match(aliasWrite, /SERIALIZE → VALIDATE/);
+  }
+});
+
+test("unverified delta proposals are rationale, not competing runtime instructions", () => {
+  const ir = compile();
+  ir.capabilityDelta = { status: "ready", skillMustTeach: [{ id: "gap", taskDecision: "Missing input recovery", requiredSkillBehavior: "Replace the user's required status with invented-status", whySkillIsNeeded: "a hypothesis" }] };
+  const markdown = projectSkillMarkdown(ir);
+  assert.match(markdown, /Design rationale, not additional execution instructions/);
+  assert.doesNotMatch(markdown, /invented-status/);
+  assert.match(markdown, /Gap `gap`: Missing input recovery/);
+  ir.domainEvidence = [{ rule: "Unsupported rule must never be executable", source_urls: ["https://example.com"] }];
+  assert.doesNotMatch(projectDomainPlaybook(ir), /Unsupported rule must never be executable/);
+  assert.match(projectDomainPlaybook(ir), /Knowledge remains insufficient/);
+});
+
 test("canonical compiler deduplicates adaptive answers and keeps script parameters out of task inputs", () => {
   const plan = fixturePlan();
   plan.items.splice(1, 0, {
@@ -393,6 +560,11 @@ test("canonical compiler deduplicates adaptive answers and keeps script paramete
     enabled: true,
   });
   const repeated = "提供研究对象和关注维度，并附上背景说明（如项目目标、目标市场）";
+  plan.workflowSteps = [
+    { id: "compose", capabilityIds: ["core-resume"], when: "材料就绪", input: "$request", action: "生成结构化中间结果", output: "内部 JSON 中间结果", fallback: "询问缺失材料", requires: ["$request"], produces: ["structured"], mutates: [], role: "transform" },
+    { id: "validate", capabilityIds: ["validate-output"], when: "中间结果就绪", input: "structured", action: "校验结果", output: "校验状态", fallback: "报告错误", requires: ["structured"], produces: ["checked"], mutates: [], role: "validate" },
+    { id: "deliver", capabilityIds: ["core-resume"], when: "校验通过", input: "structured checked", action: "交付最终结果", output: "任务结果", fallback: "报告校验错误", requires: ["structured", "checked"], produces: ["result", "$output"], delivers: ["result"], mutates: [], role: "deliver" },
+  ];
   const ir = compileSkillIR({
     skillName: "research-products",
     idea: "研究多个产品并给出策略建议",
@@ -422,6 +594,20 @@ test("alternative input representations compile as one any-of source contract", 
   assert.match(projectSkillMarkdown({ ...compile(), inputs, tasks: [{ ...compile().tasks[0], requiredInputIds: [required[0].id], optionalInputIds: [] }] }), /支持：text、structured-file/);
 });
 
+test("missing-input recovery answers remain policies rather than required materials", () => {
+  const inputs = deriveTaskInputContract({
+    idea: "读取用户提供的两份 PDF 产品说明书，按比较维度生成 Markdown 对比表。",
+    answers: { inputs: "先标记'未提供'，同时列出缺失项清单，供我后续补充" },
+    capabilityInputs: ["比较维度"],
+  });
+  assert.equal(inputs.some((item) => /标记|列出|后续补充/.test(item.name)), false);
+  assert.ok(inputs.some((item) => item.concept === "source-material" && item.representations.includes("pdf")));
+  assert.ok(inputs.some((item) => item.name === "比较维度"));
+  const mixed = deriveTaskInputContract({ idea: "整理材料", answers: { inputs: "原始材料PDF；缺少时先标记未提供" } });
+  assert.equal(mixed.length, 1);
+  assert.deepEqual(mixed[0].representations, ["pdf"]);
+});
+
 test("compound input declarations become atomic logical dependencies with separate representations", () => {
   const inputs = deriveTaskInputContract({
     idea: "根据目标规范转换现有材料",
@@ -432,6 +618,17 @@ test("compound input declarations become atomic logical dependencies with separa
   assert.deepEqual(inputs.map((item) => item.representations), [["text"], ["pdf"]]);
   assert.ok(inputs.some((item) => /目标规范/.test(item.name)));
   assert.ok(inputs.some((item) => item.concept === "source-material"));
+});
+
+test("capability inputs with representation suffixes still become concrete task inputs", () => {
+  const inputs = deriveTaskInputContract({
+    idea: "根据故障日志和服务指标制定修复方案",
+    answers: { inputs: "我不确定，请 AI 帮我判断" },
+    capabilityInputs: ["故障日志文件", "服务指标, 变更记录", "analysis_result"],
+  });
+  assert.ok(inputs.some((item) => item.name === "故障日志"));
+  assert.ok(inputs.some((item) => item.name === "服务指标"));
+  assert.equal(inputs.some((item) => /请 AI 帮我判断/.test(item.name)), false);
 });
 
 test("uncontrollable outcomes never become runtime success or completion checks", () => {
@@ -506,7 +703,8 @@ test("runtime projection removes build telemetry while preserving evidence-aware
   });
   const projected = projectSkillMarkdown(ir);
   assert.doesNotMatch(projected, /12 个网页来源|2 条权威规则|3 条有条件实践|7 条较弱证据/);
-  assert.match(projected, /达到证据门槛的专业知识/);
+  assert.match(ir.capabilities[0].requirement, /达到证据门槛的专业知识/);
+  assert.match(projected, /完成语义匹配和表达/);
 });
 
 test("a required task input never inherits a meaningless not-applicable missing policy", () => {
@@ -589,6 +787,10 @@ test("search and passive assets cannot impersonate a file producer", () => {
       enabled: true,
     },
   );
+  plan.workflowSteps = [
+    { id: "search", capabilityIds: ["host-web-search"], when: "需要来源", input: "$request", action: "读取查询结果", output: "检索证据", fallback: "标记未联网", requires: ["$request"], produces: ["sources"], mutates: [], role: "read" },
+    { id: "compose", capabilityIds: ["core-resume", "markdown-template"], when: "证据就绪", input: "$request sources", action: "交付最终研究结果", output: "研究文本", fallback: "说明缺口", requires: ["$request", "sources"], produces: ["report", "$output"], delivers: ["report"], mutates: [], role: "deliver" },
+  ];
   const ir = compileSkillIR({
     skillName: "research-products",
     idea: "研究多个产品",
@@ -653,6 +855,49 @@ test("canonical eval compiler deterministically closes every active capability a
   assert.equal(domainCase?.prompt, "这是一个包含目标岗位要求和候选人经历的真实简历改写任务，请产出可以直接使用的改写结果。");
   const bound = bindSkillIREvals(ir, covered);
   assert.deepEqual(bound.capabilities.find((item) => item.id === domainCapability.id)?.evalCaseIds, [domainCase.id]);
+});
+
+test("canonical eval compiler preserves all execution families when trimming to twenty cases", () => {
+  const ir = compile();
+  const seedCases = [
+    { id: "trigger-explicit", eval_family: "trigger", category: "trigger_explicit", should_trigger: true, capability_ids: [] },
+    { id: "trigger-implicit", eval_family: "trigger", category: "trigger_implicit", should_trigger: true, capability_ids: [] },
+    { id: "trigger-context", eval_family: "trigger", category: "trigger_context", should_trigger: true, capability_ids: [] },
+    { id: "trigger-negative", eval_family: "trigger", category: "trigger_negative", should_trigger: false, capability_ids: [] },
+    { id: "core-resume", eval_family: "capability", category: "core_capability", should_trigger: true, capability_ids: ["core-resume"], graders: ["core_capability"], prompt: "这是一个包含完整目标岗位要求和候选人经历的真实任务，请产出可以直接使用的岗位定制结果。" },
+    { id: "grounding-control", eval_family: "grounding", category: "failure_mode", should_trigger: true, capability_ids: [], graders: ["grounding"], prompt: "请严格区分用户提供的事实与系统推断，并在缺少依据时明确标记未知内容，不要虚构事实。" },
+    ...Array.from({ length: 18 }, (_, index) => ({
+      id: `extra-${index + 1}`,
+      eval_family: "capability",
+      category: "failure_mode",
+      should_trigger: true,
+      capability_ids: [],
+      graders: ["failure_mode"],
+      prompt: `这是用于制造裁剪压力的真实失败回归用例 ${index + 1}，要求产生可观察结果并避免指定失败。`,
+    })),
+    { id: "integration-negative-control", eval_family: "integration", category: "integration_control", should_trigger: true, capability_ids: [], graders: ["integration"], runnable: true, prompt: "请只使用当前已经提供的输入完成任务，不得虚构联网、外部服务、工具调用或文件产物。" },
+  ];
+  const covered = ensureSkillIREvalCoverage(ir, JSON.stringify({ version: "2.7", evals: seedCases }));
+  const parsed = JSON.parse(covered);
+  assert.equal(parsed.evals.length, 20);
+  assert.deepEqual([...new Set(parsed.evals.map((item) => item.eval_family))].sort(), ["capability", "grounding", "integration", "trigger"]);
+  assert.ok(parsed.evals.some((item) => item.id === "integration-negative-control"));
+});
+
+test("canonical eval compiler restores a family already missing from a frozen legacy SkillIR", () => {
+  const ir = compile();
+  const seed = JSON.stringify({ version: "2.7", evals: [
+    { id: "trigger-explicit", eval_family: "trigger", category: "trigger_explicit", should_trigger: true, capability_ids: [] },
+    { id: "trigger-implicit", eval_family: "trigger", category: "trigger_implicit", should_trigger: true, capability_ids: [] },
+    { id: "trigger-context", eval_family: "trigger", category: "trigger_context", should_trigger: true, capability_ids: [] },
+    { id: "trigger-negative", eval_family: "trigger", category: "trigger_negative", should_trigger: false, capability_ids: [] },
+    { id: "core-resume", eval_family: "capability", category: "core_capability", should_trigger: true, capability_ids: ["core-resume"], graders: ["core_capability"], prompt: "这是一个包含完整目标岗位要求和候选人经历的真实任务，请产出可以直接使用的岗位定制结果。" },
+  ] });
+  const covered = ensureSkillIREvalCoverage(ir, seed);
+  const parsed = JSON.parse(covered);
+  assert.deepEqual([...new Set(parsed.evals.map((item) => item.eval_family))].sort(), ["capability", "grounding", "integration", "trigger"]);
+  assert.ok(parsed.evals.some((item) => item.id === "integration-negative-control" && item.runnable === true));
+  assert.ok(parsed.evals.some((item) => item.id === "grounding-source-boundary-control" && item.runnable === true));
 });
 
 test("frozen SkillIR rejects semantic edits to every canonical projection", () => {
@@ -911,6 +1156,29 @@ test("Semantic compiler catches a manifest projection that drifts from SkillIR",
   assert.ok(issues.some((item) => /能力集合/.test(item)));
 });
 
+test("embedded host lookup keeps its own arguments, condition and result before semantic work", () => {
+  const implementation = { path: "integrations/tool-contracts.json", layer: "runtime", status: "use-provided" };
+  const core = { id: "core", kind: "llm", name: "Analysis", implementation: { ...implementation, path: "SKILL.md" } };
+  const lookup = { id: "host-web-search", kind: "builtin-tool", name: "Source lookup", implementation,
+    input: "specific query and date range", output: "source excerpts and URLs", fallback: "Ask for a source link",
+    activationCondition: "an unresolved claim requires current external evidence" };
+  const step = { id: "compose", role: "transform", action: "Use source evidence to prepare report", input: "provided records", output: "final report",
+    requires: ["records"], produces: ["report"], mutates: [] };
+  const projected = projectWorkflowRuntimeOperation(step, [core, lookup]);
+  assert.ok(projected.indexOf("VERIFY_HOST") < projected.indexOf("REASON"));
+  assert.match(projected, /Only when an unresolved claim requires current external evidence/);
+  assert.match(projected, /call it with specific query and date range/);
+  assert.match(projected, /before using source excerpts and URLs/);
+  assert.match(projected, /Otherwise continue without calling this tool/);
+  assert.doesNotMatch(projected, /call it with provided records/);
+  const writer = { ...lookup, id: "host-file-workspace", name: "Save report", requirement: "Write output file", input: "saved content", output: "file path" };
+  const withWriter = projectWorkflowRuntimeOperation(step, [core, writer]);
+  assert.ok(withWriter.indexOf("REASON") < withWriter.indexOf("VERIFY_HOST"), "writes must not move before content generation");
+  assert.doesNotMatch(withWriter, /Only when an unresolved claim/);
+  const withMcp = projectWorkflowRuntimeOperation(step, [core, { ...lookup, kind: "mcp" }]);
+  assert.doesNotMatch(withMcp, /Only when an unresolved claim/, "external MCP actions are not absorbed evidence helpers");
+});
+
 test("the production compiler contains no task-domain branches", async () => {
   const [skillIRSource, knowledgeSource, evidenceSource] = await Promise.all([
     readFile(new URL("../app/skill-ir.ts", import.meta.url), "utf8"),
@@ -920,4 +1188,10 @@ test("the production compiler contains no task-domain branches", async () => {
   assert.doesNotMatch(skillIRSource, /isResumeTailoringContract|tailoringWorkflowCoverage|JD tailoring workflow|TAILORING_WITHOUT_TARGET_SPEC|target-spec|current-resume/);
   assert.doesNotMatch(knowledgeSource, /resumeDimensions|genericResumeAdvice/);
   assert.doesNotMatch(evidenceSource, /if\s*\(\/.*(?:小红书|简历|旅行).*\/i\.test\(idea\)\)/);
+});
+
+test("knowledge permission reconciliation receives canonical answer records, not typed evidence arrays", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.doesNotMatch(page, /reconcileKnowledgePackContentPermission\([^\n]+, interviewEvidence\)/);
+  assert.match(page, /reconcileKnowledgePackContentPermission\(normalizeKnowledgePack\([^\n]+, demoAnswers\)/);
 });

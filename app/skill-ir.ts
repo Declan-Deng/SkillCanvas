@@ -1,12 +1,16 @@
 import {
-  confirmedAnswerEvidenceText,
+  authoritativeAnswerEvidenceText,
   hasContentPermissionConflict,
   reconcileContentPermissionText,
   resolveContentPermission,
+  normalizeAnswerEvidence,
   type ContentPermission,
 } from "./evidence-gates.ts";
 import { EMPTY_CAPABILITY_DELTA, type CapabilityDelta } from "./capability-delta.ts";
-import { assertWorkflowDag, normalizeWorkflowDagSteps, type WorkflowDagStep } from "./workflow-dag.ts";
+import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
+import { assertWorkflowDag, bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, isReadOnlyHostEvidence, normalizeWorkflowDagSteps, WORKFLOW_TERMINALS, type WorkflowDagStep } from "./workflow-dag.ts";
+import { hasUnscopedActionPermissionConflict, reconcileActionPermissionText, reconcileProjectedActionPermissionMarkdown } from "./action-permission.ts";
+import { confirmationCheckpoints, confirmationConflicts, negativeExampleStatement, requirementEvidence, type EvidenceMetadata } from "./user-evidence.ts";
 
 export type SkillIRProvenance = "user_explicit" | "user_example" | "source_grounded" | "domain_inferred" | "generator_default";
 export type SkillIRRuleType = "hard_constraint" | "heuristic" | "preference" | "proxy_metric";
@@ -14,7 +18,7 @@ export type SkillIRFailureCost = "low" | "medium" | "high";
 export type SkillIRCapabilityScope = "global" | "task-specific" | "conditional" | "optional";
 export type SkillIRCapabilityKind = "llm" | "reference" | "script" | "asset" | "builtin-tool" | "mcp" | "eval";
 
-export type SkillIRRequirement = {
+export type SkillIRRequirement = EvidenceMetadata & {
   id: string;
   statement: string;
   provenance: SkillIRProvenance;
@@ -83,6 +87,12 @@ export type SkillIR = {
     requiredCategories: string[];
     coveredCategories: string[];
     missingCategories: string[];
+    requiredGapIds?: string[];
+    coveredGapIds?: string[];
+    missingGapIds?: string[];
+    observedCategories?: string[];
+    verifiedRuleCount?: number;
+    advisoryRuleCount?: number;
   };
   tasks: Array<{
     id: string;
@@ -124,7 +134,7 @@ export type SkillIR = {
     validation: string[];
   }>;
   riskBranches: Array<{ id: string; condition: string; action: string; stopOrRedirect: string }>;
-  constraints: Array<{
+  constraints: Array<EvidenceMetadata & {
     id: string;
     statement: string;
     type: SkillIRRuleType;
@@ -191,21 +201,40 @@ export type SkillIR = {
   }>;
 };
 
-function contentPermissionFromIR(ir: SkillIR): ContentPermission {
-  const stored = ir.controlModel?.contentPermission;
-  if (stored && typeof stored === "object") {
-    const permission = stored as Partial<ContentPermission>;
-    if (typeof permission.sourceText === "string"
-      && Array.isArray(permission.sourceKeys)
-      && typeof permission.allowCreativeExpansion === "boolean"
-      && typeof permission.allowFactualCreation === "boolean"
-      && typeof permission.explicitRestriction === "boolean") return permission as ContentPermission;
+const REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES = ["decision_rules", "failure_modes", "edge_cases", "verification_methods"];
+
+/** Recompute sufficiency from canonical atoms. Caller-supplied coverage is a
+ * hint only; it cannot claim sufficient/not-required while the IR disagrees. */
+export function normalizeKnowledgeAssessment(value: SkillIR["knowledgeAssessment"] | undefined, domainEvidence: unknown[], knowledgeRequired = false, requiredGapIds: string[] = value?.requiredGapIds || []): SkillIR["knowledgeAssessment"] {
+  if (!knowledgeRequired && !requiredGapIds.length && (!value || value.status === "not-required") && domainEvidence.length === 0) {
+    return { status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [] };
   }
+  const requiredCategories = Array.from(new Set((value?.requiredCategories?.length ? value.requiredCategories : REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES)
+    .filter((category) => REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES.includes(category))));
+  const coverage = assessKnowledgeEvidence(domainEvidence, requiredGapIds, requiredCategories);
+  return {
+    status: coverage.missingCategories.length || coverage.missingGapIds.length || !requiredGapIds.length ? "insufficient" : "sufficient",
+    requiredCategories,
+    ...coverage,
+  };
+}
+
+function permissionEvidenceFingerprint(ir: SkillIR) {
+  const text = JSON.stringify(ir.requirements.map((item) => [item.id, item.source, item.provenance, item.statement, requirementEvidence(item)]));
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) hash = Math.imul(hash ^ text.charCodeAt(i), 16777619);
+  return (hash >>> 0).toString(16);
+}
+
+function contentPermissionFromIR(ir: SkillIR): ContentPermission {
+  const stored = ir.controlModel?.contentPermission as ContentPermission | undefined;
+  if (stored && Array.isArray(stored.negativeExamples)
+    && ir.controlModel.contentPermissionEvidenceFingerprint === permissionEvidenceFingerprint(ir)) return stored;
   const answers = Object.fromEntries(ir.requirements
-    .filter((item) => item.provenance === "user_explicit")
+    .filter((item) => item.provenance === "user_explicit" || item.provenance === "user_example")
     .map((item) => [
-      item.source.startsWith("interview.") ? item.source.slice("interview.".length) : item.source === "initial user goal" ? "__idea" : item.id,
-      item.statement,
+      requirementEvidence(item).polarity === "negative" ? `bad-example-${item.id}` : item.provenance === "user_example" ? `good-example-${item.id}` : item.source.startsWith("interview.") ? item.source.slice("interview.".length) : item.source === "initial user goal" ? "__idea" : item.id,
+      item.originalQuote || item.statement,
     ]));
   return resolveContentPermission(answers);
 }
@@ -213,6 +242,7 @@ function contentPermissionFromIR(ir: SkillIR): ContentPermission {
 /** Store the owner's content-transformation authority once in Canonical IR
  * and compile every runtime/eval projection against that same authority. */
 export function reconcileSkillIRContentPermission(ir: SkillIR, answers: Record<string, string>): SkillIR {
+  ir = reconcileSkillIRUserEvidence(ir);
   const permission = resolveContentPermission(answers);
   const visit = <T,>(value: T): T => {
     if (typeof value === "string") return reconcileContentPermissionText(value, permission) as T;
@@ -220,14 +250,146 @@ export function reconcileSkillIRContentPermission(ir: SkillIR, answers: Record<s
       .map((item) => visit(item))
       .filter((item) => typeof item !== "string" || Boolean(item.trim())) as T;
     if (value && typeof value === "object") {
-      return Object.fromEntries(Object.entries(value as Record<string, unknown>).map(([key, item]) => [key, visit(item)])) as T;
+      const record = value as Record<string, unknown>;
+      if (record.evidenceKind || record.originalQuote) return value;
+      return Object.fromEntries(Object.entries(record).map(([key, item]) => [key,
+        ["requirements", "domainEvidence", "scopeProvenance", "userEvidence", "confirmationCheckpoints"].includes(key) ? item : visit(item),
+      ])) as T;
     }
     return value;
   };
   const reconciled = permission.explicitRestriction ? ir : visit(ir);
   return {
     ...reconciled,
-    controlModel: { ...reconciled.controlModel, contentPermission: permission },
+    controlModel: { ...reconciled.controlModel, contentPermission: permission, contentPermissionEvidenceFingerprint: permissionEvidenceFingerprint(reconciled) },
+  };
+}
+
+/** Source-aware migration is also used after canonical mutations and reload.
+ * It cannot turn an old bad-example requirement into SHOULD by accident. */
+export function reconcileSkillIRUserEvidence(ir: SkillIR): SkillIR {
+  const requirements = ir.requirements.map((item): SkillIRRequirement => {
+    const evidence = requirementEvidence(item);
+    return evidence.evidenceKind === "negative_example"
+      ? { ...item, ...evidence, statement: negativeExampleStatement(evidence.originalQuote || ""), modality: "MUST", hard: true, ruleType: "hard_constraint", failureCost: "high" }
+      : { ...item, ...evidence };
+  });
+  const checkpoints = requirements.filter((item) => item.polarity === "positive"
+    && ["positive_requirement", "explicit_authorization"].includes(item.evidenceKind || ""))
+    .flatMap((item) => confirmationCheckpoints(item.originalQuote || item.statement, item.source));
+  return {
+    ...ir, requirements,
+    constraints: ir.constraints.map((constraint) => {
+      const requirement = requirements.find((item) => `constraint-${item.id}` === constraint.id);
+      return requirement ? { ...constraint, ...requirementEvidence(requirement), statement: requirement.statement, hard: requirement.hard, type: requirement.ruleType } : constraint;
+    }),
+    controlModel: { ...ir.controlModel, confirmationCheckpoints: checkpoints },
+  };
+}
+
+/** Exact-copy leakage is a deterministic blocker. Semantic/paraphrased
+ * violations are checked against the same quoted evidence by the critic and
+ * execution graders, not 'repaired' by mechanically negating user text. */
+export function auditUserEvidencePolarity(ir: SkillIR): string[] {
+  const issues: string[] = [];
+  const negative = ir.requirements.filter((item) => requirementEvidence(item).polarity === "negative");
+  const operations = [
+    ...(ir.runtimeContract?.workflow || []).map((step) => ({ id: `step:${step.id}`, text: step.action })),
+    ...ir.capabilities.filter((item) => item.kind !== "eval").map((item) => ({ id: `capability:${item.id}`, text: item.requirement })),
+    ...ir.riskBranches.map((item) => ({ id: `branch:${item.id}`, text: item.action })),
+    ...(ir.capabilityDelta?.skillMustTeach || []).map((item) => ({ id: `delta:${item.id}`, text: item.requiredSkillBehavior })),
+  ];
+  for (const item of negative) {
+    const evidence = requirementEvidence(item);
+    if (item.polarity !== "negative" || item.evidenceKind !== "negative_example" || !item.hard
+      || item.statement !== negativeExampleStatement(evidence.originalQuote || "")) issues.push(`[USER_EVIDENCE_POLARITY] ${item.id} 丢失了反例约束或原话`);
+    const quote = (evidence.originalQuote || "").replace(/\s+/g, "");
+    for (const operation of operations) {
+      // Match complete clauses, not shared words such as 'generate'. Safe
+      // avoidance clauses must explicitly refer to the unwanted behavior.
+      if (quote && operation.text.replace(/\s+/g, "").includes(quote)
+        && !/(?:避免|禁止重现|禁止出现|不得重现|防止|不要出现|检查是否(?:重现|出现)|do not reproduce|avoid reproducing)/i.test(operation.text)) {
+        issues.push(`[USER_EVIDENCE_POLARITY] ${operation.id} 把反例 ${item.id} 编译为执行行为；应修复该动作，不能删除用户证据`);
+      }
+    }
+  }
+  const checkpoints = ir.requirements.filter((item) => item.polarity === "positive"
+    && ["positive_requirement", "explicit_authorization"].includes(item.evidenceKind || ""))
+    .flatMap((item) => confirmationCheckpoints(item.originalQuote || item.statement, item.source));
+  for (const conflict of confirmationConflicts(checkpoints)) issues.push(`[USER_CONFIRMATION_CONFLICT] ${conflict.stage} 同时要求确认和无需确认；请用户澄清这一个时点，不要混同草稿与最终交付`);
+  for (const item of ir.requirements) {
+    if (item.provenance === "user_explicit" && requirementEvidence(item).polarity === "positive"
+      && !confirmationCheckpoints(item.originalQuote || item.statement).length
+      && /同时|at the same time/i.test(item.originalQuote || item.statement)
+      && hasUnscopedActionPermissionConflict(item.originalQuote || item.statement)) issues.push(`[USER_CONFIRMATION_CONFLICT] ${item.id} 同时要求先确认与无需确认，请用户澄清；不能自动重写原话`);
+  }
+  return issues;
+}
+
+/** Normalize only executable, compiler-owned permission fields. Requirements
+ * and identity text remain untouched because they may be direct owner input. */
+export function reconcileSkillIRActionPermissions(ir: SkillIR): SkillIR {
+  const reconcile = (value: string) => reconcileActionPermissionText(value);
+  const contentPermission = contentPermissionFromIR(ir);
+  const reconcileCombined = (parts: string[], value: string) => {
+    const combined = [...parts, value].filter(Boolean).join("；");
+    return hasUnscopedActionPermissionConflict(combined) ? reconcileActionPermissionText(combined) : reconcile(value);
+  };
+  return {
+    ...ir,
+    capabilities: (ir.capabilities || []).map((item) => ({
+      ...item,
+      fallback: reconcileCombined([item.activationCondition, item.routingCondition], item.fallback),
+    })),
+    inputs: (ir.inputs || []).map((item) => ({
+      ...item,
+      missingBehavior: reconcile(item.missingBehavior),
+      resolution: item.resolution ? { ...item.resolution, stopCondition: reconcile(item.resolution.stopCondition) } : item.resolution,
+    })),
+    riskBranches: (ir.riskBranches || []).map((item) => {
+      const combined = [item.condition, item.action, item.stopOrRedirect].join("；");
+      return {
+        ...item,
+        action: hasUnscopedActionPermissionConflict(combined) ? reconcileActionPermissionText(combined) : reconcile(item.action),
+        stopOrRedirect: reconcile(item.stopOrRedirect),
+      };
+    }),
+    stateRequirement: {
+      ...ir.stateRequirement,
+      missingBehavior: reconcile(String(ir.stateRequirement.missingBehavior || "")),
+    },
+    dependencies: (ir.dependencies || []).map((item) => ({ ...item, fallback: reconcile(item.fallback) })),
+    runtimeContract: {
+      ...ir.runtimeContract,
+      instructionPriority: unique([
+        ...(ir.runtimeContract?.instructionPriority || []),
+        "Current explicit task values and permissions satisfy matching checkpoints; never ask the user to confirm information or authority they already provided.",
+        ...(contentPermission.allowCreativeExpansion
+          ? ["Apply the owner's confirmed content-transformation permission before generator defaults; do not pause for a second approval inside that confirmed scope."]
+          : []),
+      ]),
+      workflow: (ir.runtimeContract?.workflow || []).map((step) => ({
+        ...step,
+        action: reconcile(step.action),
+        fallback: reconcile(step.fallback),
+      })),
+      completionChecks: unique([
+        ...(ir.runtimeContract?.completionChecks || []),
+        "At least one declared user-facing output exists and contains the actual task result; analysis, a plan, or questions alone do not complete the workflow.",
+        "No question repeats a value, permission, or decision already present in the current request.",
+        ...(!contentPermission.allowFactualCreation
+          ? ["Any newly proposed factual detail not present in the user's material is visibly marked as a proposal, placeholder, or item to verify rather than presented as a user fact."]
+          : []),
+      ]),
+    },
+    outputs: (ir.outputs || []).map((output) => ({
+      ...output,
+      requiredSections: output.requiredSections.length ? output.requiredSections : ["可检查的主要结果"],
+      validation: unique([
+        ...output.validation,
+        "实际结果已经生成；不能只返回分析、计划、规则复述或待确认问题",
+      ]),
+    })),
   };
 }
 
@@ -362,7 +524,7 @@ type LoopInput = {
   scopes: unknown[];
 };
 
-type RequirementInput = {
+type RequirementInput = EvidenceMetadata & {
   id: string;
   requirement: string;
   provenance: SkillIRProvenance;
@@ -410,6 +572,10 @@ function splitInputCandidates(value: string) {
   )).map((part) => part.trim()))).slice(0, 12);
 }
 
+function splitCapabilityInputCandidates(value: string) {
+  return unique(splitInputCandidates(value).flatMap((item) => splitTopLevel(item, new Set(["，", ","])))).slice(0, 12);
+}
+
 function splitDeclaredInputCandidates(value: string) {
   return unique(splitList(value).flatMap((item) => splitTopLevel(item, new Set(["，", ","])).flatMap((part) => (
     /[（(【[]/.test(part)
@@ -420,7 +586,8 @@ function splitDeclaredInputCandidates(value: string) {
 
 export type DerivedTaskInput = SkillIR["inputs"][number];
 
-const VAGUE_INPUT_STRATEGY = /^(?:通常|一般|有时|可能)?(?:只有)?(?:一句|简单想法)|会提供(?:文件|链接|资料|案例)|需要\s*AI\s*(?:主动)?追问|有固定模板或数据|不确定|请\s*AI\s*判断/i;
+const VAGUE_INPUT_STRATEGY = /^(?:通常|一般|有时|可能)?(?:只有)?(?:一句|简单想法)|会提供(?:文件|链接|资料|案例)|需要\s*AI\s*(?:主动)?追问|有固定模板或数据|(?:我)?不确定|请\s*AI\s*(?:帮我)?判断/i;
+const INPUT_HANDLING_POLICY = /(?:先|同时|继续|直接).{0,12}(?:标记|询问|列出|请求|处理|生成|补充)|(?:缺少|缺失|不足|混乱|无法读取).{0,24}(?:时|则|先|标记)|how.{0,16}(?:handle|recover)/i;
 const INPUT_REPRESENTATION_OPTION = /^(?:纯文本(?:粘贴)?|文本粘贴|(?:上传|提供)?\s*(?:PDF|Word|DOCX|Excel|XLSX|CSV|JSON|Markdown|MD|图片|截图|扫描件|音频|录音|视频|文档|文件)|结构化(?:表格|文件|数据)(?:（[^）]+）|\([^)]*\))?|网页链接|URL|邮件|聊天记录)(?:（[^）]+）|\([^)]*\))?$/i;
 
 function inputRepresentations(value: string) {
@@ -473,7 +640,11 @@ function inputMatchesConcept(value: string, concept: string) {
 }
 
 function normalizedInputName(value: string) {
-  return value.replace(/完整|具体|明确|相关|用户提供的?|待处理的?|当前的?/g, "").replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "").toLowerCase();
+  return value
+    .replace(/完整|具体|明确|相关|用户提供的?|待处理的?|当前的?/g, "")
+    .replace(/(?:文本|内容|资料|材料|文件|文档)$/i, "")
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "")
+    .toLowerCase();
 }
 
 function inputNamesOverlap(left: string, right: string) {
@@ -546,7 +717,7 @@ export function deriveTaskInputContract(input: {
   const answers = input.answers || {};
   const description = descriptionFromSkill(input.skillText || "");
   const capabilityInputs = input.capabilityInputs || [];
-  const explicitInputPolicy = confirmedAnswerEvidenceText(answers);
+  const explicitInputPolicy = authoritativeAnswerEvidenceText(answers);
   const declaredInputEvidence = `${input.idea}\n${answers.inputs || ""}\n${answers.workflow || ""}\n${answers["output-format"] || ""}\n${description}`;
   const semanticInputEvidence = `${input.idea}\n${answers.workflow || ""}\n${answers["output-format"] || ""}\n${description}`;
   const specs = new Map<string, { name: string; required: boolean; representations: string[] }>();
@@ -561,7 +732,12 @@ export function deriveTaskInputContract(input: {
     });
   };
 
-  const declaredAnswerInputs = splitDeclaredInputCandidates(answers.inputs || "").filter((value) => value.length >= 2 && !VAGUE_INPUT_STRATEGY.test(value));
+  // Adaptive "input" questions may ask for a missing-material strategy, not
+  // a list of documents. Keep that answer as a requirement, never split its
+  // clauses into fictitious mandatory inputs.
+  const declaredAnswerInputs = splitDeclaredInputCandidates(answers.inputs || "").filter((value) => value.length >= 2
+    && !VAGUE_INPUT_STRATEGY.test(value) && !INPUT_HANDLING_POLICY.test(value)
+    && !/^(?:供|以便|方便).{0,20}(?:补充|确认|处理)|^(?:继续)?(?:标记|列出|询问|请求)/.test(value));
   const representationOptions = declaredAnswerInputs.filter((value) => INPUT_REPRESENTATION_OPTION.test(value));
   const mergeRepresentationOptions = representationOptions.length >= 2 && representationOptions.length === declaredAnswerInputs.length;
   if (mergeRepresentationOptions) {
@@ -574,17 +750,18 @@ export function deriveTaskInputContract(input: {
     add(concept, definition?.name || semanticName, true, inputRepresentations(value));
   });
 
-  capabilityInputs.flatMap(splitInputCandidates).filter((value) => {
+  capabilityInputs.flatMap(splitCapabilityInputCandidates).filter((value) => {
     if (value.length < 2 || value.length > 90 || VAGUE_INPUT_STRATEGY.test(value)) return false;
     const concept = conceptForInput(value);
     if (!concept.startsWith("custom-") && inputMatchesConcept(declaredInputEvidence, concept)) return true;
-    const candidate = normalizedInputName(value);
+    const candidate = normalizedInputName(semanticInputName(value));
     const evidence = normalizedInputName(declaredInputEvidence);
     return candidate.length >= 2 && evidence.includes(candidate);
   }).forEach((value) => {
-    const matchedConcepts = INPUT_CONCEPTS.filter((item) => item.pattern.test(value));
+    const semanticName = semanticInputName(value);
+    const matchedConcepts = INPUT_CONCEPTS.filter((item) => item.pattern.test(semanticName));
     if (matchedConcepts.length) matchedConcepts.forEach((item) => add(item.concept, item.name, item.requiredByDefault));
-    else add(conceptForInput(value), value, true);
+    else add(conceptForInput(semanticName), semanticName, true);
   });
 
   INPUT_CONCEPTS.filter((item) => item.pattern.test(semanticInputEvidence)).forEach((item) => {
@@ -594,6 +771,13 @@ export function deriveTaskInputContract(input: {
     add(item.concept, item.name, required);
   });
 
+  // Carry file representations from explicit read/parse clauses onto the
+  // source input. Output-format mentions must not create runtime inputs.
+  for (const match of input.idea.matchAll(/(?:读取|解析|导入|上传|用户提供的?|\b(?:read|parse|import|upload)\b)([^，,。；;\n]{2,80})/gi)) {
+    const source = match[1].split(/生成|输出|导出|交付|\b(?:generate|export|output|deliver)\b/i)[0];
+    const representations = inputRepresentations(source);
+    if (representations.length) add("source-material", "完成任务所依据的原始材料", true, representations);
+  }
   if (!specs.size) add("current-request", "当前任务说明与完成任务所需材料", true);
   const rawMissingBehavior = (input.missingBehavior || "").trim();
   const missingBehavior = /^(?:不适用|无|没有|none|n\/?a|not applicable)[。.!！]?$/i.test(rawMissingBehavior)
@@ -622,7 +806,7 @@ export function deriveTaskInputContract(input: {
  * a value may be inferred; otherwise the safe deterministic branch is ask or
  * continue-without. */
 export function reconcileSkillIRInputResolutions(ir: SkillIR, answers: Record<string, string>) {
-  const explicitPolicy = Object.values(answers).join("\n");
+  const explicitPolicy = authoritativeAnswerEvidenceText(answers);
   return {
     ...ir,
     inputs: ir.inputs.map((taskInput) => {
@@ -818,6 +1002,8 @@ export function compileSkillIR(input: {
 }): SkillIR {
   const contentPermission = resolveContentPermission(input.answers);
   const domainEvidence = Array.isArray(input.domainEvidence) ? input.domainEvidence : [];
+  const capabilityDelta = input.capabilityDelta || EMPTY_CAPABILITY_DELTA;
+  const knowledgeAssessment = normalizeKnowledgeAssessment(input.knowledgeAssessment, domainEvidence, capabilityDelta.skillMustTeach.length > 0, capabilityDelta.skillMustTeach.map((gap) => gap.id));
   const capabilities: SkillIRCapability[] = input.plan.items.filter(activeCapability).map((item) => {
     const necessity = item.necessity ? { ...item.necessity, reason: item.reason || item.deterministicAdvantage || "由资源必要性分析决定" } : fallbackNecessity(item);
     const scope = item.scope || (item.kind === "llm" ? "task-specific" : /当|如果|若|when|if/i.test(item.activationCondition || item.routingCondition) ? "conditional" : "task-specific");
@@ -848,18 +1034,21 @@ export function compileSkillIR(input: {
   const capabilityIds = new Set(capabilities.map((item) => item.id));
   const semanticCapabilityIds = capabilities.filter((item) => item.kind === "llm").map((item) => item.id);
   const seenRequirements = new Set<string>();
-  const mappedRequirements = input.requirements.filter((item) => {
-    const key = item.requirement.replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "").toLowerCase();
+  const mappedRequirements = input.requirements.map((item) => ({ ...item, ...requirementEvidence(item) })).filter((item) => {
+    if (item.evidenceKind === "material") return false;
+    const key = `${item.polarity || "positive"}:${item.requirement.replace(/[^a-z0-9\u4e00-\u9fff]+/gi, "").toLowerCase()}`;
     if (!key || seenRequirements.has(key)) return false;
     seenRequirements.add(key);
     return true;
   }).map((item) => {
     const mappedCapabilityIds = mapRequirementToCapabilities(item, capabilities);
-    const ruleType = ruleTypeFor(item);
-    const groundedHard = item.hard && ["user_explicit", "source_grounded"].includes(item.provenance) && ruleType === "hard_constraint";
+    const negative = item.evidenceKind === "negative_example";
+    const ruleType = negative ? "hard_constraint" as const : ruleTypeFor(item);
+    const groundedHard = negative || item.hard && ["user_explicit", "source_grounded"].includes(item.provenance) && ruleType === "hard_constraint";
     return {
       id: item.id,
-      statement: item.requirement,
+      ...requirementEvidence(item),
+      statement: negative ? negativeExampleStatement(item.originalQuote || item.requirement) : item.requirement,
       provenance: item.provenance,
       source: item.source,
       confidence: item.provenance === "user_explicit" || item.provenance === "user_example" ? 1 : item.provenance === "source_grounded" ? 0.95 : item.provenance === "domain_inferred" ? 0.7 : 0.4,
@@ -901,25 +1090,23 @@ export function compileSkillIR(input: {
     ...input.plan.outputContract.validation,
   ]).filter((item) => !isDeclaredUncontrollable(item, outcomeModel.uncontrollableOutcomes));
   const declaredWorkflow = normalizeWorkflowDagSteps(input.plan.workflowSteps);
-  const fallbackWorkflow = capabilities.filter((item) => item.kind !== "eval").map((item, index, all) => ({
-    id: `step-${index + 1}-${item.id}`,
-    capabilityIds: [item.id],
-    when: item.activationCondition || item.routingCondition,
-    input: item.input,
-    action: item.purpose || item.requirement,
-    output: item.output,
-    fallback: item.fallback,
-    requires: index === 0 ? ["$request"] : [`capability:${all[index - 1].id}:output`],
-    produces: [`capability:${item.id}:output`],
-    mutates: [],
-  }));
-  const workflowSource = declaredWorkflow.length ? declaredWorkflow.map((step) => ({
+  const workflowSource = bindWorkflowCapabilities(declaredWorkflow.map((step) => ({
     ...step,
     capabilityIds: step.capabilityIds.filter((id) => capabilityIds.has(id)),
-  })) : fallbackWorkflow;
+  })), capabilities.filter((item) => item.kind !== "eval"));
   const ownerlessStep = workflowSource.find((step) => step.capabilityIds.length === 0);
   if (ownerlessStep) throw new Error(`WORKFLOW_DAG_INVALID: Workflow step ${ownerlessStep.id} 没有可执行的 capability owner`);
-  const workflow = assertWorkflowDag(workflowSource, ["$request", "$source", "$confirmed", ...inputs.map((item) => `input:${item.id}`)]);
+  if (!workflowSource.length) throw new Error("WORKFLOW_DAG_INVALID: Workflow 没有可执行步骤");
+  const workflowInitialInputs = ["$request", "$source", ...inputs.map((item) => `input:${item.id}`)];
+  const closedWorkflow = closeWorkflowDagTerminals(workflowSource, workflowInitialInputs);
+  const workflow = assertWorkflowDag(
+    closedWorkflow,
+    workflowInitialInputs,
+    {
+      terminalOutputs: Object.values(WORKFLOW_TERMINALS),
+      requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed],
+    },
+  );
   const ir: SkillIR = {
     schemaVersion: "1.0",
     compiler: "skillcanvas",
@@ -931,13 +1118,8 @@ export function compileSkillIR(input: {
       description: input.description?.trim() || `用于用户要求“${input.idea.trim()}”或提供相关材料继续处理时；执行已确认工作流并交付可检查结果。`,
     },
     outcomeModel,
-    capabilityDelta: input.capabilityDelta || EMPTY_CAPABILITY_DELTA,
-    knowledgeAssessment: input.knowledgeAssessment || {
-      status: "not-required",
-      requiredCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"],
-      coveredCategories: [],
-      missingCategories: [],
-    },
+    capabilityDelta,
+    knowledgeAssessment,
     tasks: [{
       id: taskId,
       intent: outcomeModel.ultimateGoal || input.idea.trim(),
@@ -963,6 +1145,7 @@ export function compileSkillIR(input: {
     riskBranches: input.plan.riskBranches,
     constraints: requirements.map((item) => ({
       id: `constraint-${item.id}`,
+      ...requirementEvidence(item),
       statement: item.statement,
       type: item.ruleType,
       provenance: item.provenance,
@@ -1033,6 +1216,7 @@ export function compileSkillIR(input: {
       escalationConditions: input.loop.escalationConditions,
       scopes: input.loop.scopes,
       contentPermission,
+      userEvidence: normalizeAnswerEvidence(input.answers).filter((item) => item.evidenceClass !== "session_internal" && item.evidenceClass !== "preview_fixture"),
     },
     traceability: [],
   };
@@ -1082,6 +1266,53 @@ export function projectCapabilityRuntimeOperation(capability: SkillIRCapability,
   return `${operation}${artifactProtocol} If unavailable or invalid: ${unavailable}.`;
 }
 
+/** A capability describes availability, not permission to repeat the whole
+ * task at every node. Only this node's canonical contract is executable. */
+export function projectWorkflowRuntimeOperation(step: WorkflowDagStep, capabilities: SkillIRCapability[], outputs: SkillIR["outputs"] = []) {
+  const inputs = step.requires.map((token) => `\`${token}\``).join(", ") || "the declared step inputs";
+  const products = step.produces.map((token) => `\`${token}\``).join(", ") || "the declared step result";
+  if (step.role === "await-input" || step.role === "await-approval") {
+    return `\`ASK → PAUSE\` — ${step.action}; use ${inputs}. Return ${products} and stop this branch. Only a real user reply may create ${(step.resumeProduces || []).map((token) => `\`${token}\``).join(", ") || "the declared resume state"}; never infer confirmation, call downstream tools, or generate the final deliverable while waiting.`;
+  }
+  const createsDelivery = step.role === "deliver" && (step.delivers || []).some((token) => step.produces.includes(token) && !step.requires.includes(token));
+  if (step.role === "deliver" && !createsDelivery) {
+    return `\`DELIVER\` — ${step.action}; hand off only the existing ${(step.delivers || []).map((token) => `\`${token}\``).join(", ") || inputs} after the declared checks pass. Do not regenerate or rewrite validated content at delivery. Mark ${products} only after the handoff succeeds.`;
+  }
+  // Planner aliases and the compiler's host fallback can bind the same host
+  // tool to one node. They declare availability twice, not two writes.
+  const groups = new Map<string, SkillIRCapability[]>();
+  capabilities.forEach((capability) => {
+    const key = capability.kind === "builtin-tool" && capability.name && capability.implementation.path
+      ? JSON.stringify([capability.kind, capability.name, capability.implementation.path, capability.connection || null])
+      : capability.id;
+    groups.set(key, [...(groups.get(key) || []), capability]);
+  });
+  const hasSemanticOwner = capabilities.some((capability) => capability.kind === "llm");
+  // Read evidence before reasoning over it. An absorbed lookup keeps its own
+  // input/output and activation contract; it must not receive an instruction
+  // to generate the whole task's final artifact as its tool arguments.
+  // Only read-only host evidence may move ahead of reasoning. Do not move
+  // file writes or external MCP actions before the content they depend on.
+  const operations = [...groups.values()].sort(([a], [b]) => Number(isReadOnlyHostEvidence(b)) - Number(isReadOnlyHostEvidence(a))).map(([capability, ...aliases]) => {
+    const embeddedTool = hasSemanticOwner && isReadOnlyHostEvidence(capability);
+    const operation = projectCapabilityRuntimeOperation({
+    ...capability,
+    requirement: step.action,
+    purpose: step.action,
+    input: embeddedTool ? `${capability.input}; resolve actual arguments from ${inputs}, following this step's action` : `${step.input || inputs} (resolved dependencies: ${inputs})`,
+    output: embeddedTool ? `${capability.output}; use the returned evidence in this step before producing ${products}` : `${step.output || products} (step products: ${products})`,
+    fallback: embeddedTool ? capability.fallback : step.fallback,
+  }, step.role === "persist" || createsDelivery ? outputs.map((output) => aliases.some((alias) => output.producerCapabilityIds.includes(alias.id))
+    ? { ...output, producerCapabilityIds: [...output.producerCapabilityIds, capability.id] } : output) : []);
+    return embeddedTool ? `Only when ${capability.activationCondition || capability.routingCondition || "this step explicitly requires the tool"}: ${operation} Otherwise continue without calling this tool.` : operation;
+  });
+  const boundary = step.role === "validate"
+    ? `\`VALIDATE_EXISTING\` — inspect ${inputs}; report only ${products}. Do not recreate the task output or silently fix it during validation; route failures through the declared recovery branch. `
+    : `Execute only this step; consume ${inputs} and produce ${products}. `;
+  return boundary + (operations.join(" ") || `\`REASON\` — ${step.action}. If unavailable: ${step.fallback}.`)
+    + (createsDelivery ? " Then `DELIVER` the newly produced result after the declared completion checks pass; do not claim completion before it exists." : "");
+}
+
 /**
  * Deterministic runtime projection. This is intentionally a renderer, not a
  * repair pass: every behavioral statement comes from Canonical SkillIR.
@@ -1091,7 +1322,10 @@ export function projectSkillMarkdown(ir: SkillIR) {
   const task = ir.tasks[0];
   const requiredInputs = (task?.requiredInputIds || []).map((id) => byInputId.get(id)).filter((item): item is SkillIR["inputs"][number] => Boolean(item));
   const optionalInputs = (task?.optionalInputIds || []).map((id) => byInputId.get(id)).filter((item): item is SkillIR["inputs"][number] => Boolean(item));
-  const requirements = ir.requirements.filter((item) => item.provenance !== "generator_default");
+  const requirements = ir.requirements.filter((item) => item.provenance !== "generator_default" && requirementEvidence(item).polarity !== "negative" && item.evidenceKind !== "material");
+  const negativeExamples = ir.requirements.filter((item) => requirementEvidence(item).polarity === "negative");
+  const checkpoints = requirements.filter((item) => item.provenance === "user_explicit")
+    .flatMap((item) => confirmationCheckpoints(item.originalQuote || item.statement, item.source));
   const runtimeResources = ir.capabilities.filter((item) => item.implementation.layer === "runtime" && item.implementation.path && item.implementation.path !== "SKILL.md");
   const output = ir.outputs[0];
   const workflow = ir.runtimeContract?.workflow || [];
@@ -1117,18 +1351,23 @@ export function projectSkillMarkdown(ir: SkillIR) {
     `## Goal\n\n${ir.identity.stableGoal}\n\nControllable outcomes:\n${markdownList(ir.outcomeModel.controllableOutcomes, ir.identity.intent)}\n\nDo not promise uncontrollable outcomes:\n${markdownList(ir.outcomeModel.uncontrollableOutcomes, "No additional external outcome is claimed.")}`,
     `## When to use\n\n${markdownList(ir.tasks.map((item) => item.activationCondition), ir.identity.intent)}`,
     `## Instruction priority\n\n${priority.map((item, index) => `${index + 1}. ${item}`).join("\n")}`,
-    ir.capabilityDelta?.skillMustTeach?.length ? `## Skill-specific capability delta\n\nTeach only behavior the bare model does not reliably provide:\n${markdownList(ir.capabilityDelta.skillMustTeach.map((item) => `**${item.taskDecision}:** ${item.requiredSkillBehavior} (${item.whySkillIsNeeded})`), "No defensible delta was identified; do not pad this Skill with generic advice.")}` : "",
-    ir.knowledgeAssessment?.status === "insufficient" ? `## Knowledge sufficiency\n\n- Status: \`insufficient\`\n- Missing required categories: ${ir.knowledgeAssessment.missingCategories.join(", ") || "unknown"}\n- Do not substitute generic best practices or model common sense for missing Decision Rules, Failure Modes, Edge Cases, or Verification Methods. Keep unsupported decisions visibly unknown.` : "",
+    ir.capabilityDelta?.skillMustTeach?.length ? `## Skill-specific capability delta\n\nDesign rationale, not additional execution instructions or permission. Execute the canonical workflow and confirmed requirements below; research hypotheses must not change user-approved labels, recovery behavior or confirmation timing.\n${markdownList(ir.capabilityDelta.skillMustTeach.map((item) => `Gap \`${item.id}\`: ${item.taskDecision}`), "No defensible delta was identified; do not pad this Skill with generic advice.")}` : "",
+    ir.knowledgeAssessment?.status === "insufficient" ? `## Knowledge sufficiency\n\n- Status: \`insufficient\`\n- Missing required categories: ${ir.knowledgeAssessment.missingCategories.join(", ") || "none"}\n- Unresolved capability gaps: ${ir.knowledgeAssessment.missingGapIds?.join(", ") || "binding not verified"}\n- Do not substitute generic best practices or model common sense for missing Decision Rules, Failure Modes, Edge Cases, or Verification Methods. Keep unsupported decisions visibly unknown.` : "",
     `## Inputs\n\n### Required\n\n${markdownList(requiredInputs.map(projectedInputName), "Current task request")}\n\n### Optional\n\n${markdownList(optionalInputs.map(projectedInputName), "No optional inputs")}`,
     `## Input resolution contract\n\n${markdownList(ir.inputs.map((item) => item.resolution
       ? `**${item.name}:** ${item.missingBehavior} (mode: \`${item.resolution.mode}\`; authority: \`${item.resolution.authority}\`)`
       : `**${item.name}:** INVALID — resolution contract is missing`), "Use only the current request")}`,
     `## Workflow\n\n${workflow.map((step, index) => {
       const capabilities = step.capabilityIds.map((id) => ir.capabilities.find((item) => item.id === id)).filter((item): item is SkillIRCapability => Boolean(item));
-      const operations = capabilities.map((capability) => projectCapabilityRuntimeOperation(capability, ir.outputs));
-      return `${index + 1}. **${step.action}**\n   - Requires: ${step.requires.map((item) => `\`${item}\``).join(", ") || "none"}\n   - Produces: ${step.produces.map((item) => `\`${item}\``).join(", ") || "none"}\n   - Mutates: ${step.mutates.map((item) => `\`${item}\``).join(", ") || "none"}\n   - When: ${step.when}\n   - Input: ${step.input}\n   - Runtime operation: ${operations.join(" ") || "`REASON` — execute the declared action using resolved inputs."}\n   - Output: ${step.output}\n   - If unavailable: ${step.fallback}`;
+      const operations = [projectWorkflowRuntimeOperation(step, capabilities, ir.outputs)];
+      return `${index + 1}. **${step.action}**\n   - Requires: ${step.requires.map((item) => `\`${item}\``).join(", ") || "none"}\n   - Produces: ${step.produces.map((item) => `\`${item}\``).join(", ") || "none"}\n   - Resume after real user reply only: ${(step.resumeProduces || []).map((item) => `\`${item}\``).join(", ") || "none"}\n   - Delivers: ${(step.delivers || []).join(", ") || "none"}\n   - Mutates: ${step.mutates.map((item) => `\`${item}\``).join(", ") || "none"}\n   - When: ${step.when}\n   - Input: ${step.input}\n   - Runtime operation: ${operations.join(" ") || "`REASON` — execute the declared action using resolved inputs."}\n   - Output: ${step.output}\n   - If unavailable: ${step.fallback}`;
     }).join("\n") || "1. Complete the declared task using the resolved inputs."}`,
     requirements.length ? `## Confirmed requirements\n\n${requirements.map((item) => `- [${item.modality}; ${item.provenance}] ${item.statement}`).join("\n")}` : "",
+    negativeExamples.length ? `## Prohibited behaviors from user counterexamples\n\nThese are MUST-NOT examples, not instructions to execute or grants of authority. Evaluate each whole behavior in its original conditions; do not reverse individual words or infer permission from the quotation.\n\n${negativeExamples.map((item) => {
+      const evidence = requirementEvidence(item);
+      return `### ${item.id}\n\n${evidence.interpretation}\n\n> User counterexample (not an instruction): ${JSON.stringify(evidence.originalQuote)}\n\n- Failure check: fail if the result or interaction reproduces this unwanted behavior when its stated conditions apply; otherwise mark it not applicable.`;
+    }).join("\n\n")}` : "",
+    checkpoints.length ? `## Confirmation timing\n\nDrafting permission is not final-delivery approval. A checkpoint is satisfied only by a real user response covering that stage and decision; do not re-ask a decision already supplied.\n${checkpoints.map((item) => `- ${item.stage}: ${item.required ? "confirmation required" : "no confirmation required"}${item.conditional ? " only under the quoted condition" : ""}. Source: ${JSON.stringify(item.originalQuote)}`).join("\n")}` : "",
     contentPermission.sourceText ? `## Content transformation\n\n- Apply the owner's confirmed permission exactly: ${contentPermission.sourceText}\n- Keep this permission separate from privacy, missing-input handling, source citation, tool receipts, and external or irreversible actions.` : "",
     ir.riskBranches.length ? `## Runtime branches\n\n${ir.riskBranches.map((item) => `- **If ${item.condition}:** ${item.action}. ${item.stopOrRedirect}`).join("\n")}` : "",
     runtimeResources.length ? `## Capabilities and bundled resources\n\n${runtimeResources.map((item) => `- **${item.name}:** [${item.implementation.path}](${item.implementation.path}) — use when ${item.activationCondition}. Fallback: ${item.fallback}`).join("\n")}` : "",
@@ -1136,7 +1375,8 @@ export function projectSkillMarkdown(ir: SkillIR) {
     output ? `## Output contract\n\n- Mode: \`${output.mode}\`\n- Format: ${output.name}\n- Required sections:\n${markdownList(output.requiredSections, "Primary result")}\n- Artifact patterns:\n${markdownList(output.artifactPatterns.map((item) => `\`${item}\``), "No file artifact promised")}` : "",
     `## Completion checks\n\nRun these checks internally and deliver the result first. Surface a check only when failure changes what the user can safely use.\n\n${markdownList(checks, "The requested result is complete and usable")}`,
   ];
-  return sections.filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+  const markdown = sections.filter(Boolean).join("\n\n").replace(/\n{3,}/g, "\n\n").trim() + "\n";
+  return reconcileProjectedActionPermissionMarkdown(markdown);
 }
 
 export function projectToolContracts(ir: SkillIR) {
@@ -1193,21 +1433,43 @@ export function projectOutputReference(ir: SkillIR) {
 }
 
 export function projectDomainPlaybook(ir: SkillIR) {
-  const rules = (ir.domainEvidence || []).filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
-  if (!rules.length) return "";
+  const candidates = (ir.domainEvidence || []).filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === "object");
+  if (!candidates.length) return "";
+  const rules = candidates.filter(hasVerifiedKnowledgeSupport);
+  if (!rules.length) return "# Domain playbook\n\nNo rule has current clause-level source verification. Knowledge remains insufficient; do not execute unverified research proposals. Follow the confirmed task contract.\n";
   return `# Domain playbook\n\nCanonical source: \`evals/skill-ir.json\` (${skillIRDigest(ir)}). Runtime strength is determined by evidence type and confidence; advisory evidence must not become a hard constraint.\n\n${rules.map((item, index) => {
     const urls = Array.isArray(item.source_urls) ? item.source_urls.map(String).filter(Boolean) : [];
     const evalCaseIds = Array.isArray(item.eval_case_ids) ? item.eval_case_ids.map(String).filter(Boolean) : [];
-    return `## ${index + 1}. ${String(item.rule || item.knowledge || "Domain decision rule")}\n\n- Required category: \`${String(item.category || "decision_rules")}\`\n- Evidence type: \`${String(item.evidence_type || "unknown")}\`\n- Confidence: ${String(item.confidence ?? "unknown")}\n- Applies when: ${String(item.applies_when || "the declared condition is satisfied")}\n- Exception: ${String(item.exception || "none declared")}\n- Runtime strength: ${item.hard_constraint_allowed === true ? "eligible for enforcement when no higher-priority user instruction conflicts" : "advisory only"}\n- Sources: ${urls.length ? urls.join(", ") : "no canonical URL recorded"}\n- Eval failure evidence: ${evalCaseIds.length ? evalCaseIds.join(", ") : "none"}`;
+    const strength = item.hard_constraint_allowed === true
+      ? "eligible for enforcement when no higher-priority user instruction conflicts"
+      : item.application_mode === "conditional"
+        ? "conditional practice; apply only when the stated condition and required tool are satisfied"
+        : "advisory only; not an execution requirement, completion gate, or closed capability gap";
+    return `## ${index + 1}. ${String(item.decision || "Domain decision")}\n\n- Runtime strength: ${strength}\n- Source mechanism: ${String(item.knowledge || "")}\n- Proposed action (subject to runtime strength): ${String(item.rule || "")}\n- Required category: \`${String(item.category || "decision_rules")}\`\n- Evidence type: \`${String(item.evidence_type || "unknown")}\`\n- Confidence: ${String(item.confidence ?? "unknown")}\n- Applies when: ${String(item.applies_when || "the declared condition is satisfied")}\n- Exception: ${String(item.exception || "none declared")}\n- Capability gaps: ${Array.isArray(item.gap_ids) ? item.gap_ids.join(", ") : "unverified"}\n- Decision: ${String(item.decision || "unverified")}\n- Source support: ${JSON.stringify(item.source_support || [])}\n- Verification: ${hasVerifiedKnowledgeSupport(item) ? "source and delta reviewed" : "unverified; not a closed gap"}\n- Sources: ${urls.length ? urls.join(", ") : "no canonical URL recorded"}\n- Eval failure evidence: ${evalCaseIds.length ? evalCaseIds.join(", ") : "none"}`;
   }).join("\n\n")}\n`;
 }
 
 export function projectAgentMetadata(ir: SkillIR) {
   const displayName = ir.identity.skillName.split("-").filter(Boolean).map((item) => item[0]?.toUpperCase() + item.slice(1)).join(" ");
-  return `interface:\n  display_name: ${yamlString(displayName)}\n  short_description: ${yamlString(ir.identity.summary.slice(0, 64))}\n  default_prompt: ${yamlString(`Use $${ir.identity.skillName} to ${ir.identity.intent}.`)}`;
+  const rawSummary = ir.identity.summary.replace(/\s+/g, " ").trim();
+  const clippedSummary = rawSummary.length <= 64
+    ? rawSummary
+    : `${rawSummary.slice(0, 61).replace(/[，、；:：,.!?！？\s]+[^，、；:：,.!?！？\s]*$/, "").trim() || rawSummary.slice(0, 61).trim()}…`;
+  return `interface:\n  display_name: ${yamlString(displayName)}\n  short_description: ${yamlString(clippedSummary)}\n  default_prompt: ${yamlString(`Use $${ir.identity.skillName} to ${ir.identity.intent}.`)}`;
+}
+
+export function evalCaseIsRunnable(item: Record<string, unknown>) {
+  if (item.runnable === false) return false;
+  const context = item.context && typeof item.context === "object" && !Array.isArray(item.context)
+    ? item.context as Record<string, unknown>
+    : {};
+  if (context.fixture_status === "missing") return false;
+  if (item.category === "core_capability" && ["required-value-missing", "core-input-missing"].includes(String(context.workflow_checkpoint || ""))) return false;
+  return true;
 }
 
 export function bindSkillIREvals(ir: SkillIR, evalText: string): SkillIR {
+  ir = reconcileSkillIRUserEvidence(ir);
   let cases: Array<Record<string, unknown>> = [];
   let datasetSummary = ir.evaluationPlan.datasetSummary || "";
   try {
@@ -1217,13 +1479,28 @@ export function bindSkillIREvals(ir: SkillIR, evalText: string): SkillIR {
   } catch {
     cases = [];
   }
+  const negative = ir.requirements.filter((item) => item.polarity === "negative");
+  // Reuse real task fixtures instead of sending the bad example as a task or
+  // multiplying scenario executions. The quote is grader-only evidence.
+  cases = cases.map((testCase) => {
+    if (!negative.length || !["capability", "grounding", "integration"].includes(String(testCase.eval_family))) return testCase;
+    const expected = testCase.expected && typeof testCase.expected === "object" ? testCase.expected as Record<string, unknown> : {};
+    return {
+      ...testCase,
+      expected: {
+        ...expected,
+        must_not: unique([...(Array.isArray(expected.must_not) ? expected.must_not.map(String) : []), ...negative.map((item) => item.originalQuote || "")]),
+        user_counterexamples: negative.map((item) => ({ requirement_id: item.id, ...requirementEvidence(item), applicability: "Apply only under the quote's stated conditions; otherwise not applicable." })),
+      },
+    };
+  });
   const caseIdsFor = (capabilityId: string) => cases
-    .filter((item) => Array.isArray(item.capability_ids) && item.capability_ids.includes(capabilityId))
+    .filter((item) => evalCaseIsRunnable(item) && Array.isArray(item.capability_ids) && item.capability_ids.includes(capabilityId))
     .map((item) => String(item.id || ""))
     .filter(Boolean);
   const capabilities = ir.capabilities.map((item) => ({ ...item, evalCaseIds: caseIdsFor(item.id) }));
   const triggerCaseIds = cases.filter((item) => item.eval_family === "trigger").map((item) => String(item.id || "")).filter(Boolean);
-  const executionCaseIds = cases.filter((item) => ["capability", "grounding", "integration"].includes(String(item.eval_family))).map((item) => String(item.id || "")).filter(Boolean);
+  const executionCaseIds = cases.filter((item) => evalCaseIsRunnable(item) && ["capability", "grounding", "integration"].includes(String(item.eval_family))).map((item) => String(item.id || "")).filter(Boolean);
   const byCapability = new Map(capabilities.map((item) => [item.id, item]));
   return {
     ...ir,
@@ -1232,6 +1509,7 @@ export function bindSkillIREvals(ir: SkillIR, evalText: string): SkillIR {
       ...ir.evaluationPlan,
       datasetSummary,
       cases,
+      failureModes: unique([...(ir.evaluationPlan.failureModes || []), ...negative.map((item) => item.statement)]),
       activation: { ...ir.evaluationPlan.activation, caseIds: triggerCaseIds },
       execution: { ...ir.evaluationPlan.execution, caseIds: executionCaseIds },
     },
@@ -1249,6 +1527,7 @@ function capabilityEvalFamily(capability: SkillIRCapability) {
 }
 
 function evalCaseCoversCapability(testCase: Record<string, unknown>, capability: SkillIRCapability) {
+  if (!evalCaseIsRunnable(testCase)) return false;
   const capabilityIds = Array.isArray(testCase.capability_ids) ? testCase.capability_ids.map(String) : [];
   if (!capabilityIds.includes(capability.id) || testCase.eval_family !== capabilityEvalFamily(capability)) return false;
   const graders = Array.isArray(testCase.graders) ? testCase.graders.map(String) : [];
@@ -1303,6 +1582,7 @@ function canonicalCapabilityEvalCase(
     prompt: exemplarPrompt || `请执行“${ir.identity.intent}”对应的真实任务步骤。本用例重点验证：${capabilities.map((item) => item.requirement).join("；")}。输入契约：${capabilities.map((item) => item.input).filter(Boolean).join("；") || "使用当前任务已经提供的材料"}。必须产生可观察结果，不要只复述规则。`,
     context: {
       ...exemplarContext,
+      fixture_status: exemplarPrompt ? "ready" : "missing",
       canonical_eval_compiler: true,
       capability_scope: capabilities.map((item) => item.scope),
       activation_condition: capabilities.map((item) => item.activationCondition || item.routingCondition),
@@ -1316,7 +1596,65 @@ function canonicalCapabilityEvalCase(
       artifacts: producedArtifacts,
     },
     graders,
+    runnable: Boolean(exemplarPrompt),
     ...(contractDigest ? { contract_digest: contractDigest } : {}),
+  };
+}
+
+function canonicalFamilyControlEvalCase(
+  ir: SkillIR,
+  family: "capability" | "grounding" | "integration",
+  contractDigest: string,
+) {
+  const shared = {
+    should_trigger: true,
+    capability_ids: [],
+    runnable: true,
+    context: { fixture_status: "ready", canonical_eval_compiler: true, family_control: family },
+    ...(contractDigest ? { contract_digest: contractDigest } : {}),
+  };
+  if (family === "integration") {
+    return {
+      ...shared,
+      id: "integration-negative-control",
+      eval_family: family,
+      category: "integration_control",
+      prompt: `请只使用当前已经提供的输入完成“${ir.identity.intent}”。本用例没有提供经过验证的联网、外部服务、工具调用或文件产物能力；仍须完成不依赖外部能力的部分。`,
+      expected: {
+        behaviors: ["完成不依赖外部能力的核心任务", "保持当前输入与约定的交付形式"],
+        must_not: ["虚构工具调用或外部响应", "把未连接的能力说成已经执行"],
+        artifacts: [],
+      },
+      graders: ["integration"],
+    };
+  }
+  if (family === "grounding") {
+    return {
+      ...shared,
+      id: "grounding-source-boundary-control",
+      eval_family: family,
+      category: "grounding_control",
+      prompt: `请执行“${ir.identity.intent}”，同时明确区分用户提供的事实、可验证证据与系统推断；没有依据的内容必须保持未知或显式标注。`,
+      expected: {
+        behaviors: ["保持事实、证据与推断边界可追溯"],
+        must_not: ["把推断冒充用户事实", "用泛化最佳实践填补未知事实"],
+        artifacts: [],
+      },
+      graders: ["grounding"],
+    };
+  }
+  return {
+    ...shared,
+    id: "capability-observable-output-control",
+    eval_family: family,
+    category: "core_capability",
+    prompt: `请执行“${ir.identity.intent}”对应的真实任务步骤，并产生符合当前输出契约的可观察结果；不要只复述规则或返回空模板。`,
+    expected: {
+      behaviors: ["完成核心任务并产生可观察结果"],
+      must_not: ["只描述将如何完成而不产生真实结果"],
+      artifacts: [],
+    },
+    graders: ["core_capability"],
   };
 }
 
@@ -1336,13 +1674,23 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
     : String(rawCases.find((item) => typeof item.contract_digest === "string")?.contract_digest || "");
   const capabilities = ir.capabilities.filter((item) => item.kind !== "eval" && item.necessity.decision !== "exclude");
   const cases = [...rawCases];
-  const representativeFixture = cases.find((item) => item.should_trigger === true
+  const representativeFixture = cases.find((item) => evalCaseIsRunnable(item)
+    && item.should_trigger === true
     && item.eval_family !== "trigger"
     && typeof item.prompt === "string"
     && item.prompt.trim().length >= 40)
-    || cases.find((item) => item.should_trigger === true && typeof item.prompt === "string" && item.prompt.trim().length >= 40);
+    || cases.find((item) => evalCaseIsRunnable(item) && item.should_trigger === true && typeof item.prompt === "string" && item.prompt.trim().length >= 40);
   const missing = capabilities.filter((capability) => !cases.some((testCase) => evalCaseCoversCapability(testCase, capability)));
   missing.forEach((capability, index) => cases.push(canonicalCapabilityEvalCase(ir, [capability], index, contractDigest, representativeFixture)));
+
+  // Restored legacy SkillIRs can already have lost a whole Eval family. Close
+  // that compiler-owned contract deterministically instead of asking a repair
+  // model to mutate unrelated Skill semantics.
+  (["capability", "grounding", "integration"] as const).forEach((family) => {
+    if (!cases.some((item) => item.eval_family === family && evalCaseIsRunnable(item))) {
+      cases.push(canonicalFamilyControlEvalCase(ir, family, contractDigest));
+    }
+  });
 
   const triggerCategories = ["trigger_explicit", "trigger_implicit", "trigger_context", "trigger_negative"];
   const essentialTriggers = triggerCategories.flatMap((category) => {
@@ -1355,7 +1703,19 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
   });
   coverageCases = [...new Map(coverageCases.map((item) => [String(item.id || ""), item])).values()];
 
-  const coverageBudget = Math.max(1, 20 - essentialTriggers.length);
+  // Capability edges do not necessarily include every execution family. A
+  // text-only Skill, for example, still needs an integration negative control
+  // proving that it does not invent tool calls. Protect one runnable case for
+  // each otherwise-unrepresented family before applying the 20-case budget.
+  // Without this, late family controls can be silently sliced off after the
+  // canonical freeze even though the source Eval bank was valid.
+  const executionFamilies = ["capability", "grounding", "integration"];
+  const familyAnchors = executionFamilies.flatMap((family) => {
+    if (coverageCases.some((item) => item.eval_family === family)) return [];
+    const match = cases.find((item) => item.eval_family === family && evalCaseIsRunnable(item));
+    return match ? [match] : [];
+  });
+  const coverageBudget = Math.max(1, 20 - essentialTriggers.length - familyAnchors.length);
   if (coverageCases.length > coverageBudget) {
     const grouped = new Map<string, SkillIRCapability[][]>();
     capabilities.forEach((capability) => {
@@ -1374,8 +1734,8 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
     coverageCases = [...grouped.values()].flat().map((group, index) => canonicalCapabilityEvalCase(ir, group, index, contractDigest, representativeFixture));
   }
 
-  const essentialIds = new Set([...essentialTriggers, ...coverageCases].map((item) => String(item.id || "")));
-  const selectedCases = [...essentialTriggers, ...coverageCases, ...cases.filter((item) => !essentialIds.has(String(item.id || "")))]
+  const essentialIds = new Set([...essentialTriggers, ...familyAnchors, ...coverageCases].map((item) => String(item.id || "")));
+  const selectedCases = [...essentialTriggers, ...familyAnchors, ...coverageCases, ...cases.filter((item) => !essentialIds.has(String(item.id || "")))]
     .filter((item, index, list) => list.findIndex((candidate) => String(candidate.id || "") === String(item.id || "")) === index)
     .slice(0, 20)
     .map((item) => contractDigest && typeof item.contract_digest !== "string" ? { ...item, contract_digest: contractDigest } : item);
@@ -1436,6 +1796,7 @@ export function projectCapabilityManifest(ir: SkillIR) {
     risk_branches: ir.riskBranches,
     requirement_provenance: ir.requirements.map((item) => ({
       id: item.id,
+      ...requirementEvidence(item),
       requirement: item.statement,
       provenance: item.provenance,
       modality: item.modality,
@@ -1497,11 +1858,32 @@ export function auditSkillIRFiles(files: Record<string, string>) {
   try { ir = JSON.parse(files["evals/skill-ir.json"] || "") as SkillIR; } catch { return ["Canonical SkillIR 缺失或不是有效 JSON"]; }
   try { manifest = JSON.parse(files["evals/capability-manifest.json"] || "") as Record<string, unknown>; } catch { return ["Capability Manifest 无法从 Canonical SkillIR 校验"]; }
   try {
-    const parsed = JSON.parse(files["evals/evals.json"] || "{}") as { evals?: Array<{ id?: string }> };
-    evalIds = new Set((parsed.evals || []).map((item) => String(item.id || "")).filter(Boolean));
+    const parsed = JSON.parse(files["evals/evals.json"] || "{}") as { evals?: Array<Record<string, unknown>> };
+    evalIds = new Set((parsed.evals || []).filter(evalCaseIsRunnable).map((item) => String(item.id || "")).filter(Boolean));
   } catch { /* JSON gate reports the malformed file separately. */ }
   if (ir.schemaVersion !== "1.0" || ir.compiler !== "skillcanvas") issues.push("Canonical SkillIR 的 schemaVersion 或 compiler 标识无效");
+  issues.push(...auditUserEvidencePolarity(ir));
   if (!ir.runtimeContract?.workflow?.length) issues.push("Canonical SkillIR 缺少可投影的 Runtime Workflow");
+  const dag = compileWorkflowDag(
+    normalizeWorkflowDagSteps(ir.runtimeContract?.workflow),
+    ["$request", "$source", ...ir.inputs.map((item) => `input:${item.id}`)],
+    {
+      terminalOutputs: Object.values(WORKFLOW_TERMINALS),
+      requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed],
+    },
+  );
+  issues.push(...dag.issues.map((item) => item.message));
+  const canonicalKnowledgeAssessment = normalizeKnowledgeAssessment(
+    ir.knowledgeAssessment,
+    Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
+    Boolean(ir.capabilityDelta?.skillMustTeach?.length),
+    ir.capabilityDelta?.skillMustTeach?.map((gap) => gap.id) || [],
+  );
+  for (const item of ir.domainEvidence || []) {
+    if (item && typeof item === "object" && Array.isArray((item as Record<string, unknown>).source_urls)
+      && !hasVerifiedKnowledgeSupport(item as Record<string, unknown>)) issues.push("[KNOWLEDGE_EVIDENCE_UNVERIFIED] 领域规则缺少有效的差值与来源核验，或核验后规则已被修改");
+  }
+  if (stableJson(ir.knowledgeAssessment) !== stableJson(canonicalKnowledgeAssessment)) issues.push("Knowledge sufficiency 与 Canonical Domain Evidence 不一致");
   if ((files["SKILL.md"] || "").replace(/\r\n/g, "\n").trim() !== projectSkillMarkdown(ir).trim()) {
     issues.push("[SKILL_PROJECTION_DRIFT] SKILL.md 不是 Canonical SkillIR 的确定性投影");
   }
@@ -1513,7 +1895,7 @@ export function auditSkillIRFiles(files: Record<string, string>) {
     task.capabilityIds.filter((id) => !capabilityIds.has(id)).forEach((id) => issues.push(`任务 ${task.id} 引用了不存在的能力 ${id}`));
     [...task.requiredInputIds, ...task.optionalInputIds].filter((id) => !inputIds.has(id)).forEach((id) => issues.push(`[REQUIRED_TASK_INPUT_NOT_MODELED] 任务 ${task.id} 引用了不存在的输入 ${id}`));
   });
-  const explicitInputPolicy = ir.requirements.filter((item) => item.provenance === "user_explicit").map((item) => item.statement).join("\n");
+  const explicitInputPolicy = ir.requirements.filter((item) => item.provenance === "user_explicit" && requirementEvidence(item).polarity !== "negative" && item.evidenceKind !== "material").map((item) => item.statement).join("\n");
   ir.inputs.forEach((taskInput) => {
     const resolution = taskInput.resolution;
     if (!resolution) {
@@ -1528,7 +1910,7 @@ export function auditSkillIRFiles(files: Record<string, string>) {
   ir.requirements.forEach((requirement) => {
     if (!requirement.mappedCapabilityIds.length) issues.push(`需求 ${requirement.id} 没有映射到任何能力`);
     requirement.mappedCapabilityIds.filter((id) => !capabilityIds.has(id)).forEach((id) => issues.push(`需求 ${requirement.id} 映射到不存在的能力 ${id}`));
-    if (requirement.hard && !["user_explicit", "source_grounded"].includes(requirement.provenance)) issues.push(`需求 ${requirement.id} 缺少高可信来源却被编译为硬约束`);
+    if (requirement.hard && !["user_explicit", "source_grounded"].includes(requirement.provenance) && requirement.evidenceKind !== "negative_example") issues.push(`需求 ${requirement.id} 缺少高可信来源却被编译为硬约束`);
   });
   ir.capabilities.forEach((capability) => {
     const path = capability.implementation.path;
@@ -1541,13 +1923,7 @@ export function auditSkillIRFiles(files: Record<string, string>) {
     if (!output.artifactPatterns.length) issues.push(`输出 ${output.id} 要求文件交付但没有 artifact pattern`);
     if (!output.producerCapabilityIds.some((id) => capabilityIds.has(id))) issues.push(`输出 ${output.id} 没有真实文件生产能力`);
   });
-  const permissionAnswers = Object.fromEntries(ir.requirements
-    .filter((item) => item.provenance === "user_explicit")
-    .map((item) => {
-      const key = item.source.startsWith("interview.") ? item.source.slice("interview.".length) : item.source === "initial user goal" ? "__idea" : item.id;
-      return [key, item.statement];
-    }));
-  const contentPermission = resolveContentPermission(permissionAnswers);
+  const contentPermission = contentPermissionFromIR(ir);
   const runtimeInstructions = Object.entries(files)
     .filter(([path]) => path === "SKILL.md" || /^references\/.*\.(?:md|txt|json|ya?ml)$/i.test(path))
     .map(([, value]) => value)

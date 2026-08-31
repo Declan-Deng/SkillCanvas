@@ -18,6 +18,25 @@ async function render() {
   return requestWorker(new Request("http://localhost/", { headers: { accept: "text/html" } }));
 }
 
+test("evaluation UI hides unobserved rows and counts without changing optimization targets", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  const report = page.slice(page.indexOf('<section className={`eval-report-panel'), page.indexOf('<div className={`finding-card', page.indexOf('<section className={`eval-report-panel')));
+  assert.match(report, /evals\.map\(\(result, index\) => \{\s*\/\/[^\n]*\n\s*if \(result\.coverage === "not-covered"\) return null;/);
+  assert.match(report, /openOptimization\(index\)/);
+  assert.doesNotMatch(report, /pendingEvals|还没测到|还没有测到|为什么还不能判断|换场景验证/);
+  assert.match(page, /: observedEvals\.length\s*\? "这次表现符合要求"\s*: "本轮结果待评估"/);
+  assert.match(css, /\.eval-report-counts\s*\{[^}]*repeat\(2, minmax\(72px, 1fr\)\)/);
+});
+
+test("demo, report, finding and feedback share one outer decision workspace", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
+  assert.match(page, /<div className="eval-workspace-card">[\s\S]*renderSkillDemoCard\(false\)[\s\S]*eval-report-panel[\s\S]*feedback-card/);
+  assert.match(css, /\.eval-workspace-card\s*\{[\s\S]*overflow: hidden/);
+  assert.match(css, /\.eval-workspace-card > \.skill-demo-card,[\s\S]*\.eval-workspace-card > \.feedback-card/);
+});
+
 function createTextPdf(message) {
   const stream = `BT /F1 12 Tf 72 720 Td (${message}) Tj ET`;
   const objects = [
@@ -65,13 +84,18 @@ test("server-renders the SkillCanvas creation experience", async () => {
 });
 
 test("keeps the generator compiler, privacy gate, and prompts wired", async () => {
-  const [page, route, css] = await Promise.all([
+  const [page, route, css, modelJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/ai/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
+    readFile(new URL("../app/model-json.ts", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /function finalizeSkillFiles\(/);
+  const liveCompileStart = page.indexOf("const canonicalIR = createCanonicalSkillIR");
+  const liveCompileEnd = page.indexOf("const initialStaticRepair", liveCompileStart);
+  const liveCompileBoundary = page.slice(liveCompileStart, liveCompileEnd);
+  assert.match(liveCompileBoundary, /finalizeSkillFiles\([\s\S]*canonicalIR/);
   const projectionBoundary = page.slice(page.indexOf("const frozenIR = bindSkillIREvals"), page.indexOf("function auditSkillFiles"));
   assert.match(projectionBoundary, /files\["SKILL\.md"\] = projectSkillMarkdown\(frozenIR\)/);
   assert.match(projectionBoundary, /files\["evals\/evals\.json"\] = projectEvalBank\(frozenIR\)/);
@@ -106,11 +130,12 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /compilerFixable.*总目标为空、过短或仍是占位内容.*内容限制与用户确认的润色或扩写权限冲突/s);
   assert.match(page, /compilerFixable.*USER_PERMISSION_IR_CONFLICT.*USER_PERMISSION_RUNTIME_CONFLICT.*USER_PERMISSION_EVAL_CONFLICT.*UNCONFIRMED_CONTENT_RESTRICTION/s);
   assert.match(page, /function reconcileCapabilityPlanContentPermission\(/);
+  assert.match(page, /allMatch\(\/PERMISSION[\s\S]*"capability\.update"[\s\S]*"input\.update"[\s\S]*"risk-branch\.update"/);
   assert.match(page, /function reconcileKnowledgePackContentPermission\(/);
   assert.match(page, /const groundingRubric = contentGroundingRubric\(contentPermission\)/);
   assert.match(page, /const contentPolicyExpected = contentPolicyEvalExpectations\(contentPermission\)/);
-  assert.match(page, /等待 Build Loop 修复完成后启动/);
-  assert.match(page, /继续修复并启动/);
+  assert.match(page, /初始 Bundle 尚未通过契约检查/);
+  assert.match(page, /继续修复 Bundle/);
   assert.match(page, /while \(!validation\.executionReady/);
   assert.match(page, /validation\.issues\.filter\(\(issue\) => issue\.priority === "P0"\)/);
   assert.match(page, /async function runP1ContractRepairLoop\(/);
@@ -153,7 +178,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /source-upload-receipt/);
   assert.match(page, /本地确定性检查/);
   assert.match(page, /Loop 自动推进/);
-  assert.match(page, /响应较慢，系统会先结束异常长输出/);
+  assert.match(page, /不代表当前请求超时或正在重试/);
+  assert.doesNotMatch(page, /busyElapsedSeconds >= 70[\s\S]{0,100}正在执行紧凑重试/);
   assert.match(page, /等待超过 \$\{Math\.round\(timeoutMs \/ 1_000\)\} 秒/);
   assert.match(page, /重试当前步骤/);
   assert.match(page, /function openOptimization\(/);
@@ -177,8 +203,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /baselineQualityScore:\s*comparison\.baselineScore/);
   assert.match(page, /bestQualityScore:\s*comparison\.skillScore/);
   assert.doesNotMatch(page, /baselineQualityScore:\s*blindResult\.revealedScores/);
-  assert.match(page, /普通 AI · 4 场景总分/);
-  assert.match(page, /你的 Skill · 4 场景总分/);
+  assert.doesNotMatch(page, /user-proof-card|场景正式对照总分|重新跑多场景对照|查看每个冻结场景的真实得分与扣分原因|旧版本分数已隐藏/);
   assert.match(page, /当前单场景 ·/);
   assert.match(page, /不与多场景总分直接比较/);
   assert.match(page, /本次提案=\$\{attempted\}/);
@@ -204,8 +229,12 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /compactInterviewEvidenceForRetry/);
   assert.match(route, /blueprint-foundation/);
   assert.match(route, /blueprint-plan/);
-  assert.match(page, /callAI<\{ sections: BlueprintSection\[\] \}>\("blueprint-foundation"/);
-  assert.match(page, /callAI<\{ capabilityPlan\?: unknown; loopPlan\?: unknown \}>\("blueprint-plan"/);
+  assert.match(page, /await runBlueprintPlanning\(/);
+  assert.match(page, /checkpoint: blueprintCheckpointRef\.current/);
+  assert.match(page, /call: \(mode, payload\) => callAI\(mode, payload\)/);
+  assert.match(route, /blueprintStagePrompt\(mode, body\)/);
+  assert.match(page, /"blueprint-capabilities"/);
+  assert.match(page, /"blueprint-workflow"/);
   assert.match(page, /const \[blueprintExpanded, setBlueprintExpanded\] = useState\(false\)/);
   assert.match(page, /aria-controls="blueprint-sections"/);
   assert.match(page, /blueprintExpanded \? "is-expanded" : "is-stacked"/);
@@ -213,7 +242,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /ai_request_retry/);
   assert.match(route, /function canRetryAfterTimeout\(/);
   assert.match(route, /raw = await upstream\.text\(\);/);
-  assert.match(route, /attemptOutputTokenBudget\(body\.mode, attempt\)/);
+  assert.match(route, /attemptOutputTokenBudget\(body\.mode, attempt, retryReason\)/);
   assert.match(page, /单项优化/);
   assert.match(page, /optimization-modal/);
   assert.match(page, /optimizationHistory/);
@@ -231,7 +260,10 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /没有为了显得“专业”而机械添加 MCP/);
   assert.match(page, /if \(!normalizedQueries\.length \|\| !mcpConnections\.length\) return empty/);
   assert.match(page, /mcpConnections\.length > 0 && knowledgeMcpReport/);
-  assert.match(page, /initialResearch\.knowledgeGaps\.length && mcpConnections\.length > 0/);
+  assert.match(page, /initialResearch\.knowledgeGaps\.length/);
+  assert.match(page, /buildOptimizationResearchQueries/);
+  assert.match(page, /if \(researchReady\)/);
+  assert.match(page, /auditOpenSkillQuality/);
   assert.match(page, /质检标准不是目标/);
   assert.match(page, /粘贴你已经在使用的方法、步骤、检查清单或 Prompt/);
   assert.ok(page.indexOf('id: "existingPrompt"') < page.indexOf('id: "idealOutput"'));
@@ -249,24 +281,52 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /mode === "optimization-diagnose"/);
   assert.match(route, /mode === "optimization-patch-plan"/);
   assert.match(route, /mode === "optimization-research"/);
+  assert.match(route, /compactSkillBundleForOptimization/);
+  assert.match(route, /!\["eval-grade", "eval-execute"\]\.includes\(body\.mode\)/);
   assert.match(route, /BASELINE MODE/);
   assert.match(route, /Obey the supplied mutation budget exactly/);
   assert.match(page, /DEFAULT_MUTATION_BUDGET/);
   assert.match(page, /auditCrossArtifactConsistency/);
   assert.match(page, /pruneBundleDeterministically/);
+  assert.match(page, /Skill 生成结果摘要/);
+  assert.match(page, /加入了哪些关键能力/);
+  assert.match(page, /还有哪些风险/);
+  assert.match(page, /为什么这样生成/);
+  assert.match(page, /开发者详情/);
+  assert.match(page, /<details className="build-developer-details">/);
+  assert.match(page, /const buildProductSummary = compactProductCopy/);
+  assert.match(page, /riskBranches\.slice\(0, 3\)\.map\(friendlyProductRisk\)/);
+  assert.match(page, /按条件使用来源可追溯的专业知识/);
+  assert.match(css, /-webkit-line-clamp:\s*3/);
   assert.match(page, /BUILD LOOP · 负责生成并冻结初始架构/);
   assert.match(page, /OPTIMIZATION LOOP · 只做有证据的局部优化/);
   assert.match(page, /查看已采纳的 \{knowledgePack\.atoms\.length\} 条知识明细/);
   assert.match(page, /<details className="knowledge-atom-details">/);
   assert.match(page, /Notification\.requestPermission\(\)/);
+  assert.match(page, /navigator\.serviceWorker\.ready/);
+  assert.match(page, /requireInteraction:\s*true/);
+  assert.match(page, /renotify:\s*true/);
   assert.match(page, /notifyGenerationLoopResult\(state\)/);
   assert.match(page, /完成后通过浏览器通知你/);
   assert.match(page, /runIsolatedEvalHarness/);
-  assert.match(page, /批量隔离执行漏返回用例，自动拆成单用例补跑/);
-  assert.match(page, /批量隔离执行失败，自动拆成单用例补跑/);
-  assert.match(page, /批量隔离评分漏返回用例，自动拆成单用例补跑/);
-  assert.match(page, /批量隔离评分失败，自动拆成单用例补跑/);
-  assert.match(page, /for \(let offset = 0; offset < repeats; offset \+= 1\)/);
+  assert.match(page, /三用例执行未完成，仅拆分当前小批次/);
+  assert.match(page, /const executionChunkSize = containsEpisodes \? 1 : shouldChunkExecution \? 3 : input\.cases\.length/);
+  assert.match(page, /composeEvaluationEpisodes\(sampledTrainCases, 1\)/);
+  assert.match(page, /composeEvaluationEpisodes\(sampledSelectionCases, 2\)/);
+  assert.match(page, /conversation: transcript/);
+  assert.match(page, /for \(let index = 0; index < input\.cases\.length; index \+= 3\)/);
+  assert.match(page, /三用例评分未完成，仅拆分当前小批次/);
+  assert.match(page, /phase: "final-output-screen"/);
+  assert.match(page, /early-stop-output-regression/);
+  assert.match(page, /compactHarnessExecutionsForGrade/);
+  assert.match(page, /NO_SKILL_HARNESS_CACHE_KEY/);
+  assert.match(page, /early-stop-no-progress/);
+  assert.match(page, /const shouldRunPrune = goalReached \|\| acceptedPatches > 0/);
+  assert.match(page, /canonicalMutationTargetCatalogForIssues/);
+  assert.match(page, /for \(let offset = existingRepeats; offset < repeats; offset \+= 1\)/);
+  assert.match(page, /comparisonNeedsStabilityRepeat/);
+  assert.match(page, /runCachedNoSkillHarness/);
+  assert.match(page, /resumeFrom:\s*candidateHarness/);
   assert.doesNotMatch(page, /评测契约[^\n]+→ 2\.3/);
   assert.match(page, /runBlindHarnessComparison/);
   assert.match(page, /冻结评测/);
@@ -288,7 +348,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /次试跑完成/);
   assert.match(page, /restoreFrozenBundleExactly/);
   assert.match(page, /current-format snapshots byte-for-byte/);
-  assert.match(page, /重新验证当前版本/);
+  assert.doesNotMatch(page, /重新验证当前版本/);
+  assert.match(page, /async function rerunMultiSceneComparison\(\)/);
   assert.match(page, /demoConversationScoredReplyId/);
   assert.match(page, /hasNewConversationEvidence/);
   assert.match(page, /先继续对话一轮，AI 回复后即可更新评分/);
@@ -359,7 +420,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /已使用安全模板完成编译/);
   assert.doesNotMatch(page, /files\["references\/confirmed-content-policy\.md"\] =/);
   assert.match(page, /## Content transformation/);
-  assert.match(page, /所有文件都能直接编辑/);
+  assert.match(page, /Compiler、Manifest、Eval、运行指标与全部文件/);
   assert.match(page, /className="skill-file-editor"/);
   assert.match(page, /function updateSelectedFileContent\(/);
   assert.match(page, /完整 Skill 文件/);
@@ -402,7 +463,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /ai_repair_payload/);
   assert.match(route, /requestBody\.thinking = \{ type: "disabled" \}/);
   assert.match(route, /ai_response_empty/);
-  assert.match(route, /function normalizeModelJsonContent\(/);
+  assert.match(route, /import \{ diagnoseModelJsonFailure, normalizeModelJsonContent \} from "\.\.\/\.\.\/model-json"/);
+  assert.match(modelJson, /function normalizeModelJsonContent\(/);
   assert.match(route, /ai_content_invalid_json/);
   assert.match(route, /attempt <= 2/);
   assert.match(route, /Every attempt owns its timeout|const controller = new AbortController\(\);[\s\S]*?for \(let attempt|for \(let attempt[\s\S]*?const controller = new AbortController/);

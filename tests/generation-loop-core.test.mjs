@@ -11,6 +11,7 @@ import {
   reconcileArtifactOutputContract,
   removeResolvedFileObservations,
   reusableOutputAssetRequested,
+  screenCandidateBehavior,
   summarizeGenerationEvidence,
 } from "../app/generation-loop-core.ts";
 
@@ -57,6 +58,10 @@ test("artifact contracts receive inspectable patterns instead of an empty gate",
 test("artifact delivery and reusable assets require direct user evidence", () => {
   assert.equal(artifactDeliveryRequested("读取 CSV 文件并给出文本建议"), false);
   assert.equal(artifactDeliveryRequested("交付一份 Markdown 报告和 CSV 表格"), true);
+  assert.deepEqual(inferArtifactPatterns("读取两份 PDF 说明书，生成 Markdown 对比表。"), ["outputs/*.md"]);
+  assert.deepEqual(inferArtifactPatterns("导入 CSV 数据后输出 Excel 文件"), ["outputs/*.xlsx"]);
+  assert.deepEqual(inferArtifactPatterns("read a PDF and generate a Markdown file"), ["outputs/*.md"]);
+  assert.equal(artifactDeliveryRequested("创建一个技能，读取 PDF 并分析其中的文本"), false);
   assert.equal(reusableOutputAssetRequested("将排序规则写入技能包，后续直接使用"), false);
   assert.equal(reusableOutputAssetRequested("保存这次确认的 CSV 表头和输出格式，以后复用"), true);
 });
@@ -86,6 +91,24 @@ test("capability closure requires implementation, runtime routing, and executabl
   assert.ok(broken.score < 100);
   assert.ok(broken.issues.some((item) => item.type === "missing-implementation"));
   assert.ok(broken.issues.some((item) => item.type === "missing-eval"));
+});
+
+test("a core eval with a missing-input checkpoint cannot prove capability closure", () => {
+  const capabilities = [{ id: "core", kind: "llm", path: "SKILL.md", layer: "runtime", status: "generate", enabled: true }];
+  const report = auditCapabilityClosure({
+    "SKILL.md": "Complete the task.",
+    "evals/capability-manifest.json": JSON.stringify({ capabilities }),
+    "evals/evals.json": JSON.stringify({ evals: [{
+      id: "core-empty",
+      eval_family: "capability",
+      category: "core_capability",
+      capability_ids: ["core"],
+      context: { workflow_checkpoint: "required-value-missing" },
+      expected: { behaviors: ["produce the final result"] },
+      graders: ["core_capability"],
+    }] }),
+  }, capabilities);
+  assert.ok(report.issues.some((item) => item.type === "missing-eval" && item.capabilityId === "core"));
 });
 
 test("generation gate accepts only held-out improvement without closure or behavior regression", () => {
@@ -121,6 +144,56 @@ test("generation gate accepts only held-out improvement without closure or behav
   assert.equal(rejected.accepted, false);
   assert.ok(rejected.reasons.some((reason) => reason.includes("能力闭环")));
   assert.ok(rejected.regressions.length > 0);
+});
+
+test("generation gate rejects score-only improvement when every held-out case still fails", () => {
+  const baseline = report([30, 30], false);
+  const candidate = report([35, 38], false);
+  const decision = decideGenerationGoalGate({
+    baseline,
+    candidate,
+    caseIds: ["case-1", "case-2"],
+    baselineClosure: 100,
+    candidateClosure: 100,
+    baselineBlockers: 0,
+    candidateBlockers: 0,
+    baselineCriticalSemanticIssues: 0,
+    candidateCriticalSemanticIssues: 0,
+  });
+  assert.equal(decision.accepted, false);
+  assert.ok(decision.reasons.some((reason) => reason.includes("没有通过任何保留任务")));
+});
+
+test("final-output screen stops an obvious regression before deep evaluation", () => {
+  const baseline = report([40, 40], false);
+  const regressed = report([32, 30], false);
+  const screen = screenCandidateBehavior({ baseline, candidate: regressed, caseIds: ["case-1", "case-2"] });
+  assert.equal(screen.advance, false);
+  assert.equal(screen.scoreDelta, -9);
+  assert.match(screen.reasons.join("；"), /最终产物明显回退|仍未通过任何任务/);
+
+  const equivalent = report([40, 40], false);
+  assert.equal(screenCandidateBehavior({ baseline, candidate: equivalent, caseIds: ["case-1", "case-2"] }).advance, true);
+});
+
+test("generation gate accepts deterministic Skill quality improvement when held-out behavior does not regress", () => {
+  const baseline = report([84, 86]);
+  const candidate = report([84, 86]);
+  const decision = decideGenerationGoalGate({
+    baseline,
+    candidate,
+    caseIds: ["case-1", "case-2"],
+    baselineClosure: 100,
+    candidateClosure: 100,
+    baselineBlockers: 0,
+    candidateBlockers: 0,
+    baselineCriticalSemanticIssues: 0,
+    candidateCriticalSemanticIssues: 0,
+    baselineQualityScore: 72,
+    candidateQualityScore: 86,
+  });
+  assert.equal(decision.accepted, true);
+  assert.equal(decision.scoreDelta, 0);
 });
 
 test("generation goal requires closure, pass rate, usable quality, and measurable lift", () => {

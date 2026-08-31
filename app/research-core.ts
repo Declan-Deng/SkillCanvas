@@ -129,7 +129,7 @@ export function parseFirecrawlResults(payload: unknown, query: string, retrieved
   });
 }
 
-export function dedupeResearchSources(sources: RetrievedKnowledgeSource[], limit = 12) {
+export function dedupeResearchSources(sources: RetrievedKnowledgeSource[], limit = 12, preferredUrls: string[] = []) {
   const seen = new Set<string>();
   const rank = { official: 5, primary: 4, reputable_secondary: 3, community: 2, unknown: 1 } as const;
   return sources.filter((item) => {
@@ -137,5 +137,6 @@ export function dedupeResearchSources(sources: RetrievedKnowledgeSource[], limit
     if (seen.has(normalized)) return false;
     seen.add(normalized);
     return true;
-  }).sort((left, right) => rank[right.authorityTier] - rank[left.authorityTier]).slice(0, limit).map((item, index) => ({ ...item, id: `source-${index + 1}` }));
+  }).sort((left, right) => Number(preferredUrls.includes(right.url)) - Number(preferredUrls.includes(left.url))
+    || rank[right.authorityTier] - rank[left.authorityTier]).slice(0, limit).map((item, index) => ({ ...item, id: `source-${index + 1}` }));
 }

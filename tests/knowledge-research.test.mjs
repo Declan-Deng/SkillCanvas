@@ -4,11 +4,14 @@ import test from "node:test";
 import {
   applyKnowledgePackToFiles,
   buildFollowupResearchQueries,
+  buildOptimizationResearchQueries,
   buildKnowledgeEvidencePayload,
   filterKnowledgePackAtoms,
   knowledgePackNeedsExpansion,
   mergeKnowledgePacks,
-  normalizeKnowledgePack,
+  normalizeKnowledgePack as normalizeKnowledgePackRaw,
+  applyKnowledgeVerification,
+  knowledgeVerificationCandidates,
   normalizeKnowledgePlan,
   normalizeRetrievedSources,
   knowledgePackIsPublishable,
@@ -20,6 +23,44 @@ import {
 import { hasContentPermissionConflict, resolveContentPermission } from "../app/evidence-gates.ts";
 
 const sourceUrl = "https://docs.example.com/professional-rule";
+
+// These older tests isolate authority, rendering and repair accounting. Give
+// their fictional source fixtures explicit gap/quote bindings and mock only
+// the semantic review. Strict missing/mismatched evidence is covered separately.
+function normalizeKnowledgePack(input) {
+  const plan = { ...input.plan, capabilityDeltaGapIds: input.plan.capabilityDeltaGapIds.length ? input.plan.capabilityDeltaGapIds : ["fixture-decision"] };
+  const atoms = (input.raw.atoms || []).map((atom) => ({
+    ...atom, gapIds: [plan.capabilityDeltaGapIds[0]], decision: atom.dimension || atom.title || "fixture decision",
+    sourceSupport: (atom.sourceUrls || []).flatMap((url) => {
+      const canonical = (value) => { const parsed = new URL(value); return `${parsed.hostname}${parsed.pathname.replace(/\/$/, "")}`; };
+      const source = input.sources.find((item) => canonical(item.url) === canonical(url));
+      return source ? [{ url, quote: source.excerpt }] : [];
+    }),
+  }));
+  const pending = normalizeKnowledgePackRaw({ ...input, plan, raw: { ...input.raw, atoms } });
+  const reviewed = applyKnowledgeVerification(pending, { verdicts: knowledgeVerificationCandidates(pending).map((item) => ({
+    id: item.id, fingerprint: item.fingerprint, sourceSupported: true, deltaRelevant: true,
+    categoryValid: true, notGeneric: true, notUserPolicy: true, verifiedGapIds: item.gapIds, reason: "mocked semantic verifier for isolated fixture",
+    supportChecks: item.supportChecks.map((check) => ({ id: check.id, sourceIndexes: [0], reason: "fixture clause support" })),
+  })) });
+  return { ...reviewed, diagnostics: pending.diagnostics };
+}
+
+test("optimization research queries stay bounded to attributed gaps", () => {
+  const queries = buildOptimizationResearchQueries("enterprise data export", ["缺少字段冲突的决策规则", "缺少异常输入验证", "缺少字段冲突的决策规则"]);
+  assert.equal(queries.length, 2);
+  assert.match(queries[0], /缺少字段冲突的决策规则/);
+  assert.match(queries[0], /decision rules/);
+  assert.match(queries[1], /缺少异常输入验证/);
+});
+
+test("followup research addresses actual missing gap questions instead of repackaging rejected rules", () => {
+  const plan = normalizeKnowledgePlan({ required: true, domain: "bulk record import", queries: ["import docs"], knowledgeGaps: ["partial failures"] });
+  const queries = buildFollowupResearchQueries(plan, ["partial failures"], ["How are acknowledgement tokens mapped to individual records?", "How are retryable responses distinguished?", "How are retryable responses distinguished?"]);
+  assert.equal(queries.length, 2);
+  assert.match(queries[0], /acknowledgement tokens/);
+  assert.match(queries[1], /retryable responses/);
+});
 
 test("domain playbook removes duplicated presentation contracts but preserves external standards", () => {
   const playbook = `# Domain playbook
@@ -68,6 +109,8 @@ test("saved knowledge packs from before diagnostics migration restore safely", (
   assert.equal(restored.diagnostics.candidateCount, 0);
   assert.equal(restored.diagnostics.validatorRejectedCount, 0);
   assert.deepEqual(restored.coverage.missing, ["判断规则"]);
+  assert.equal(restored.sufficiency, "insufficient");
+  assert.deepEqual(restored.categoryCoverage.missing, ["decision_rules", "failure_modes", "edge_cases", "verification_methods"]);
 });
 
 test("knowledge planning only enables research for executable gaps and queries", () => {
@@ -327,7 +370,7 @@ test("knowledge compiler accepts executable named methods and canonical source U
   const sources = normalizeRetrievedSources([{
     url: "https://docs.example.com/framework/?utm_source=search",
     title: "Structured method",
-    excerpt: "The source explains a named structure, when it applies, and how to order evidence before producing the final artifact.",
+    excerpt: "The STAR method organizes evidence into Situation, Task, Action and Result. Use it to structure experience examples rather than merely listing responsibilities.",
   }]);
   const pack = normalizeKnowledgePack({
     plan,
@@ -460,8 +503,9 @@ test("knowledge evidence stays inside a bounded model context", () => {
     retrievedAt: "2026-08-14T00:00:00.000Z",
   }));
   const payload = buildKnowledgeEvidencePayload(sources, 20_000);
-  assert.ok(payload.length <= 8);
-  assert.ok(payload.reduce((sum, source) => sum + source.excerpt.length, 0) <= 20_000);
+  assert.ok(payload.length <= 12);
+  assert.ok(JSON.stringify(payload).length <= 20_002);
+  assert.ok(payload.every((source) => source.passages.length && !source.excerpt), "source text is included exactly once as numbered spans");
 });
 
 test("compiled knowledge becomes a routed Skill reference instead of a decorative search summary", () => {

@@ -41,22 +41,26 @@ const FAILURE_OWNERS: Record<EvalFailureType, FailureAttribution["owner"]> = {
  * The model may provide evidence, but it cannot choose a broader edit surface. */
 export function attributeEvalFailure(evidence: string, family: EvalFamily = "capability"): FailureAttribution {
   const value = evidence.trim();
-  const conflict = /冲突|矛盾|互相抵触|不一致的指令|优先级错误|覆盖了用户|contradict|conflict|incompatible instruction|priority inversion/i;
+  const conflict = /冲突|矛盾|互相抵触|不一致的指令|优先级错误|覆盖了用户|contradict|conflict|incompatible instruction|priority inversion|(?:用户|本轮).{0,24}(?:已|明确)(?:提供|授权|允许|确认).{0,80}(?:仍|却|但|反而).{0,32}(?:询问|追问|要求确认|暂停|停止|拒绝)|(?:仍|却|但|反而).{0,32}(?:询问|追问|要求确认|暂停|停止|拒绝).{0,80}(?:已经提供|明确授权|明确允许|无需确认)|(?:unnecessary|repeated).{0,16}(?:question|confirmation)|(?:asks?|waits?).{0,32}(?:confirmation|approval).{0,48}(?:already|explicitly).{0,24}(?:provided|authorized|allowed)/i;
   const tool = /\b(?:MCP|API|tool|browser|search|filesystem|command|adapter)\b|工具|调用|连接|授权|参数|回执|可用性|降级路径/i;
   const verification = /验证|验收|核对|检查|断言|评分器|证据不足|没有证明|未验证|verify|validation|acceptance|assertion|grader|unchecked/i;
+  const missingOutput = /(?:没有|未|没有真正|未能|未实际)(?:产生|生成|交付|给出|返回|输出).{0,32}(?:结果|内容|交付物|产物|文件|简历|报告)|(?:拒绝|停止|暂停).{0,20}(?:生成|交付|输出|返回)(?:结果|内容|交付物|产物|文件|简历|报告)?|(?:只|仅)(?:给出|返回|输出|停留在).{0,24}(?:分析|步骤|计划|问题|追问|说明|规则)|(?:no|without|failed to|refus(?:e|ed|es)|stop(?:s|ped)?).{0,20}(?:observable|concrete|actual|final).{0,12}(?:output|result|deliverable)|(?:only|merely).{0,20}(?:analysis|questions?|plan|instructions?)/i;
+  const integrationToolFailure = family === "integration" && /不可用|未连接|未授权|调用失败|缺少回执|invalid parameters?|unavailable|not connected|unauthorized|missing receipt/i.test(value);
   const exception = /例外|边界|异常|空值|缺失输入|格式错误|不可用|失败恢复|回退|停止条件|edge case|exception|boundary|malformed|missing input|fallback|failure recovery/i;
   const decision = /决策|判断规则|选择条件|优先级|取舍|分类规则|映射规则|decision rule|heuristic|routing rule|tie.?breaker/i;
   const type: EvalFailureType = conflict.test(value)
     ? "instruction_conflict"
-    : tool.test(value) || family === "integration"
-      ? "missing_tool_knowledge"
-      : verification.test(value)
-        ? "missing_verification"
-        : exception.test(value)
-          ? "missing_exception"
-          : decision.test(value)
-            ? "missing_decision_rule"
-            : "missing_decision_rule";
+    : missingOutput.test(value)
+      ? "missing_verification"
+      : tool.test(value) || integrationToolFailure
+        ? "missing_tool_knowledge"
+        : verification.test(value)
+          ? "missing_verification"
+          : exception.test(value)
+            ? "missing_exception"
+            : decision.test(value)
+              ? "missing_decision_rule"
+              : "missing_decision_rule";
   return {
     type,
     label: FAILURE_LABELS[type],
@@ -70,13 +74,20 @@ export type PipelineIssue = {
   id: string;
   priority: IssuePriority;
   type: string;
-  source: "static" | "closure" | "semantic" | "eval" | "regression";
+  source: "static" | "closure" | "semantic" | "eval" | "regression" | "quality";
   evidence: string;
   files: string[];
   capabilityId?: string;
   failureType?: EvalFailureType;
   allowedMutationTypes?: string[];
   evalCaseIds?: string[];
+};
+
+export type OpenSkillQualityReport = {
+  score: number;
+  passed: boolean;
+  checks: Array<{ id: string; passed: boolean; detail: string }>;
+  issues: PipelineIssue[];
 };
 
 export type ScopedCapability = {
@@ -204,8 +215,30 @@ export function selectHighestPriorityIssues(issues: PipelineIssue[]) {
   return highest ? issues.filter((item) => item.priority === highest) : [];
 }
 
-export function optimizationPolicyFor(issues: PipelineIssue[]) {
+/** Give one optimizer round one semantic owner. Mixing instruction conflicts,
+ * missing verification, and knowledge gaps in the same request encourages a
+ * broad rewrite and makes it impossible to tell which mutation fixed what. */
+export function focusOptimizationIssues(issues: PipelineIssue[], limit = 3) {
   const selected = selectHighestPriorityIssues(issues);
+  const attributed = selected.filter((item) => item.failureType && item.allowedMutationTypes?.length);
+  if (!attributed.length) {
+    const rootType = selected[0]?.type;
+    return selected.filter((item) => !rootType || item.type === rootType).slice(0, Math.max(1, limit));
+  }
+  const groups = new Map<EvalFailureType, PipelineIssue[]>();
+  attributed.forEach((item) => {
+    const type = item.failureType!;
+    groups.set(type, [...(groups.get(type) || []), item]);
+  });
+  const focused = [...groups.entries()].sort((left, right) => {
+    const weight = (items: PipelineIssue[]) => items.reduce((sum, item) => sum + 1 + (item.evalCaseIds?.length || 0), 0);
+    return weight(right[1]) - weight(left[1]) || FAILURE_LABELS[left[0]].localeCompare(FAILURE_LABELS[right[0]], "zh-CN");
+  })[0]?.[1] || [];
+  return focused.slice(0, Math.max(1, limit));
+}
+
+export function optimizationPolicyFor(issues: PipelineIssue[]) {
+  const selected = focusOptimizationIssues(issues);
   const priority = selected[0]?.priority || null;
   return {
     priority,
@@ -290,10 +323,25 @@ export function reconcileArtifactProducerCapabilities<T extends ScopedCapability
     const contract = `${item.path || ""} ${item.output || ""} ${item.routingCondition || ""}`.toLowerCase();
     return requestedExtensions.some((extension) => contract.includes(extension) || contract.includes(extension.slice(1)));
   };
-  if (!input.requiresArtifact || capabilities.some(ownsRequestedArtifact)) return capabilities;
   const existingIndex = capabilities.findIndex((item) => item.id === input.fallback.id);
   const existing = existingIndex >= 0 ? capabilities[existingIndex] : undefined;
+  const compilerOwned = existing?.requirement?.startsWith("创建并交付与输出契约匹配的文件：")
+    && existing.output?.startsWith("真实存在且匹配 ");
+  if (!input.requiresArtifact || (!compilerOwned && capabilities.some(ownsRequestedArtifact))) return capabilities;
   const patterns = input.artifactPatterns.length ? input.artifactPatterns : ["outputs/**"];
+  const equivalentWriter = capabilities.findIndex((item) => activeCapability(item)
+    && item.kind === "builtin-tool" && capabilityOwnsArtifacts(item)
+    && item.path === input.fallback.path && item.name === input.fallback.name);
+  if (equivalentWriter >= 0 && existingIndex < 0) {
+    const writer = capabilities[equivalentWriter];
+    capabilities[equivalentWriter] = {
+      ...writer,
+      optional: false, enabled: true, recommended: true, status: "use-provided",
+      affects: [...new Set([...list(writer.affects), "artifact-output", "output-contract"])],
+      output: `${writer.output || "文件"}；真实存在且匹配 ${patterns.join("、")} 的文件产物`,
+    } as T;
+    return capabilities;
+  }
   const artifactCapability = {
     ...input.fallback,
     ...existing,
@@ -594,6 +642,136 @@ export function estimateDomainValueDensity(files: Record<string, string>) {
   const denominator = Math.max(1, generic + behaviorChanging);
   const score = Math.round((behaviorChanging / denominator) * 100);
   return { score, generic, behaviorChanging, shouldResearch: text.length > 500 && score < 45 };
+}
+
+/**
+ * Deterministic quality lint derived from recurring patterns in the OpenAI,
+ * Anthropic, Microsoft and GitHub public Agent Skill catalogs. This is not a
+ * style grader: every finding maps to a concrete runtime, discovery,
+ * progressive-disclosure, knowledge or verification defect that the bounded
+ * Optimization Loop can repair.
+ */
+export function auditOpenSkillQuality(files: Record<string, string>): OpenSkillQualityReport {
+  const issues: PipelineIssue[] = [];
+  const checks: OpenSkillQualityReport["checks"] = [];
+  const skill = files["SKILL.md"] || "";
+  const body = skill.replace(/^---\s*\n[\s\S]*?\n---(?:\s*\n|$)/, "");
+  const frontmatter = skill.match(/^---\s*\n([\s\S]*?)\n---(?:\s*\n|$)/)?.[1] || "";
+  const description = frontmatter.match(/^description:\s*(.+)$/m)?.[1]?.replace(/^['"]|['"]$/g, "").trim() || "";
+  const headings = [...body.matchAll(/^#{1,3}\s+(.+?)\s*$/gm)].map((match) => match[1].trim());
+  const lineCount = body.split("\n").length;
+  const add = (issue: Omit<PipelineIssue, "source">) => issues.push({ ...issue, source: "quality" });
+  const check = (id: string, passed: boolean, detail: string) => checks.push({ id, passed, detail });
+
+  const discoverable = description.length >= 24
+    && /use when|use for|trigger|when the user|用于|适用于|当用户|触发/i.test(description)
+    && /(?:create|review|analy|inspect|convert|generate|build|fix|write|design|plan|deploy|debug|test|validate|optimi[sz]e|research|完成|生成|分析|检查|审阅|修改|转换|规划|处理|设计|验证|研究)/i.test(description);
+  check("discovery", discoverable, discoverable ? "description 同时说明能力和触发场景" : "description 没有同时说明做什么与何时触发");
+  if (!discoverable) add({
+    id: "open-skill-discovery-description",
+    priority: "P2",
+    type: "WEAK_DISCOVERY_DESCRIPTION",
+    evidence: "SKILL.md 的 description 必须同时说明 Skill 做什么、用户在什么任务下应触发；否则目标 Agent 可能根本不会加载它。",
+    files: ["SKILL.md"],
+  });
+
+  const conciseEntry = lineCount <= 500;
+  check("progressive-disclosure", conciseEntry, conciseEntry ? `主文件 ${lineCount} 行` : `主文件 ${lineCount} 行，超过建议的 500 行`);
+  if (!conciseEntry) add({
+    id: "open-skill-main-file-too-large",
+    priority: "P2",
+    type: "PROGRESSIVE_DISCLOSURE_OVERFLOW",
+    evidence: `SKILL.md 有 ${lineCount} 行。主文件应保留触发、路由和核心工作流，把重资料移到按需读取的 references/。`,
+    files: ["SKILL.md"],
+  });
+
+  const hasWorkflow = headings.some((heading) => /workflow|steps|process|instructions|工作流|步骤|流程|执行/i.test(heading))
+    && /(?:^|\n)\s*(?:\d+[.)、]|[-*+]\s+(?:读取|检查|确认|生成|执行|验证|比较|输出|read|check|verify|run|create|write))/im.test(body);
+  check("executable-workflow", hasWorkflow, hasWorkflow ? "主文件含可执行工作流" : "主文件缺少动作化工作流");
+  if (!hasWorkflow) add({
+    id: "open-skill-executable-workflow",
+    priority: "P2",
+    type: "NON_EXECUTABLE_WORKFLOW",
+    evidence: "主文件没有可识别的动作化步骤。优秀 Skill 用命令式步骤告诉 Agent 读取什么、判断什么、产生什么，而不是只介绍领域知识。",
+    files: ["SKILL.md", "evals/skill-ir.json"],
+  });
+
+  const hasVerification = headings.some((heading) => /verification|quality check|acceptance|validation|验收|验证|质量检查/i.test(heading))
+    || /(?:验证|验收|核对|检查|verify|validate|acceptance).{0,80}(?:输出|结果|产物|文件|artifact|output|result)/i.test(body);
+  check("verification", hasVerification, hasVerification ? "含可观察验收入口" : "缺少最终产物验收入口");
+  if (!hasVerification) add({
+    id: "open-skill-verification-contract",
+    priority: "P2",
+    type: "MISSING_VERIFICATION_METHOD",
+    evidence: "Skill 没有说明完成后如何检查真实输出；应增加针对最终产物的可观察验证，而不是增加一组泛化评分。",
+    files: ["SKILL.md", "evals/skill-ir.json"],
+    failureType: "missing_verification",
+    allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.missing_verification,
+  });
+
+  const referencePaths = Object.keys(files).filter((path) => /^references\/.*\.(?:md|txt)$/i.test(path));
+  referencePaths.forEach((path, index) => {
+    const content = files[path] || "";
+    const lines = content.split("\n").length;
+    const reachable = skill.includes(path);
+    if (!reachable) add({
+      id: `open-skill-unrouted-reference-${index + 1}`,
+      priority: "P2",
+      type: "UNROUTED_REFERENCE",
+      evidence: `${path} 没有从 SKILL.md 的工作流或路由条件中被引用，Agent 不知道何时读取它。`,
+      files: ["SKILL.md", path],
+    });
+    if (lines > 300 && !/(?:^|\n)##?\s+(?:Table of Contents|Contents|目录)\s*$/im.test(content)) add({
+      id: `open-skill-large-reference-no-toc-${index + 1}`,
+      priority: "P3",
+      type: "LARGE_REFERENCE_WITHOUT_TOC",
+      evidence: `${path} 有 ${lines} 行但没有目录；长参考资料应允许 Agent 快速定位所需章节。`,
+      files: [path],
+    });
+  });
+  check("resource-reachability", !issues.some((issue) => issue.type === "UNROUTED_REFERENCE"), referencePaths.length ? "所有参考资料均可从主流程按需到达" : "没有额外参考资料");
+
+  const ir = parseJson<Record<string, unknown>>(files["evals/skill-ir.json"]);
+  const assessment = ir?.knowledgeAssessment && typeof ir.knowledgeAssessment === "object"
+    ? ir.knowledgeAssessment as Record<string, unknown>
+    : null;
+  const required = list(assessment?.requiredCategories);
+  const missing = list(assessment?.missingCategories);
+  const knowledgeRequired = assessment?.status !== "not-required" && required.length > 0;
+  const categoryConfig: Record<string, { label: string; failureType: EvalFailureType }> = {
+    decision_rules: { label: "决策规则", failureType: "missing_decision_rule" },
+    failure_modes: { label: "失败模式", failureType: "missing_exception" },
+    edge_cases: { label: "边界案例", failureType: "missing_exception" },
+    verification_methods: { label: "验证方法", failureType: "missing_verification" },
+  };
+  if (knowledgeRequired) missing.forEach((category, index) => {
+    const config = categoryConfig[category] || { label: category, failureType: "missing_decision_rule" as const };
+    add({
+      id: `open-skill-missing-knowledge-${category}-${index + 1}`,
+      priority: "P2",
+      type: `MISSING_KNOWLEDGE_CATEGORY_${category.toUpperCase()}`,
+      evidence: `Canonical SkillIR 已确认该任务需要专业知识，但仍缺少${config.label}。不得用通用最佳实践补齐，应围绕这一缺口定向检索或明确标记知识不足。`,
+      files: ["evals/skill-ir.json", "references/domain-playbook.md"],
+      failureType: config.failureType,
+      allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS[config.failureType],
+    });
+  });
+  check("knowledge-sufficiency", !knowledgeRequired || missing.length === 0, !knowledgeRequired ? "该 Skill 不依赖外部专业知识" : missing.length ? `缺少：${missing.join("、")}` : "四类专业知识已覆盖");
+
+  const density = estimateDomainValueDensity(files);
+  if (knowledgeRequired && density.shouldResearch && !missing.length) add({
+    id: "open-skill-low-domain-value-density",
+    priority: "P2",
+    type: "LOW_BEHAVIOR_CHANGING_KNOWLEDGE",
+    evidence: `专业知识中可改变行为的规则密度仅 ${density.score}；应补充有条件、动作和例外的规则，删除“专业、清晰、高质量”等泛化内容。`,
+    files: ["SKILL.md", ...referencePaths.slice(0, 3)],
+    failureType: "missing_decision_rule",
+    allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.missing_decision_rule,
+  });
+
+  const uniqueIssues = [...new Map(issues.map((issue) => [`${issue.type}:${issue.files.join("|")}:${issue.evidence}`, issue])).values()];
+  const penalty = uniqueIssues.reduce((sum, issue) => sum + (issue.priority === "P1" ? 30 : issue.priority === "P2" ? 14 : 4), 0);
+  return { score: Math.max(0, 100 - penalty), passed: !uniqueIssues.some((issue) => issue.priority === "P1" || issue.priority === "P2"), checks, issues: uniqueIssues };
 }
 
 function dedupeBy<T>(items: T[], key: (item: T, index: number) => string) {

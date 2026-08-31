@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  auditOpenSkillQuality,
   FAILURE_ATTRIBUTION_MUTATIONS,
   applyPatchPlan,
   attributeEvalFailure,
@@ -11,6 +12,7 @@ import {
   candidateUtility,
   constrainPatchPlan,
   estimateDomainValueDensity,
+  focusOptimizationIssues,
   inferEvalFamily,
   makeContractIssues,
   normalizePatchPlan,
@@ -26,6 +28,9 @@ test("Eval failures are attributed to one bounded Canonical SkillIR owner", () =
   assert.equal(attributeEvalFailure("MCP 参数错误且没有检查调用回执", "integration").type, "missing_tool_knowledge");
   assert.equal(attributeEvalFailure("输出没有执行可观察的验收检查").type, "missing_verification");
   assert.equal(attributeEvalFailure("系统规则与用户明确要求相互冲突").type, "instruction_conflict");
+  assert.equal(attributeEvalFailure("用户已经明确允许直接完成，但 Skill 仍要求确认并暂停").type, "instruction_conflict");
+  assert.equal(attributeEvalFailure("执行只返回分析步骤，没有产生任何可检查输出", "integration").type, "missing_verification");
+  assert.equal(attributeEvalFailure("integration 分支拒绝交付，但不存在工具调用问题", "integration").type, "missing_verification");
   assert.deepEqual(FAILURE_ATTRIBUTION_MUTATIONS.missing_exception, ["risk-branch.add", "risk-branch.update", "risk-branch.remove"]);
 });
 
@@ -148,6 +153,17 @@ test("only structured execution issues can enter P0", () => {
   assert.deepEqual(policy.selected.map((item) => item.priority), ["P0"]);
 });
 
+test("one optimization round stays on one attributed semantic owner", () => {
+  const issues = [
+    { id: "verification-1", priority: "P1", type: "EVAL_MISSING_VERIFICATION", source: "eval", evidence: "没有交付最终结果", files: [], failureType: "missing_verification", allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.missing_verification, evalCaseIds: ["case-1", "case-2"] },
+    { id: "conflict-1", priority: "P1", type: "EVAL_INSTRUCTION_CONFLICT", source: "eval", evidence: "已经提供材料却重复追问", files: [], failureType: "instruction_conflict", allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.instruction_conflict, evalCaseIds: ["case-3"] },
+    { id: "knowledge-1", priority: "P2", type: "EVAL_MISSING_DECISION_RULE", source: "eval", evidence: "缺判断规则", files: [], failureType: "missing_decision_rule", allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.missing_decision_rule },
+  ];
+  const focused = focusOptimizationIssues(issues);
+  assert.deepEqual(focused.map((item) => item.id), ["verification-1"]);
+  assert.deepEqual(optimizationPolicyFor(issues).selected.map((item) => item.failureType), ["missing_verification"]);
+});
+
 test("eval families keep trigger, capability, grounding, and integration isolated", () => {
   assert.equal(inferEvalFamily({ category: "trigger_negative" }), "trigger");
   assert.equal(inferEvalFamily({ category: "core_capability" }), "capability");
@@ -184,6 +200,20 @@ test("artifact compiler promotes one real file owner without duplicating a disab
   assert.equal(owner?.enabled, true);
   assert.match(owner?.output || "", /outputs\/\*\.pdf/);
   assert.deepEqual(owner?.affects, ["artifact-output", "output-contract"]);
+  const refreshed = reconcileArtifactProducerCapabilities({ capabilities, fallback, artifactPatterns: ["outputs/*.md"], requiresArtifact: true });
+  assert.equal(refreshed.length, capabilities.length);
+  assert.equal(refreshed.find((item) => item.id === fallback.id).output, "真实存在且匹配 outputs/*.md 的文件产物");
+  assert.deepEqual(reconcileArtifactProducerCapabilities({ capabilities: refreshed, fallback, artifactPatterns: ["outputs/*.md"], requiresArtifact: true }), refreshed);
+});
+
+test("artifact compiler reuses an equivalent planner workspace writer instead of adding a compiler alias", () => {
+  const fallback = { id: "host-file-workspace", kind: "builtin-tool", name: "Workspace files", path: "integrations/tool-contracts.json", output: "file", enabled: false, status: "use-provided" };
+  const plannerWriter = { ...fallback, id: "planner-file-writer", output: "write Markdown file", affects: ["artifact-output"], enabled: true };
+  const capabilities = reconcileArtifactProducerCapabilities({ capabilities: [plannerWriter], fallback, artifactPatterns: ["outputs/*.md"], requiresArtifact: true });
+  assert.equal(capabilities.length, 1);
+  assert.equal(capabilities[0].id, "planner-file-writer");
+  assert.match(capabilities[0].output, /outputs\/\*\.md/);
+  assert.deepEqual(capabilities[0].affects, ["artifact-output", "output-contract"]);
 });
 
 test("an unrelated CSV asset cannot satisfy a PDF delivery contract", () => {
@@ -320,4 +350,23 @@ test("delete pass deterministically removes duplicate manifest entries", () => {
 test("utility penalizes regression and complexity instead of maximizing score alone", () => {
   assert.ok(candidateUtility({ qualityGain: 10, regressionCount: 0, changedFiles: 1, newFiles: 0, tokenDelta: 100 }) > 0);
   assert.ok(candidateUtility({ qualityGain: 10, regressionCount: 1, changedFiles: 3, newFiles: 1, tokenDelta: 2_000 }) < 0);
+});
+
+test("open-skill quality lint turns catalog patterns into bounded repair issues", () => {
+  const good = auditOpenSkillQuality({
+    "SKILL.md": `---\nname: inspect-records\ndescription: Use when the user asks to inspect records and produce a verified report.\n---\n\n# Inspect records\n\n## Workflow\n\n1. Read the supplied records.\n2. Check each required field.\n3. Write the report.\n\n## Verification\n\nVerify the final report contains every required result.`,
+    "evals/skill-ir.json": JSON.stringify({ knowledgeAssessment: { status: "not-required", requiredCategories: [], missingCategories: [] } }),
+  });
+  assert.equal(good.passed, true);
+  assert.equal(good.issues.length, 0);
+
+  const weak = auditOpenSkillQuality({
+    "SKILL.md": `---\nname: weak-skill\ndescription: Helps with things.\n---\n\n# Notes\n\n${"Keep it professional and high quality.\n".repeat(510)}`,
+    "evals/skill-ir.json": JSON.stringify({ knowledgeAssessment: { status: "insufficient", requiredCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"], missingCategories: ["decision_rules", "verification_methods"] } }),
+  });
+  assert.equal(weak.passed, false);
+  assert.ok(weak.issues.some((issue) => issue.type === "WEAK_DISCOVERY_DESCRIPTION"));
+  assert.ok(weak.issues.some((issue) => issue.type === "PROGRESSIVE_DISCLOSURE_OVERFLOW"));
+  assert.ok(weak.issues.some((issue) => issue.type === "MISSING_KNOWLEDGE_CATEGORY_DECISION_RULES" && issue.failureType === "missing_decision_rule"));
+  assert.ok(weak.issues.some((issue) => issue.type === "MISSING_KNOWLEDGE_CATEGORY_VERIFICATION_METHODS" && issue.failureType === "missing_verification"));
 });

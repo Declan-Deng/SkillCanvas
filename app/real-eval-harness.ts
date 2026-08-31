@@ -36,9 +36,144 @@ export type HarnessExecution = {
   triggered: boolean;
   artifacts: Array<{ path: string; summary: string; content: string; verified: boolean }>;
   trace: string[];
+  transcript?: Array<{ role: "user" | "assistant"; content: string; turnId: string }>;
   durationMs: number;
   outputChars: number;
 };
+
+function uniqueStrings(values: string[], limit: number) {
+  return [...new Set(values.map((value) => value.trim()).filter(Boolean))].slice(0, limit);
+}
+
+function episodeMaterialPrompt(prompt: string) {
+  return prompt
+    .replace(/\s*本用例重点验证：[\s\S]*?(?:本用例明确满足激活条件：[\s\S]*?)?。\s*$/u, "")
+    .trim();
+}
+
+function episodeKickoff(testCase: SkillEvalCase) {
+  const actualTask = typeof testCase.context.actual_task === "string" ? testCase.context.actual_task.trim() : "";
+  const task = actualTask || testCase.prompt.split(/[。！？\n]/u).find((item) => item.trim())?.trim() || "当前任务";
+  return `我想完成“${task}”。相关材料会在下一条消息提供。请先确认当前需要接收的核心材料，不要假设材料内容，也不要提前索取尚未到达步骤的后续决策。`;
+}
+
+/**
+ * Collapse capability-level cases into a small number of end-to-end episodes.
+ * Cases from the same evaluation family share one trajectory so adding a new
+ * capability no longer creates another near-identical model rollout.
+ */
+export function composeEvaluationEpisodes(cases: SkillEvalCase[], maxEpisodes = 3): SkillEvalCase[] {
+  const limit = Math.max(1, Math.min(3, Math.floor(maxEpisodes)));
+  if (!cases.length) return [];
+  if (cases.every((item) => item.turns && item.turns.length >= 2)) return cases.slice(0, limit);
+  const positive = cases.filter((item) => item.shouldTrigger);
+  const boundary = cases.filter((item) => !item.shouldTrigger);
+  const reserveBoundary = limit >= 2 && boundary.length > 0;
+  const positiveLimit = Math.max(1, limit - (reserveBoundary ? 1 : 0));
+  const source = positive.length ? positive : cases;
+  const familyOrder: SkillEvalCase["family"][] = ["capability", "grounding", "integration", "trigger"];
+  const grouped = familyOrder
+    .map((family) => source.filter((item) => item.family === family))
+    .filter((group) => group.length > 0);
+  const buckets = grouped.slice(0, positiveLimit);
+  while (buckets.length < Math.min(positiveLimit, source.length)) {
+    const largest = buckets
+      .map((bucket, index) => ({ bucket, index }))
+      .sort((left, right) => right.bucket.length - left.bucket.length)[0];
+    if (!largest || largest.bucket.length < 2) break;
+    const moved = largest.bucket.splice(Math.ceil(largest.bucket.length / 2));
+    if (moved.length) buckets.push(moved);
+  }
+  const episodes: SkillEvalCase[] = buckets.slice(0, positiveLimit).map((bucket, index): SkillEvalCase => {
+    const representative = [...bucket].sort((left, right) => right.prompt.length - left.prompt.length)[0];
+    const materialPrompt = episodeMaterialPrompt(representative.prompt);
+    const capabilities = uniqueStrings(bucket.flatMap((item) => item.capabilityIds), 16);
+    const expectedBehaviors = uniqueStrings([
+      "收到后续材料后继续同一任务，不重复索取已经提供的内容",
+      "最终一轮交付可直接检查的任务结果，而不是只给计划或问题清单",
+      ...bucket.flatMap((item) => item.expected.behaviors).filter((item) => /完成|交付|输出|使用|匹配|生成|调整|验证|确认/u.test(item)),
+    ], 7);
+    const mustNot = uniqueStrings([
+      "提前使用尚未提供的材料或把缺失内容说成已经确认",
+      ...bucket.flatMap((item) => item.expected.mustNot).filter((item) => /虚构|忽略|只描述|不产生|只提出|重复|泄露/u.test(item)),
+    ], 6);
+    const counterexamples = [...new Map(bucket.flatMap((item) => item.expected.userCounterexamples || [])
+      .map((item) => [`${item.requirement_id}:${item.originalQuote}`, item])).values()];
+    return {
+      ...representative,
+      id: `episode-${representative.split}-${index + 1}-${representative.family}`,
+      category: "end_to_end_episode",
+      prompt: materialPrompt,
+      context: {
+        ...representative.context,
+        episode: true,
+        mergedCaseIds: bucket.map((item) => item.id),
+      },
+      capabilityIds: capabilities,
+      expected: {
+        behaviors: expectedBehaviors,
+        // Owner counterexamples are not expendable generic rubric prose. Do
+        // not regex-filter or truncate them when collapsing cases to episodes.
+        mustNot: [...new Set([...mustNot, ...counterexamples.map((item) => item.originalQuote)])],
+        artifacts: uniqueStrings(bucket.flatMap((item) => item.expected.artifacts), 6),
+        ...(counterexamples.length ? { userCounterexamples: counterexamples } : {}),
+      },
+      graders: uniqueStrings(bucket.flatMap((item) => item.graders), 8),
+      turns: [
+        {
+          id: "request",
+          prompt: episodeKickoff(representative),
+          context: { materialsAvailable: false },
+          checkpoint: "input",
+        },
+        {
+          id: "materials-and-delivery",
+          prompt: materialPrompt,
+          context: { materialsAvailable: true },
+          checkpoint: "final",
+        },
+      ],
+    };
+  });
+  if (reserveBoundary) {
+    const boundaryCase = [...boundary].sort((left, right) => {
+      const leftPriority = left.category === "trigger_negative" ? 0 : 1;
+      const rightPriority = right.category === "trigger_negative" ? 0 : 1;
+      return leftPriority - rightPriority || right.prompt.length - left.prompt.length;
+    })[0];
+    if (boundaryCase) {
+      const boundaryEpisode: SkillEvalCase = {
+        ...boundaryCase,
+        id: `episode-${boundaryCase.split}-${episodes.length + 1}-boundary`,
+        context: { ...boundaryCase.context, episode: true, mergedCaseIds: [boundaryCase.id] },
+      };
+      delete boundaryEpisode.turns;
+      episodes.push(boundaryEpisode);
+    }
+  }
+  return episodes.slice(0, limit);
+}
+
+/** Keep grading focused on the delivered result. The frozen contract already
+ * carries prompts and assertions, so repeating full traces, request metadata,
+ * and the final assistant turn inside transcript only burns context without
+ * adding evidence. */
+export function compactHarnessExecutionsForGrade(executions: HarnessExecution[]) {
+  return executions.map((execution) => {
+    const transcript = execution.transcript?.filter((turn, index, items) => {
+      if (turn.role !== "assistant") return true;
+      const laterAssistant = items.slice(index + 1).some((item) => item.role === "assistant");
+      return laterAssistant || turn.content.trim() !== execution.output.trim();
+    }).map((turn) => ({ role: turn.role, content: turn.content, turnId: turn.turnId }));
+    return {
+      caseId: execution.caseId,
+      triggered: execution.triggered,
+      output: execution.output,
+      artifacts: execution.artifacts,
+      ...(transcript?.length ? { transcript } : {}),
+    };
+  });
+}
 
 export type AssertionGrade = {
   text: string;
@@ -124,12 +259,56 @@ export type BlindComparison = {
  * deliberately excluded: exposing them leaks hidden assertions into the
  * Executor and needlessly multiplies context size. Runtime files are bounded
  * because a real Agent would load large resources progressively. */
-export function runtimeSkillBundle(files: Record<string, string>, maxChars = 72_000) {
+export function runtimeSkillBundle(
+  files: Record<string, string>,
+  maxChars = 72_000,
+  scope?: { capabilityIds?: string[]; families?: SkillEvalCase["family"][] },
+) {
+  const availableRuntimePaths = new Set(Object.keys(files).filter((path) => (
+    path === "SKILL.md" || /^(?:references|scripts|assets|integrations)\//.test(path)
+  )));
+  let scopedPaths: Set<string> | null = null;
+  if (scope) {
+    scopedPaths = new Set([
+      "SKILL.md",
+      "references/requirements.md",
+      "references/quality-criteria.md",
+      "references/domain-playbook.md",
+      "references/output-contract.md",
+      "references/loop-plan.md",
+    ].filter((path) => availableRuntimePaths.has(path)));
+    const families = new Set(scope.families || []);
+    if (families.has("grounding")) ["references/personal-context.md", "references/source-evidence.md", "references/state-model.md"].forEach((path) => scopedPaths?.add(path));
+    if (families.has("integration")) Object.keys(files).filter((path) => path.startsWith("integrations/")).forEach((path) => scopedPaths?.add(path));
+    try {
+      const ir = JSON.parse(files["evals/skill-ir.json"] || "{}") as { capabilities?: Array<{ id?: string; implementation?: { path?: string } }> };
+      const capabilityIds = new Set(scope.capabilityIds || []);
+      (ir.capabilities || []).forEach((capability) => {
+        const path = capability.implementation?.path || "";
+        if (capability.id && capabilityIds.has(capability.id) && availableRuntimePaths.has(path)) scopedPaths?.add(path);
+      });
+    } catch {
+      scopedPaths = null;
+    }
+    if (scopedPaths) {
+      const pathPattern = /[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+/g;
+      const queue = [...scopedPaths].filter((path) => path !== "SKILL.md");
+      for (let index = 0; index < queue.length; index += 1) {
+        const path = queue[index];
+        const references = (files[path]?.match(pathPattern) || []).map((item) => item.replace(/[),.;:'"`]+$/g, ""));
+        references.forEach((reference) => {
+          if (!availableRuntimePaths.has(reference) || scopedPaths?.has(reference)) return;
+          scopedPaths?.add(reference);
+          queue.push(reference);
+        });
+      }
+    }
+  }
   const runtimeEntries = Object.entries(files)
     .filter(([path, content]) => Boolean(content.trim()) && (
       path === "SKILL.md"
       || /^(?:references|scripts|assets|integrations)\//.test(path)
-    ))
+    ) && (!scopedPaths || scopedPaths.has(path)))
     .sort(([left], [right]) => {
       const priority = (path: string) => path === "SKILL.md" ? 0 : path.startsWith("references/") ? 1 : path.startsWith("scripts/") ? 2 : path.startsWith("integrations/") ? 3 : 4;
       return priority(left) - priority(right) || left.localeCompare(right);
@@ -202,10 +381,12 @@ export function freezeEvalContract(cases: SkillEvalCase[]): FrozenEvalContract {
     ...item,
     capabilityIds: [...item.capabilityIds],
     context: { ...item.context },
+    turns: item.turns?.map((turn) => ({ ...turn, context: { ...turn.context } })),
     expected: {
       behaviors: [...item.expected.behaviors],
       mustNot: [...item.expected.mustNot],
       artifacts: [...item.expected.artifacts],
+      ...(item.expected.userCounterexamples ? { userCounterexamples: item.expected.userCounterexamples.map((evidence) => ({ ...evidence })) } : {}),
     },
     graders: [...item.graders],
   }));

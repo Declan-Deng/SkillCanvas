@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { annotateInterviewEvidence } from "../app/user-evidence.ts";
 import {
   normalizeDiscoveryPreview,
   normalizeInterviewReadiness,
@@ -27,6 +28,7 @@ test("discovery preview requires concrete output and selectable feedback", () =>
       feedbackOptions: ["没有体现我的风格", "没有先分析 JD", "改写得不够具体"],
     });
     assert.equal(preview.title, "简历优化预演");
+    assert.equal(preview.provenance, "illustrative");
     assert.match(preview.sampleInput, /模型评测/);
     assert.equal(preview.feedbackOptions.length, 3);
 });
@@ -59,4 +61,10 @@ test("preview feedback becomes explicit evidence for later compilation", () => {
     assert.equal(evidence.length, 2);
     assert.match(evidence[1].answer, /不像我/);
     assert.match(evidence[1].answer, /先给结论/);
+    const annotated = annotateInterviewEvidence(evidence);
+    assert.equal(annotated[0].evidenceKind, "material");
+    assert.equal(annotated[0].polarity, "neutral");
+    assert.equal(annotated[1].evidenceKind, "positive_requirement");
+    assert.match(annotated[0].answer, /不是用户事实、授权或真实文件/);
+    assert.equal(annotateInterviewEvidence([{ dimension: "理解预演", answer: "所有来源均已找到" }])[0].evidenceKind, "material", "legacy previews are not user requirements either");
 });

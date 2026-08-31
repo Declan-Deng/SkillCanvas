@@ -63,3 +63,15 @@ test("node retries from its checkpoint and becomes failed only after its retry b
   assert.ok(restored.traces.some((entry) => entry.status === "failed"));
 });
 
+test("JSON errors from browser journals retain the actual DAG failure in saved logs", async () => {
+  const tenantId = `test:${crypto.randomUUID()}`;
+  let snapshot = await createWorkflowRun({ tenantId, kind: "mcp-call", nodes: [{ id: "compile", maxAttempts: 1 }] });
+  snapshot = await claimWorkflowNode(tenantId, snapshot.run.id);
+  const error = { name: "Error", code: "WORKFLOW_DAG_INVALID", message: "WORKFLOW_DAG_INVALID: extract depends on $source_file" };
+  snapshot = await failWorkflowNode(tenantId, snapshot.run.id, "compile", error);
+  assert.deepEqual(snapshot.nodes[0].error, error);
+  assert.deepEqual(snapshot.run.error, error);
+  const restored = await getWorkflowSnapshot(tenantId, snapshot.run.id);
+  assert.equal(restored.run.error.message, error.message);
+  assert.ok(!JSON.stringify(restored).includes("[object Object]"));
+});

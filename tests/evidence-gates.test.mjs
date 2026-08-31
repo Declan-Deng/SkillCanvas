@@ -133,6 +133,24 @@ test("domain evidence is projected from structured knowledge atoms rather than m
   assert.equal(evidence.some((item) => /^来源账本|^使用方式/.test(item.rule)), false);
 });
 
+test("domain evidence keeps mandatory categories and never rehydrates rendered markdown", () => {
+  const structured = deriveDomainEvidence(JSON.stringify({ knowledge_checks: [{
+    id: "failure-1",
+    type: "failure_pattern",
+    category: "failure_modes",
+    observable_behavior: "输入缺少关键材料时停止依赖步骤",
+    applies_when: "必需输入不可获得",
+    exception: "存在已授权替代来源",
+    source_urls: ["https://example.com/failure"],
+    confidence: 0.9,
+  }] }), "", "");
+  assert.equal(structured[0].category, "failure_modes");
+  assert.deepEqual(structured[0].source_urls, ["https://example.com/failure"]);
+
+  const projectedMarkdown = "# Domain playbook\n\n## 已覆盖：decision_rules、failure_modes\n\n- 强制类别：failure_modes";
+  assert.deepEqual(deriveDomainEvidence(projectedMarkdown, "", ""), []);
+});
+
 test("an owner-authored conservative grounding boundary remains authoritative", () => {
   const permission = resolveContentPermission({ "evidence-policy": "无法核实的数据要避免编造，未知不能写成已知" });
   assert.equal(permission.explicitRestriction, true);
@@ -301,6 +319,21 @@ test("semantic compiler blocks manifest, artifact, grader, and provenance contra
   assert.ok(issues.some((item) => /不存在真实文件产出能力/.test(item)));
   assert.ok(issues.some((item) => /没有绑定 artifact_checker/.test(item)));
   assert.ok(issues.some((item) => /来源不足/.test(item)));
+});
+
+test("domain evidence enforcement follows canonical mode, not imperative wording in a quotation", () => {
+  const check = (mode, allowed = false) => semanticGateAudit({
+    "SKILL.md": "## Goal\nWrite a result",
+    "evals/evals.json": "{}",
+    "evals/capability-manifest.json": JSON.stringify({ domain_evidence: [{
+      rule: "必须核对批次校验和", hard_constraint_allowed: allowed, application_mode: mode,
+    }] }),
+  }).filter((issue) => issue.startsWith("领域规则"));
+  assert.deepEqual(check("advisory"), []);
+  assert.deepEqual(check("conditional"), []);
+  assert.equal(check("enforced").length, 1);
+  assert.equal(check(undefined).length, 1, "untyped legacy evidence must remain fail-closed");
+  assert.deepEqual(check("enforced", true), []);
 });
 
 test("final minimality pass removes orphan resources and empty integrations", () => {

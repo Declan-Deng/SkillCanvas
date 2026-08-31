@@ -3,9 +3,29 @@ import test from "node:test";
 
 import {
   compactInterviewEvidenceForRetry,
+  compactSkillBundleForOptimization,
   compactSkillBundleForTrial,
   compactSourceContextForTrial,
 } from "../app/ai-context.ts";
+
+test("optimizer context routes only issue-relevant implementation files", () => {
+  const bundle = {
+    "SKILL.md": "# Skill\n\nRead references/requirements.md when active.",
+    "references/requirements.md": "# Requirements\nKeep the contract.",
+    "references/domain-playbook.md": "# Domain rules\nUse the verified branch.",
+    "scripts/affected.py": "print('affected')",
+    "scripts/unrelated.py": "print('unrelated secret')",
+    "evals/evals.json": JSON.stringify({ large: "x".repeat(20_000) }),
+  };
+  const compact = compactSkillBundleForOptimization(bundle, {
+    issues: [{ files: ["scripts/affected.py"], evidence: "runtime failure" }],
+  }, 4_000);
+  assert.match(compact, /## SKILL\.md/);
+  assert.match(compact, /## scripts\/affected\.py/);
+  assert.match(compact, /## references\/requirements\.md/);
+  assert.doesNotMatch(compact, /unrelated secret|evals\/evals\.json/);
+  assert.ok(compact.length <= 4_000);
+});
 
 test("trial bundle uses progressive disclosure and stays inside its budget", () => {
   const bundle = {

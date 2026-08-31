@@ -1,3 +1,5 @@
+import { classifyUserEvidence } from "./user-evidence.ts";
+
 type SkillFileMap = Record<string, string>;
 
 const TRIAL_CORE_PATHS = [
@@ -9,6 +11,16 @@ const TRIAL_CORE_PATHS = [
   "references/source-evidence.md",
   "references/loop-plan.md",
   "references/capability-plan.md",
+  "integrations/tool-contracts.json",
+];
+
+const OPTIMIZATION_CORE_PATHS = [
+  "SKILL.md",
+  "references/requirements.md",
+  "references/quality-criteria.md",
+  "references/domain-playbook.md",
+  "references/capability-plan.md",
+  "references/loop-plan.md",
   "integrations/tool-contracts.json",
 ];
 
@@ -100,6 +112,60 @@ export function compactSkillBundleForTrial(value: unknown, maxChars = 20_000) {
   return sections.join("").trim().slice(0, maxChars);
 }
 
+/**
+ * Route optimizer context by the issue surface instead of retransmitting the
+ * complete bundle on every diagnose/replan request. Canonical SkillIR and Eval
+ * evidence travel in their own fields, so this excerpt only needs the runtime
+ * entrypoint, relevant canonical projections, and implementation bytes named by
+ * the current issue. No source file is mutated or semantically summarized.
+ */
+export function compactSkillBundleForOptimization(
+  value: unknown,
+  routingEvidence: unknown,
+  maxChars = 24_000,
+) {
+  const files = asSkillFiles(value);
+  if (!files) return plainText(value).slice(0, maxChars);
+
+  const available = new Set(Object.keys(files));
+  const evidenceText = plainText(routingEvidence);
+  const directlyNamed = Object.keys(files).filter((path) => evidenceText.includes(path));
+  const selected: string[] = [];
+  const seen = new Set<string>();
+  const enqueue = (path: string) => {
+    if (!available.has(path) || seen.has(path)) return;
+    seen.add(path);
+    selected.push(path);
+  };
+
+  enqueue("SKILL.md");
+  directlyNamed.forEach(enqueue);
+  OPTIMIZATION_CORE_PATHS.forEach(enqueue);
+
+  // Include resources that the selected runtime files actually route to. This
+  // preserves progressive disclosure without pulling in unrelated private
+  // history, the full Eval bank, or compiler-generated projections.
+  for (let index = 0; index < selected.length; index += 1) {
+    referencedPaths(files[selected[index]] || "", available).forEach(enqueue);
+  }
+
+  let remaining = Math.max(1_000, maxChars);
+  const sections: string[] = [];
+  for (const [index, path] of selected.entries()) {
+    if (remaining < 180) break;
+    const header = `\n\n## ${path}\n`;
+    const filesLeft = selected.length - index;
+    const fairShare = Math.max(500, Math.floor(remaining / filesLeft) - header.length);
+    const pathLimit = path === "SKILL.md" ? 7_000 : /^(?:scripts|assets)\//.test(path) ? 6_000 : 4_000;
+    const contentBudget = Math.min(pathLimit, fairShare, remaining - header.length);
+    if (contentBudget <= 0) break;
+    const section = `${header}${boundedFileExcerpt(files[path], contentBudget)}`;
+    sections.push(section);
+    remaining -= section.length;
+  }
+  return sections.join("").trim().slice(0, maxChars);
+}
+
 /** Preserve evidence from multiple user-context sections instead of keeping
  * only the beginning of a large uploaded-material summary. */
 export function compactSourceContextForTrial(value: unknown, maxChars = 8_000) {
@@ -132,9 +198,15 @@ export function compactInterviewEvidenceForRetry(value: unknown, maxChars = 8_00
     const dimension = plainText(record.dimension || record.label || `decision-${index + 1}`).slice(0, 80);
     const answer = plainText(record.answer || record.value || record.choice).trim();
     const question = plainText(record.question || record.prompt).trim();
+    const kind = record.evidenceKind === "negative_example" || record.evidenceKind === "explicit_authorization"
+      ? record.evidenceKind : classifyUserEvidence(String(record.key || record.id || ""), dimension);
+    const protectedAnswer = kind === "negative_example" || kind === "explicit_authorization";
     const answerBudget = Math.max(160, Math.floor(perItem * 0.68));
-    const questionBudget = Math.max(80, perItem - answerBudget - dimension.length - 24);
-    return `${index + 1}. [${dimension}] answer=${balancedExcerpt(answer, answerBudget, " … ")}; question=${balancedExcerpt(question, questionBudget, " … ")}`;
+    const questionBudget = Math.max(40, perItem - answerBudget - dimension.length - kind.length - 45);
+    return `${index + 1}. [${dimension}; ${kind}] answer=${protectedAnswer ? JSON.stringify(answer) : balancedExcerpt(answer, answerBudget, " … ")}; question=${balancedExcerpt(question, questionBudget, " … ")}`;
   });
-  return records.join("\n").slice(0, maxChars);
+  // A soft transport target must not silently drop a counterexample's trailing
+  // condition or change permission scope. Shorten question wording, not those
+  // owner-authored clauses, when protected evidence exceeds this target.
+  return records.join("\n");
 }

@@ -1,3 +1,5 @@
+import { describeUserEvidence, type EvidenceMetadata } from "./user-evidence.ts";
+
 export const OPTIMIZATION_EDIT_BUDGET = 4;
 export const OPTIMIZATION_TRAIN_SAMPLE = 4;
 export const OPTIMIZATION_SELECTION_SAMPLE = 4;
@@ -11,11 +13,23 @@ export type SkillEvalCase = {
   shouldTrigger: boolean;
   prompt: string;
   context: Record<string, unknown>;
+  /**
+   * A real evaluation episode may reveal required material over multiple user
+   * turns. The harness executes these turns sequentially and only grades the
+   * completed trajectory. Legacy atomic cases omit this field.
+   */
+  turns?: Array<{
+    id: string;
+    prompt: string;
+    context: Record<string, unknown>;
+    checkpoint: "input" | "final";
+  }>;
   capabilityIds: string[];
   expected: {
     behaviors: string[];
     mustNot: string[];
     artifacts: string[];
+    userCounterexamples?: Array<Required<EvidenceMetadata> & { requirement_id: string; applicability: string }>;
   };
   graders: string[];
   split: OptimizationSplit;
@@ -114,6 +128,9 @@ export function parseAndSplitEvalCases(raw: string): SkillEvalCase[] {
   const normalized = rows.slice(0, 20).flatMap((row, index) => {
     if (!row || typeof row !== "object") return [];
     const item = row as Record<string, unknown>;
+    const rawContext = item.context && typeof item.context === "object" && !Array.isArray(item.context) ? item.context as Record<string, unknown> : {};
+    if (item.runnable === false || rawContext.fixture_status === "missing") return [];
+    if (item.category === "core_capability" && ["required-value-missing", "core-input-missing"].includes(String(rawContext.workflow_checkpoint || ""))) return [];
     const prompt = typeof item.prompt === "string" ? item.prompt.trim() : "";
     if (prompt.length < 12) return [];
     const expected = item.expected && typeof item.expected === "object" ? item.expected as Record<string, unknown> : {};
@@ -130,12 +147,16 @@ export function parseAndSplitEvalCases(raw: string): SkillEvalCase[] {
       category: typeof item.category === "string" && item.category.trim() ? item.category.trim() : "core_capability",
       shouldTrigger: item.should_trigger !== false,
       prompt,
-      context: item.context && typeof item.context === "object" && !Array.isArray(item.context) ? { ...(item.context as Record<string, unknown>) } : {},
+      context: { ...rawContext },
       capabilityIds: stringList(item.capability_ids),
       expected: {
         behaviors: stringList(expected.behaviors),
         mustNot: stringList(expected.must_not),
         artifacts: stringList(expected.artifacts),
+        ...(Array.isArray(expected.user_counterexamples) ? { userCounterexamples: expected.user_counterexamples.flatMap((value) => {
+          if (!value || typeof value !== "object" || typeof value.originalQuote !== "string") return [];
+          return [{ ...describeUserEvidence("negative_example", value.originalQuote), requirement_id: String(value.requirement_id || ""), applicability: String(value.applicability || "Only when the quote's conditions apply") }];
+        }) } : {}),
       },
       graders: stringList(item.graders),
     }];

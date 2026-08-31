@@ -1,6 +1,9 @@
-import { bindSkillIREvals, projectEvalBank, skillIRDigest, type SkillIR, type SkillIRCapability, type SkillIRRequirement } from "./skill-ir.ts";
-import { compileWorkflowDag, normalizeWorkflowDagSteps } from "./workflow-dag.ts";
+import { auditUserEvidencePolarity, bindSkillIREvals, normalizeKnowledgeAssessment, projectEvalBank, reconcileSkillIRUserEvidence, skillIRDigest, type SkillIR, type SkillIRCapability, type SkillIRRequirement } from "./skill-ir.ts";
+import { requirementEvidence } from "./user-evidence.ts";
+import { bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, normalizeWorkflowDagSteps, WORKFLOW_TERMINALS } from "./workflow-dag.ts";
+import { hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
 import { EMPTY_CAPABILITY_DELTA } from "./capability-delta.ts";
+import { reconcileRuntimeInputResources, hasRuntimeInputBinding } from "./bundle-resource-repair.ts";
 
 export type CanonicalMutation =
   | { type: "identity.update"; changes: Partial<SkillIR["identity"]> }
@@ -47,11 +50,38 @@ export const COMPILER_OWNED_SEMANTIC_PATHS = new Set([
   "references/state-model.md",
   "references/loop-plan.md",
   "references/tooling.md",
+  "references/source-evidence.md",
   "integrations/tool-contracts.json",
 ]);
 
 export function isImplementationBytePath(path: string) {
   return /^(?:scripts|assets)\/[A-Za-z0-9._/-]+$/.test(path) && !path.split("/").includes("..");
+}
+
+// Wider only for canonical repair, where validateImplementationFiles checks
+// the reference owner. The general optimizer's FilePatch boundary stays tight.
+export const isRepairImplementationPath = (path: string) => isImplementationBytePath(path) || isAuthoredReferencePath(path);
+
+export function isAuthoredReferencePath(path: string) {
+  return /^references\/[A-Za-z0-9._/-]+\.(?:md|txt)$/i.test(path)
+    && !path.split("/").includes("..") && !COMPILER_OWNED_SEMANTIC_PATHS.has(path);
+}
+
+/** Non-projected reference documents already are file-backed implementations.
+ * Require a real active owner; don't silently drop the very file a repair needs. */
+export function validateImplementationFiles(ir: SkillIR, value: Record<string, unknown> = {}): Record<string, string> {
+  const result: Record<string, string> = {};
+  for (const [path, content] of Object.entries(value)) {
+    if (!isRepairImplementationPath(path) || typeof content !== "string" || !content.trim()) {
+      throw new Error(`IMPLEMENTATION_FILE_INVALID: ${path}；仅支持 scripts/assets 和非编译器管理的 references/*.md 或 *.txt，不能用文本冒充二进制文件`);
+    }
+    if (path.startsWith("references/") && !ir.capabilities.some((item) => item.kind === "reference"
+      && item.necessity.decision !== "exclude" && item.implementation.path === path)) {
+      throw new Error(`REFERENCE_OWNER_MISSING: ${path} 没有已启用的参考能力；请同时修改对应 capability 的 implementation 和 routingCondition`);
+    }
+    result[path] = content;
+  }
+  return result;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -131,7 +161,7 @@ function replaceById<T extends object>(items: T[], idKey: keyof T, id: string, c
 }
 
 function reconcileDerivedContracts(ir: SkillIR) {
-  const next = structuredClone(ir);
+  const next = reconcileSkillIRUserEvidence(structuredClone(ir));
   const taskIdsByCapability = new Map<string, string[]>();
   next.tasks.forEach((task) => task.capabilityIds.forEach((capabilityId) => {
     taskIdsByCapability.set(capabilityId, [...(taskIdsByCapability.get(capabilityId) || []), task.id]);
@@ -144,25 +174,16 @@ function reconcileDerivedContracts(ir: SkillIR) {
     const capabilityIds = step.capabilityIds.filter((id) => activeCapabilityIds.has(id));
     return capabilityIds.length ? [{ ...step, capabilityIds }] : [];
   });
-  const routedCapabilityIds = new Set(retainedWorkflow.flatMap((step) => step.capabilityIds));
-  const appended = next.capabilities
-    .filter((capability) => activeCapabilityIds.has(capability.id) && !routedCapabilityIds.has(capability.id))
-    .map((capability, index) => {
-      const prior = retainedWorkflow.at(-1);
-      return {
-        id: `step-added-${index + 1}-${capability.id}`,
-        capabilityIds: [capability.id],
-        when: capability.activationCondition || capability.routingCondition || "执行相关任务时",
-        input: capability.input,
-        action: capability.requirement || capability.purpose,
-        output: capability.output,
-        fallback: capability.fallback,
-        requires: prior?.produces.length ? [prior.produces[0]] : ["$request"],
-        produces: [`capability:${capability.id}:output`],
-        mutates: [],
-      };
-    });
-  next.runtimeContract.workflow = [...retainedWorkflow, ...appended];
+  next.runtimeContract.workflow = closeWorkflowDagTerminals(
+    bindWorkflowCapabilities(retainedWorkflow, next.capabilities.filter((capability) => activeCapabilityIds.has(capability.id))),
+    ["$request", "$source", ...next.inputs.map((item) => `input:${item.id}`)],
+  );
+  next.knowledgeAssessment = normalizeKnowledgeAssessment(
+    next.knowledgeAssessment,
+    Array.isArray(next.domainEvidence) ? next.domainEvidence : [],
+    Boolean(next.capabilityDelta?.skillMustTeach?.length),
+    next.capabilityDelta?.skillMustTeach?.map((gap) => gap.id) || [],
+  );
   next.runtimeContract.completionChecks = [...new Set([
     ...next.outputs.flatMap((output) => output.validation),
     ...next.tasks.flatMap((task) => task.successIndicators),
@@ -173,6 +194,7 @@ function reconcileDerivedContracts(ir: SkillIR) {
     const id = `constraint-${requirement.id}`;
     constraintById.set(id, {
       id,
+      ...requirementEvidence(requirement),
       statement: requirement.statement,
       type: requirement.ruleType,
       provenance: requirement.provenance,
@@ -215,6 +237,18 @@ export function applySkillIRMutations(ir: SkillIR, mutations: CanonicalMutation[
   let next = structuredClone(ir);
   const changedTargets: string[] = [];
   for (const mutation of mutations) {
+    if (mutation.type === "requirement.update" || mutation.type === "requirement.remove") {
+      const existing = ir.requirements.find((item) => item.id === mutation.requirementId);
+      if (existing && requirementEvidence(existing).polarity === "negative") {
+        const evidence = requirementEvidence(existing);
+        const changes = mutation.type === "requirement.update" ? mutation.changes : {};
+        const protectedFields = ["source", "provenance", "evidenceKind", "polarity", "originalQuote", "interpretation", "statement", "hard", "modality"] as const;
+        if (mutation.type === "requirement.remove" || protectedFields.some((key) => key in changes
+          && changes[key] !== ({ ...existing, ...evidence })[key])) {
+          throw new Error(`[USER_EVIDENCE_IMMUTABLE] ${existing.id}: 自动优化不能删除、改写或反转用户反例；请修改对应执行行为`);
+        }
+      }
+    }
     changedTargets.push(mutation.type);
     if (mutation.type === "identity.update") next.identity = { ...next.identity, ...mutation.changes, skillName: next.identity.skillName };
     else if (mutation.type === "requirement.add") next.requirements = [...next.requirements, mutation.requirement];
@@ -224,7 +258,42 @@ export function applySkillIRMutations(ir: SkillIR, mutations: CanonicalMutation[
     else if (mutation.type === "task.update") next.tasks = replaceById(next.tasks, "id", mutation.taskId, mutation.changes);
     else if (mutation.type === "task.remove") next.tasks = next.tasks.filter((item) => item.id !== mutation.taskId);
     else if (mutation.type === "capability.add") next.capabilities = [...next.capabilities, mutation.capability];
-    else if (mutation.type === "capability.update") next.capabilities = replaceById(next.capabilities, "id", mutation.capabilityId, mutation.changes);
+    else if (mutation.type === "capability.update") {
+      let existing = next.capabilities.find((item) => item.id === mutation.capabilityId);
+      const bindRuntimeInput = existing?.kind === "reference" && mutation.changes.kind === "builtin-tool";
+      if (bindRuntimeInput && existing) {
+        const input = next.inputs.find((item) => hasRuntimeInputBinding(mutation.changes.input || "", item.id));
+        if (!input) throw new Error(`RUNTIME_INPUT_BINDING_REQUIRED: ${existing.id} 改为宿主读取时，input 必须引用一个现有 input:<id>，不能只改 kind 来绕过缺文件检查`);
+        next = reconcileRuntimeInputResources(next, {}, { [existing.id]: input.id });
+        existing = next.capabilities.find((item) => item.id === mutation.capabilityId);
+        if (existing?.kind === "reference") throw new Error(`RUNTIME_INPUT_BINDING_INVALID: ${existing.id} 未建立有效的运行时文件绑定；保留原资源契约`);
+      }
+      const changes = { ...mutation.changes,
+        ...(mutation.changes.implementation && existing
+          ? { implementation: { ...existing.implementation, ...mutation.changes.implementation } } : {}),
+        ...(bindRuntimeInput && existing ? { implementation: existing.implementation, input: existing.input,
+          fallback: existing.fallback, necessity: existing.necessity } : {}),
+      };
+      next.capabilities = replaceById(next.capabilities, "id", mutation.capabilityId, changes);
+      const oldPath = existing?.implementation.path;
+      const newPath = changes.implementation?.path;
+      // A resource move must update its actual readers, not just the manifest.
+      // Preserve user evidence and other owners' instructions verbatim.
+      if (existing?.kind === "reference" && oldPath?.startsWith("references/")
+        && newPath?.startsWith("references/") && oldPath !== newPath) {
+        const move = (value: string) => value.split(oldPath).join(newPath);
+        next.capabilities = next.capabilities.map((item) => item.id !== existing.id ? item : {
+          ...item, input: move(item.input), output: move(item.output), purpose: move(item.purpose),
+          activationCondition: move(item.activationCondition), routingCondition: move(item.routingCondition), fallback: move(item.fallback),
+        });
+        next.runtimeContract.workflow = next.runtimeContract.workflow.map((step) => !step.capabilityIds.includes(existing.id) ? step : {
+          ...step, when: move(step.when), input: move(step.input), action: move(step.action), output: move(step.output), fallback: move(step.fallback),
+        });
+        next.knowledgeRequirements = next.knowledgeRequirements.map((item) => item.capabilityId !== existing.id ? item : {
+          ...item, path: item.path === oldPath ? newPath : item.path, route: move(item.route),
+        });
+      }
+    }
     else if (mutation.type === "capability.remove") next.capabilities = next.capabilities.filter((item) => item.id !== mutation.capabilityId);
     else if (mutation.type === "input.add") next.inputs = [...next.inputs, mutation.input];
     else if (mutation.type === "input.update") next.inputs = replaceById(next.inputs, "id", mutation.inputId, mutation.changes);
@@ -255,7 +324,7 @@ export function applySkillIRMutations(ir: SkillIR, mutations: CanonicalMutation[
 }
 
 export function validateCanonicalSkillIR(ir: SkillIR) {
-  const issues: string[] = [];
+  const issues: string[] = auditUserEvidencePolarity(ir);
   const unique = (values: string[], label: string) => {
     const seen = new Set<string>();
     values.forEach((value) => { if (!value || seen.has(value)) issues.push(`${label} id is empty or duplicated: ${value || "<empty>"}`); seen.add(value); });
@@ -273,7 +342,7 @@ export function validateCanonicalSkillIR(ir: SkillIR) {
   const outputIds = new Set(ir.outputs.map((item) => item.id));
   ir.requirements.forEach((item) => {
     if (!item.statement?.trim()) issues.push(`requirement ${item.id} has no statement`);
-    if (item.hard && !["user_explicit", "source_grounded"].includes(item.provenance)) issues.push(`requirement ${item.id} cannot be hard with provenance ${item.provenance}`);
+    if (item.hard && !["user_explicit", "source_grounded"].includes(item.provenance) && item.evidenceKind !== "negative_example") issues.push(`requirement ${item.id} cannot be hard with provenance ${item.provenance}`);
     item.mappedCapabilityIds.forEach((id) => { if (!capabilityIds.has(id)) issues.push(`requirement ${item.id} references missing capability ${id}`); });
   });
   ir.tasks.forEach((item) => {
@@ -287,9 +356,31 @@ export function validateCanonicalSkillIR(ir: SkillIR) {
     if (!item.condition?.trim() || !item.action?.trim() || !item.stopOrRedirect?.trim()) issues.push(`risk-branch ${item.id} has an incomplete condition/action/fallback contract`);
   });
   domainEvidence.forEach((item) => {
-    if (!String(item.rule || item.knowledge || "").trim()) issues.push(`domain-evidence ${String(item.id || "<empty>")} has no behavior-changing rule`);
+    const id = String(item.id || "<empty>");
+    if (!String(item.rule || item.knowledge || "").trim()) issues.push(`domain-evidence ${id} has no behavior-changing rule`);
+    if (!["decision_rules", "failure_modes", "edge_cases", "verification_methods"].includes(String(item.category || ""))) issues.push(`domain-evidence ${id} has no valid required category`);
+    if (!String(item.applies_when || "").trim()) issues.push(`domain-evidence ${id} has no applies_when condition`);
+    const confidence = Number(item.confidence);
+    if (!Number.isFinite(confidence) || confidence <= 0 || confidence > 1) issues.push(`domain-evidence ${id} has invalid confidence`);
+    const evidenceType = String(item.evidence_type || "");
+    const sourceUrls = Array.isArray(item.source_urls) ? item.source_urls.filter((url) => typeof url === "string" && /^https?:\/\//i.test(url)) : [];
+    const evalCaseIds = Array.isArray(item.eval_case_ids) ? item.eval_case_ids.filter((caseId) => typeof caseId === "string" && Boolean(caseId.trim())) : [];
+    if (evidenceType === "official_rule" && !sourceUrls.length) issues.push(`domain-evidence ${id} claims an official rule without source_urls`);
+    if (sourceUrls.length && !hasVerifiedKnowledgeSupport(item)) issues.push(`domain-evidence ${id} has no valid source/gap verification for its current claim`);
+    if (evidenceType === "evidence_backed_practice" && !sourceUrls.length && !evalCaseIds.length) issues.push(`domain-evidence ${id} claims evidence without source_urls or eval_case_ids`);
+    if (!["official_rule", "evidence_backed_practice", "user_preference", "heuristic"].includes(evidenceType)) issues.push(`domain-evidence ${id} has invalid evidence_type`);
+    if (!sourceUrls.length && !evalCaseIds.length && evidenceType !== "user_preference") issues.push(`domain-evidence ${id} has no source_urls or eval_case_ids provenance`);
   });
-  const dag = compileWorkflowDag(normalizeWorkflowDagSteps(ir.runtimeContract?.workflow), ["$request", "$source", "$confirmed", ...ir.inputs.map((item) => `input:${item.id}`)]);
+  const normalizedKnowledge = normalizeKnowledgeAssessment(ir.knowledgeAssessment, domainEvidence, Boolean(ir.capabilityDelta?.skillMustTeach?.length), ir.capabilityDelta?.skillMustTeach?.map((gap) => gap.id) || []);
+  if (JSON.stringify(ir.knowledgeAssessment) !== JSON.stringify(normalizedKnowledge)) issues.push("knowledgeAssessment 与 Canonical Domain Evidence 覆盖情况不一致");
+  const dag = compileWorkflowDag(
+    normalizeWorkflowDagSteps(ir.runtimeContract?.workflow),
+    ["$request", "$source", ...ir.inputs.map((item) => `input:${item.id}`)],
+    {
+      terminalOutputs: Object.values(WORKFLOW_TERMINALS),
+      requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed],
+    },
+  );
   issues.push(...dag.issues.map((item) => item.message));
   return { valid: issues.length === 0, issues };
 }
@@ -303,12 +394,17 @@ export function semanticSkillIRDigest(value: SkillIR | Record<string, string>) {
 export function parseCanonicalSkillIR(files: Record<string, string>) {
   try {
     const parsed = JSON.parse(files["evals/skill-ir.json"] || "") as SkillIR;
-    return {
+    return reconcileSkillIRUserEvidence({
       ...parsed,
       capabilityDelta: parsed.capabilityDelta || EMPTY_CAPABILITY_DELTA,
-      knowledgeAssessment: parsed.knowledgeAssessment || { status: "not-required", requiredCategories: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"], coveredCategories: [], missingCategories: [] },
+      knowledgeAssessment: normalizeKnowledgeAssessment(
+        parsed.knowledgeAssessment,
+        Array.isArray(parsed.domainEvidence) ? parsed.domainEvidence : [],
+        Boolean(parsed.capabilityDelta?.skillMustTeach?.length),
+        parsed.capabilityDelta?.skillMustTeach?.map((gap) => gap.id) || [],
+      ),
       runtimeContract: { ...parsed.runtimeContract, workflow: normalizeWorkflowDagSteps(parsed.runtimeContract?.workflow) },
-    };
+    });
   }
   catch { return null; }
 }

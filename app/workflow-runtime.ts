@@ -44,6 +44,16 @@ function now() {
 
 function serializeError(error: unknown) {
   if (error instanceof Error) return { name: error.name, message: error.message, stack: error.stack };
+  // Browser journals send Errors across JSON. Preserve their diagnostic
+  // fields instead of turning the already-serialized object into [object Object].
+  if (error && typeof error === "object" && "message" in error && typeof error.message === "string") {
+    const record = error as Record<string, unknown>;
+    return {
+      message: record.message,
+      ...(typeof record.name === "string" ? { name: record.name } : {}),
+      ...(typeof record.code === "string" ? { code: record.code } : {}),
+    };
+  }
   return { message: String(error || "Unknown workflow error") };
 }
 

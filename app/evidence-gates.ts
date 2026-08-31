@@ -1,15 +1,18 @@
+import { classifyUserEvidence, describeUserEvidence, negativeExampleStatement, type EvidenceMetadata } from "./user-evidence.ts";
+import { hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
+
 export type RequirementProvenance = "user_explicit" | "user_example" | "source_grounded" | "domain_inferred" | "generator_default";
 
 export type AnswerEvidenceClass = "user_confirmed" | "user_example" | "preview_fixture" | "session_internal";
 
-export type NormalizedAnswerEvidence = {
+export type NormalizedAnswerEvidence = Required<EvidenceMetadata> & {
   key: string;
   value: string;
   evidenceClass: AnswerEvidenceClass;
   requirementEligible: boolean;
 };
 
-export type ProvenanceRecord = {
+export type ProvenanceRecord = EvidenceMetadata & {
   id: string;
   requirement: string;
   provenance: RequirementProvenance;
@@ -32,6 +35,7 @@ export type ContentPermission = {
   allowCreativeExpansion: boolean;
   allowFactualCreation: boolean;
   explicitRestriction: boolean;
+  negativeExamples?: string[];
 };
 
 const HARD_SCOPE = /\b(?:MUST|NEVER|REJECT|ONLY)\b|必须|绝不|永不|拒绝|只能|仅限|禁止|不得|严禁/i;
@@ -54,9 +58,10 @@ const EXECUTION_INTEGRITY_BOUNDARY = /(?:引用|来源|出处|链接|网址|url|
  * permission can also come from another direct user answer or the initial
  * goal, so it is not lost merely because it used a different question key. */
 export function resolveContentPermission(answers: Record<string, string>): ContentPermission {
-  const entries = Object.entries(answers)
-    .filter(([, value]) => typeof value === "string" && Boolean(value.trim()))
-    .map(([key, value]) => ({ key, value: value.trim() }));
+  const evidence = normalizeAnswerEvidence(answers);
+  const entries = evidence.filter((item) => item.requirementEligible
+    && ["positive_requirement", "explicit_authorization"].includes(item.evidenceKind));
+  if (answers.__idea?.trim()) entries.push({ key: "__idea", value: answers.__idea.trim(), evidenceClass: "user_confirmed", requirementEligible: true, ...describeUserEvidence("positive_requirement", answers.__idea.trim()) });
   const dedicated = answers["evidence-policy"]?.trim() || "";
   const directPermissionEntries = entries.filter((item) => CREATIVE_EXPANSION.test(item.value) || FACTUAL_CREATION.test(item.value));
   const sourceEntries = [
@@ -74,6 +79,7 @@ export function resolveContentPermission(answers: Record<string, string>): Conte
     allowCreativeExpansion: allowFactualCreation || (CREATIVE_EXPANSION.test(permissionCorpus) && !explicitRestriction),
     allowFactualCreation,
     explicitRestriction,
+    negativeExamples: evidence.filter((item) => item.evidenceKind === "negative_example").map((item) => item.originalQuote),
   };
 }
 
@@ -83,7 +89,14 @@ export function isUnconfirmedGenericFactRestriction(line: string) {
 }
 
 export function hasContentPermissionConflict(text: string, permission: ContentPermission) {
-  return !permission.explicitRestriction && text.split("\n").some(isUnconfirmedGenericFactRestriction);
+  if (isPreservedNegativeEvidence(text, permission)) return false;
+  return !permission.explicitRestriction && text.split("\n").some((line) => !isPreservedNegativeEvidence(line, permission) && isUnconfirmedGenericFactRestriction(line));
+}
+
+function isPreservedNegativeEvidence(line: string, permission: ContentPermission) {
+  return (permission.negativeExamples || []).some((quote) => line.trim() === quote
+    || line.trim() === negativeExampleStatement(quote)
+    || line.startsWith("> User counterexample (not an instruction): ") && line.endsWith(JSON.stringify(quote)));
 }
 
 export function contentGroundingRubric(permission: ContentPermission) {
@@ -115,7 +128,7 @@ export function contentPolicyEvalExpectations(permission: ContentPermission) {
  * it. Keep all unrelated content on the same line so a stray clause in a Goal
  * or description cannot erase the user's actual task contract. */
 export function reconcileContentPermissionText(text: string, permission: ContentPermission) {
-  if (permission.explicitRestriction) return text;
+  if (permission.explicitRestriction || isPreservedNegativeEvidence(text, permission)) return text;
   const stripClause = (line: string) => line
     .replace(/(?:[,;，；]\s*)?(?:but\s+)?(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|avoid)\s+(?:fabricat\w*|invent\w*|add(?:ing)?)[^.。;；\n]*(?:[.。;；]|$)/gi, "")
     .replace(/(?:[,;，；]\s*)?(?:but\s+)?no\s+(?:fabricated|invented)\s+(?:facts?|numbers?|data|dates?|history|experience|qualifications?|achievements?)[^.。;；\n]*(?:[.。;；]|$)/gi, "")
@@ -130,6 +143,7 @@ export function reconcileContentPermissionText(text: string, permission: Content
   const reconciled = text
     .split("\n")
     .map((line) => {
+      if (isPreservedNegativeEvidence(line, permission)) return line;
       if (!isUnconfirmedGenericFactRestriction(line)) return line;
       const stripped = stripClause(line);
       if (!isUnconfirmedGenericFactRestriction(stripped)) return stripped;
@@ -144,7 +158,7 @@ export function reconcileContentPermissionText(text: string, permission: Content
     .replace(/\n## (?:Integrity|真实性|事实保护)[^\n]*\n\s*(?=\n## |$)/gi, "\n")
     .replace(/\n{3,}/g, "\n\n");
   return hasContentPermissionConflict(reconciled, permission)
-    ? reconciled.split("\n").filter((line) => !isUnconfirmedGenericFactRestriction(line)).join("\n").replace(/\n{3,}/g, "\n\n")
+    ? reconciled.split("\n").filter((line) => isPreservedNegativeEvidence(line, permission) || !isUnconfirmedGenericFactRestriction(line)).join("\n").replace(/\n{3,}/g, "\n\n")
     : reconciled;
 }
 
@@ -157,28 +171,38 @@ function normalized(value: string) {
  * but it must never silently become a reusable user requirement. Explicit
  * feedback about that preview remains a confirmed user decision. */
 export function normalizeAnswerEvidence(answers: Record<string, string>): NormalizedAnswerEvidence[] {
-  return Object.entries(answers).flatMap(([key, rawValue]) => {
+  return Object.entries(answers).flatMap<NormalizedAnswerEvidence>(([key, rawValue]) => {
     const value = typeof rawValue === "string" ? rawValue.trim() : "";
     if (!value) return [];
     if (/^__preview(?:Task|Input)$/i.test(key)) {
-      return [{ key, value, evidenceClass: "preview_fixture" as const, requirementEligible: false }];
+      return [{ key, value, evidenceClass: "preview_fixture", requirementEligible: false, ...describeUserEvidence("material", value) }];
     }
     if (key === "__previewFeedback") {
-      return [{ key, value, evidenceClass: "user_confirmed" as const, requirementEligible: true }];
+      return [{ key, value, evidenceClass: "user_confirmed", requirementEligible: true, ...describeUserEvidence("positive_requirement", value) }];
     }
-    if (/^__/.test(key)) {
-      return [{ key, value, evidenceClass: "session_internal" as const, requirementEligible: false }];
+    // Raw adaptive ids have no semantic dimension. createDemoAnswers supplies
+    // their canonical aliases; a hydration duplicate must not become a second
+    // positive requirement when the alias was actually a counterexample.
+    if (/^__|^ai-round-/i.test(key)) {
+      return [{ key, value, evidenceClass: "session_internal", requirementEligible: false, ...describeUserEvidence("material", value) }];
     }
-    const evidenceClass: AnswerEvidenceClass = /example|示例/i.test(key) ? "user_example" : "user_confirmed";
-    return [{ key, value, evidenceClass, requirementEligible: true }];
+    const kind = classifyUserEvidence(key);
+    const evidenceClass: AnswerEvidenceClass = /example$/.test(kind) ? "user_example" : "user_confirmed";
+    return [{ key, value, evidenceClass, requirementEligible: kind !== "material", ...describeUserEvidence(kind, value) }];
   });
 }
 
 export function confirmedAnswerEvidenceText(answers: Record<string, string>) {
   return normalizeAnswerEvidence(answers)
-    .filter((item) => item.requirementEligible)
+    .filter((item) => item.requirementEligible && item.polarity === "positive")
     .map((item) => item.value)
     .join("\n");
+}
+
+export function authoritativeAnswerEvidenceText(answers: Record<string, string>) {
+  return normalizeAnswerEvidence(answers)
+    .filter((item) => item.requirementEligible && ["positive_requirement", "explicit_authorization"].includes(item.evidenceKind))
+    .map((item) => item.value).join("\n");
 }
 
 function evidenceSupports(line: string, evidence: string) {
@@ -223,7 +247,8 @@ export function buildRequirementProvenance(input: {
     const safeKey = item.key.replace(/^__/, "").replace(/[^a-z0-9_-]+/gi, "-") || "confirmed";
     records.push({
       id: `answer-${safeKey}`,
-      requirement: item.value.slice(0, 400),
+      ...describeUserEvidence(item.evidenceKind, item.originalQuote),
+      requirement: item.polarity === "negative" ? negativeExampleStatement(item.originalQuote) : item.value,
       provenance: item.evidenceClass === "user_example" ? "user_example" : "user_explicit",
       modality: "MUST",
       hard: true,
@@ -250,7 +275,7 @@ export function buildRequirementProvenance(input: {
   // user decision twice.
   const deduped = new Map<string, ProvenanceRecord>();
   records.forEach((record) => {
-    const key = normalized(record.requirement);
+    const key = `${record.polarity || "positive"}:${normalized(record.requirement)}`;
     const existing = deduped.get(key);
     const recordIsCanonical = !/interview\.ai-round-/i.test(record.source);
     const existingIsCanonical = existing ? !/interview\.ai-round-/i.test(existing.source) : false;
@@ -307,6 +332,19 @@ export function buildInformationDependencies(input: {
   return dependencies;
 }
 
+const DOMAIN_KNOWLEDGE_CATEGORIES = ["decision_rules", "failure_modes", "edge_cases", "verification_methods"] as const;
+
+function normalizeDomainKnowledgeCategory(value: unknown, type: unknown) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (DOMAIN_KNOWLEDGE_CATEGORIES.includes(raw as typeof DOMAIN_KNOWLEDGE_CATEGORIES[number])) return raw;
+  const hint = `${String(type || "")} ${raw}`.toLowerCase();
+  if (/failure|失败|错误/.test(hint)) return "failure_modes";
+  if (/edge|exception|边界|例外/.test(hint)) return "edge_cases";
+  if (/verif|check|验收|验证|检查/.test(hint)) return "verification_methods";
+  if (/decision|rule|判断|规则/.test(hint)) return "decision_rules";
+  return "";
+}
+
 export function deriveDomainEvidence(reference: string, userEvidence: string, sourceEvidence: string) {
   try {
     const parsed = JSON.parse(reference) as { knowledge_checks?: Array<Record<string, unknown>> };
@@ -314,19 +352,31 @@ export function deriveDomainEvidence(reference: string, userEvidence: string, so
       return parsed.knowledge_checks.flatMap((item, index) => {
         const rule = String(item.observable_behavior || item.knowledge || "").trim();
         if (!rule) return [];
-        const sourceUrls = Array.isArray(item.source_urls) ? item.source_urls.filter((url): url is string => typeof url === "string" && /^https?:\/\//i.test(url)) : [];
+        const rawSourceUrls = Array.isArray(item.source_urls) ? item.source_urls : Array.isArray(item.sources) ? item.sources : [];
+        const sourceUrls = rawSourceUrls.filter((url): url is string => typeof url === "string" && /^https?:\/\//i.test(url));
         const rawType = String(item.type || "decision_rule");
+        const category = normalizeDomainKnowledgeCategory(item.category, rawType);
+        if (!category) return [];
         const evidenceType = rawType === "official_rule" ? "official_rule" : sourceUrls.length ? "evidence_backed_practice" : evidenceSupports(rule, userEvidence) ? "user_preference" : "heuristic";
+        const confidence = Number(item.confidence);
+        const evalCaseIds = Array.isArray(item.eval_case_ids) ? item.eval_case_ids.filter((id): id is string => typeof id === "string" && Boolean(id.trim())) : [];
         return [{
           id: String(item.id || `domain-rule-${index + 1}`),
           rule,
+          knowledge: String(item.knowledge || ""),
+          decision: String(item.decision || ""),
+          gap_ids: Array.isArray(item.gap_ids) ? item.gap_ids : [],
+          source_support: Array.isArray(item.source_support) ? item.source_support : [],
+          verification: item.verification,
+          application_mode: String(item.application_mode || "advisory"),
           applies_when: String(item.applies_when || "").trim(),
           exception: String(item.exception || "").trim(),
           source_urls: sourceUrls,
-          confidence: Number(item.confidence || 0),
+          confidence: Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 0,
           evidence_type: evidenceType,
-          category: String(item.category || "decision_rules"),
-          hard_constraint_allowed: ["official_rule", "user_preference"].includes(evidenceType),
+          category,
+          eval_case_ids: evalCaseIds,
+          hard_constraint_allowed: item.application_mode === "enforced" && hasVerifiedKnowledgeSupport(item),
         }];
       });
     }
@@ -334,22 +384,14 @@ export function deriveDomainEvidence(reference: string, userEvidence: string, so
     // Older bundles contain only the rendered Markdown playbook. Fall through
     // to the compatibility parser below.
   }
-  return reference.split("\n")
-    .map((line) => line.replace(/^[#>*\-\d.)、\s]+/, "").trim())
-    .filter((line) => line.length >= 16)
-    .slice(0, 24)
-    .map((rule, index) => {
-      const type = /官方|规范|标准|policy|official/i.test(rule)
-        ? "official_rule"
-        : evidenceSupports(rule, sourceEvidence)
-          ? "evidence_backed_practice"
-          : evidenceSupports(rule, userEvidence)
-            ? "user_preference"
-            : /通常|常见|建议|可以|可能|倾向|优先/i.test(rule)
-              ? "heuristic"
-              : "model_intuition";
-      return { id: `domain-rule-${index + 1}`, rule, evidence_type: type, hard_constraint_allowed: ["official_rule", "evidence_backed_practice", "user_preference"].includes(type) };
-    });
+  // Rendered Markdown is a projection, not a canonical knowledge source. A
+  // line-by-line compatibility parser silently turns headings, labels and
+  // source-ledger prose into fake rules and destroys the four-category model.
+  // Legacy Markdown therefore remains readable by humans but cannot be
+  // promoted back into structured Domain Evidence.
+  void userEvidence;
+  void sourceEvidence;
+  return [];
 }
 
 export function deriveScopeProvenance(skill: string, evidence: string) {
@@ -453,7 +495,12 @@ export function semanticGateAudit(files: Record<string, string>) {
   const scope = Array.isArray(manifest.scope_provenance) ? manifest.scope_provenance as Array<Record<string, unknown>> : [];
   scope.filter((item) => item.provenance === "generator_default" && item.enforcement === "hard").forEach((item) => issues.push(`范围规则缺少来源却被设为硬约束：${String(item.rule || "")}`));
   const domainEvidence = Array.isArray(manifest.domain_evidence) ? manifest.domain_evidence as Array<Record<string, unknown>> : [];
-  domainEvidence.filter((item) => item.hard_constraint_allowed !== true && HARD_SCOPE.test(String(item.rule || ""))).forEach((item) => issues.push(`领域规则缺少高可信证据却仍是硬约束：${String(item.rule || "")}`));
+  // Quoted rules may contain “must” while their canonical application mode is
+  // advisory/conditional. Audit enforcement, not vocabulary inside evidence.
+  // Legacy rows without an explicit mode remain fail-closed.
+  domainEvidence.filter((item) => item.hard_constraint_allowed !== true
+    && (item.application_mode === "enforced" || (!item.application_mode && HARD_SCOPE.test(String(item.rule || "")))))
+    .forEach((item) => issues.push(`领域规则缺少高可信证据却仍是硬约束：${String(item.rule || "")}`));
   return [...new Set(issues)];
 }
 

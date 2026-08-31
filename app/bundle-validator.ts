@@ -1,4 +1,6 @@
 import { auditSkillIRFiles } from "./skill-ir.ts";
+import { hasUnscopedActionPermissionConflict } from "./action-permission.ts";
+import { capabilityDeltaGapIsDefensible, type CapabilityDeltaGap } from "./capability-delta.ts";
 
 export type BundleIssuePriority = "P0" | "P1";
 export type BundleIssueCategory = "P0_EXECUTION_BLOCKER" | "P1_CONTRACT_BLOCKER";
@@ -38,11 +40,10 @@ const REQUIRED_HARNESS = [
 ];
 
 const RUNTIME_FILE_REFERENCE = /\b(?:references|scripts|assets|integrations)\/[A-Za-z0-9_./-]+\.(?:md|json|py|sh|csv|tsv|txt|ya?ml|html|xlsx?)\b/g;
-const ASK_FIRST_SIGNAL = /(?:先|必须|需要|应当|务必).{0,10}(?:询问|追问|确认|征求)|(?:等待|暂停|停止).{0,12}(?:用户|确认|回复|输入)|(?:ask|confirm|wait for).{0,16}(?:user|approval|input)/i;
-const AUTONOMOUS_SIGNAL = /(?:自主|自动|直接|无需确认|不必询问|不用询问|默认).{0,12}(?:推进|继续|执行|完成|处理|补全|决定)|(?:proceed|continue|execute|complete).{0,12}(?:autonomously|without confirmation|without asking)/i;
-const SCOPED_AUTONOMY_SIGNAL = /(?:低风险|非关键|可逆).{0,80}(?:关键|高风险|不可逆)|(?:关键|高风险|不可逆).{0,80}(?:低风险|非关键|可逆)|(?:除非|仅当|只有|否则|分别|根据.{0,12}(?:风险|情况|条件))/i;
 const PROMPT_TEMPLATE_SIGNAL = /(?:相邻任务|complete the task|do the task|待替换|在此(?:填写|输入)|placeholder|示例任务(?:\s*\d+)?)/i;
 const GENERIC_INPUT_SIGNAL = /^(?:用户)?(?:补充|其他|相关|必要|更多|通用)?(?:的)?(?:输入|信息|资料|内容|上下文|材料)$/i;
+const VAGUE_TASK_INPUT_SIGNAL = /^(?:我)?(?:不确定[,，；;\s]*)?(?:请)?\s*(?:AI|模型)?\s*(?:帮我)?(?:判断|决定|处理)|^(?:当前)?(?:任务)?(?:说明)?与(?:所需)?材料$/i;
+const UNSUPPORTED_FACT_CREATION_SIGNAL = /(?:(?:未确认|没有|缺少|可能没有|未知).{0,48}(?:可以|可|允许)?\s*(?:编造|虚构|捏造))|(?:(?:可以|可|允许)\s*(?:直接)?(?:编造|虚构|捏造).{0,32}(?:事实|经历|数据|技能|项目)?)/i;
 
 // Detection method and failure severity are separate dimensions. Everything in
 // this validator is deterministic, but only failures that prevent the bundle
@@ -107,6 +108,15 @@ function validateSkillFrontmatter(skill: string, issues: BundleStaticIssue[]) {
   const keys = fields.map((item) => item[1]);
   if (fields.length !== lines.length || !keys.includes("name") || !keys.includes("description")) {
     pushIssue(issues, "INVALID_SKILL_FRONTMATTER", "SKILL.md", "SKILL.md frontmatter 必须包含可解析的 name 与 description");
+  }
+  const values = new Map(fields.map((item) => [item[1], item[2].trim().replace(/^['"]|['"]$/g, "")]));
+  const name = values.get("name") || "";
+  const description = values.get("description") || "";
+  if (name && (name.length > 64 || !/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name))) {
+    pushIssue(issues, "INVALID_SKILL_FRONTMATTER", "SKILL.md", "Skill name 必须为 1–64 个小写字母、数字或单连字符，且不能以连字符开头或结尾");
+  }
+  if (description && (description.length > 1024 || description.length < 10)) {
+    pushIssue(issues, "INVALID_SKILL_FRONTMATTER", "SKILL.md", "Skill description 必须为 10–1024 个字符，并说明能力与适用场景");
   }
   const extras = keys.filter((key) => !["name", "description"].includes(key));
   if (extras.length) pushIssue(issues, "INVALID_SKILL_FRONTMATTER", "SKILL.md", `SKILL.md frontmatter 含不允许的字段：${extras.join("、")}`);
@@ -175,6 +185,10 @@ function markdownContractUnits(content: string) {
 }
 
 function jsonContractUnits(value: unknown, prefix = "root"): Array<{ key: string; text: string }> {
+  // Capability Delta is non-executable design rationale. Its bare-model
+  // counterexamples/hypotheses are not runtime permission grants. Executable
+  // workflow, requirements and tool contracts remain subject to this gate.
+  if (prefix === "root.capabilityDelta") return [];
   if (Array.isArray(value)) return value.flatMap((item, index) => jsonContractUnits(item, `${prefix}[${index}]`));
   if (!value || typeof value !== "object") return [];
   const object = value as Record<string, unknown>;
@@ -208,7 +222,7 @@ function validateContentPermissionCoherence(files: Record<string, string>, issue
   const runtimeFiles = Object.entries(files).filter(([path]) => path === "SKILL.md" || /^references\/.*\.(?:md|txt)$/i.test(path));
   runtimeFiles.forEach(([path, content]) => {
     markdownContractUnits(content).forEach((unit) => {
-      if (ASK_FIRST_SIGNAL.test(unit.text) && AUTONOMOUS_SIGNAL.test(unit.text) && !SCOPED_AUTONOMY_SIGNAL.test(unit.text)) {
+      if (hasUnscopedActionPermissionConflict(unit.text)) {
         pushIssue(issues, "CONTRADICTORY_ACTION_PERMISSION", path, `第 ${unit.line} 行在同一规则中同时要求先问与自主推进，且没有条件分支`);
       }
     });
@@ -217,7 +231,7 @@ function validateContentPermissionCoherence(files: Record<string, string>, issue
     if (!files[path]) return;
     try {
       jsonContractUnits(JSON.parse(files[path])).forEach((unit) => {
-        if (ASK_FIRST_SIGNAL.test(unit.text) && AUTONOMOUS_SIGNAL.test(unit.text) && !SCOPED_AUTONOMY_SIGNAL.test(unit.text)) {
+        if (hasUnscopedActionPermissionConflict(unit.text)) {
           pushIssue(issues, "CONTRADICTORY_ACTION_PERMISSION", path, `${unit.key} 同时要求先问与自主推进，且没有条件分支`);
         }
       });
@@ -259,6 +273,9 @@ function validatePromptCompleteness(files: Record<string, string>, issues: Bundl
   });
   prompts.forEach((prompt) => {
     if (/[；;]\s*$/.test(prompt.value)) pushIssue(issues, "INCOMPLETE_PROMPT", prompt.path, `${prompt.key} 以未完成的分号结尾`);
+    const unmatchedPair = [["“", "”"], ["「", "」"], ["『", "』"], ["（", "）"], ["【", "】"]]
+      .find(([open, close]) => prompt.value.split(open).length !== prompt.value.split(close).length);
+    if (unmatchedPair) pushIssue(issues, "INCOMPLETE_PROMPT", prompt.path, `${prompt.key} 含未闭合的 ${unmatchedPair[0]}${unmatchedPair[1]}，疑似模型输出被截断`);
     if (PROMPT_TEMPLATE_SIGNAL.test(prompt.value)) pushIssue(issues, "TEMPLATE_PROMPT_TEXT", prompt.path, `${prompt.key} 仍含生成器样板词：${prompt.value.match(PROMPT_TEMPLATE_SIGNAL)?.[0] || "template"}`);
   });
 }
@@ -291,7 +308,7 @@ function validateSkillIRInputSpecificity(files: Record<string, string>, issues: 
     const inputs = Array.isArray(parsed.inputs) ? parsed.inputs : [];
     inputs.forEach((input, index) => {
       const label = String(input.name || input.concept || input.id || `input-${index + 1}`).trim();
-      if (inputs.length > 1 && GENERIC_INPUT_SIGNAL.test(label.replace(/[\s_-]+/g, ""))) {
+      if (GENERIC_INPUT_SIGNAL.test(label.replace(/[\s_-]+/g, "")) || VAGUE_TASK_INPUT_SIGNAL.test(label)) {
         pushIssue(issues, "BOILERPLATE_INPUT_OVERLAP", "evals/skill-ir.json", `输入“${label}”是无法区分来源或用途的通用样板，与已有具体输入重叠`);
       }
     });
@@ -309,12 +326,38 @@ function validateSkillIRInputSpecificity(files: Record<string, string>, issues: 
   } catch { /* JSON parsing reports its own P0 issue. */ }
 }
 
+function validateCanonicalSkillValue(files: Record<string, string>, issues: BundleStaticIssue[]) {
+  if (!files["evals/skill-ir.json"]) return;
+  try {
+    const ir = JSON.parse(files["evals/skill-ir.json"]) as Record<string, unknown>;
+    const delta = ir.capabilityDelta && typeof ir.capabilityDelta === "object" ? ir.capabilityDelta as Record<string, unknown> : {};
+    const gaps = Array.isArray(delta.skillMustTeach) ? delta.skillMustTeach : [];
+    gaps.forEach((gap, index) => {
+      if (!gap || typeof gap !== "object" || Array.isArray(gap) || !capabilityDeltaGapIsDefensible(gap as Partial<CapabilityDeltaGap>)) {
+        pushIssue(issues, "NON_DEFENSIBLE_CAPABILITY_DELTA", "evals/skill-ir.json", `Capability Delta 第 ${index + 1} 项只是普通工作流复述、字段不完整，或没有说明具体失败与新增决策`);
+      }
+    });
+    const assessment = ir.knowledgeAssessment && typeof ir.knowledgeAssessment === "object" ? ir.knowledgeAssessment as Record<string, unknown> : {};
+    if (gaps.length > 0 && assessment.status === "not-required") {
+      pushIssue(issues, "KNOWLEDGE_REQUIREMENT_BYPASSED", "evals/skill-ir.json", "Capability Delta 已声明专属能力差值，但专业知识被标记为 not-required；必须采集四类知识或明确标记 insufficient");
+    }
+    const permission = ir.controlModel && typeof ir.controlModel === "object"
+      ? (ir.controlModel as Record<string, unknown>).contentPermission
+      : null;
+    const factualCreationAllowed = Boolean(permission && typeof permission === "object" && (permission as Record<string, unknown>).allowFactualCreation === true);
+    if (!factualCreationAllowed && UNSUPPORTED_FACT_CREATION_SIGNAL.test(files["references/source-evidence.md"] || "")) {
+      pushIssue(issues, "UNSUPPORTED_FACT_CREATION", "references/source-evidence.md", "来源证据允许编造未确认事实，但 Canonical content permission 明确禁止 factual creation");
+    }
+  } catch { /* JSON parsing reports its own P0 issue. */ }
+}
+
 export function validateBundleContentCoherence(files: Record<string, string>) {
   const issues: BundleStaticIssue[] = [];
   validateContentPermissionCoherence(files, issues);
   validateAdjacentDuplicateSentences(files, issues);
   validatePromptCompleteness(files, issues);
   validateSkillIRInputSpecificity(files, issues);
+  validateCanonicalSkillValue(files, issues);
   return [...new Map(issues.map((issue) => [`${issue.code}:${issue.path}:${issue.message}`, issue])).values()];
 }
 

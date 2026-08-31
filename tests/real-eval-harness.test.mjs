@@ -5,6 +5,8 @@ import {
   anonymizeComparison,
   buildHarnessReport,
   compareHarnessBenchmarks,
+  compactHarnessExecutionsForGrade,
+  composeEvaluationEpisodes,
   freezeEvalContract,
   normalizeBlindComparison,
   normalizeHarnessExecutions,
@@ -94,6 +96,57 @@ function gradePayload(score) {
   };
 }
 
+test("collapses capability cases into bounded two-turn episodes", () => {
+  const source = [
+    ...cases(),
+    {
+      ...cases()[0],
+      id: "core-2",
+      capabilityIds: ["resume-grounding"],
+      expected: {
+        behaviors: ["使用用户提供的简历事实交付最终结果"],
+        mustNot: ["虚构用户经历"],
+        artifacts: ["resume.md"],
+      },
+    },
+  ];
+  const episodes = composeEvaluationEpisodes(source, 2);
+  assert.equal(episodes.length, 2);
+  const productive = episodes.find((item) => item.shouldTrigger);
+  const boundary = episodes.find((item) => !item.shouldTrigger);
+  assert.equal(productive?.turns?.length, 2);
+  assert.equal(productive?.turns?.[0].checkpoint, "input");
+  assert.equal(productive?.turns?.[1].checkpoint, "final");
+  assert.equal(boundary?.turns, undefined, "a trigger boundary should stay a cheap single-turn check");
+  assert.ok(episodes.some((item) => item.capabilityIds.includes("resume-grounding")));
+  assert.ok(episodes.some((item) => item.expected.behaviors.some((behavior) => /最终一轮交付/.test(behavior))));
+});
+
+test("grading payload keeps final artifacts without repeating executor metadata", () => {
+  const compact = compactHarnessExecutionsForGrade([{
+    runId: "run-1",
+    caseId: "core-1",
+    configuration: "candidate",
+    runIndex: 1,
+    prompt: "duplicated frozen prompt",
+    output: "final deliverable",
+    triggered: true,
+    artifacts: [{ path: "outputs/result.md", summary: "result", content: "artifact body", verified: true }],
+    trace: ["large private trace"],
+    transcript: [
+      { role: "user", content: "first turn", turnId: "request" },
+      { role: "assistant", content: "send material", turnId: "request" },
+      { role: "user", content: "material", turnId: "final" },
+      { role: "assistant", content: "final deliverable", turnId: "final" },
+    ],
+    durationMs: 900,
+    outputChars: 17,
+  }]);
+  assert.deepEqual(Object.keys(compact[0]).sort(), ["artifacts", "caseId", "output", "transcript", "triggered"]);
+  assert.equal(compact[0].transcript.some((turn) => turn.content === "final deliverable"), false);
+  assert.equal(compact[0].artifacts[0].content, "artifact body");
+});
+
 test("freezes a stable private contract while withholding answers from the executor", () => {
   const first = freezeEvalContract(cases());
   const second = freezeEvalContract(cases());
@@ -120,6 +173,29 @@ test("executor runtime bundle excludes hidden eval contracts and bounds large re
   assert.equal("evals/graders.json" in bundle, false);
   assert.equal("agents/openai.yaml" in bundle, false);
   assert.ok(JSON.stringify(bundle).length < 45_000);
+});
+
+test("executor runtime bundle loads only capability-relevant resources for an eval batch", () => {
+  const files = {
+    "SKILL.md": "# Runtime instructions",
+    "references/requirements.md": "shared requirements",
+    "references/domain-playbook.md": "shared domain rules",
+    "scripts/selected.py": "# uses assets/selected.json\nprint('selected')",
+    "assets/selected.json": "{\"selected\":true}",
+    "scripts/unrelated.py": "print('unrelated secret')",
+    "evals/skill-ir.json": JSON.stringify({
+      capabilities: [
+        { id: "selected-capability", implementation: { path: "scripts/selected.py" } },
+        { id: "unrelated-capability", implementation: { path: "scripts/unrelated.py" } },
+      ],
+    }),
+  };
+  const bundle = runtimeSkillBundle(files, 20_000, { capabilityIds: ["selected-capability"], families: ["capability"] });
+  assert.ok(bundle["SKILL.md"]);
+  assert.ok(bundle["references/requirements.md"]);
+  assert.ok(bundle["scripts/selected.py"]);
+  assert.ok(bundle["assets/selected.json"]);
+  assert.equal("scripts/unrelated.py" in bundle, false);
 });
 
 test("separates execution and grading, enforces frozen assertions, and aggregates repeated runs", () => {

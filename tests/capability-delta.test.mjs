@@ -24,3 +24,29 @@ test("capability delta rejects generic quality filler and preserves behavior-cha
   assert.equal(delta.skillMustTeach[0].id, "extract-before-rewrite");
   assert.deepEqual(delta.researchFocus, ["事实抽取完成后应如何验证字段来源"]);
 });
+
+test("capability delta rejects a workflow restatement that adds no decision rule", () => {
+  const delta = normalizeCapabilityDelta({
+    skillMustTeach: [
+      {
+        id: "extract-keywords",
+        taskDecision: "从输入中提取关键词并输出列表",
+        bareModelBehavior: "裸模型可能提取关键词，但可能遗漏细节",
+        requiredSkillBehavior: "必须系统提取关键词并输出结构化列表",
+        whySkillIsNeeded: "确保提取全面，为后续处理提供依据",
+        researchQuestions: ["有哪些关键词"],
+      },
+      {
+        id: "source-boundary",
+        taskDecision: "补写候选事实前判断它是否有可追溯来源",
+        bareModelBehavior: "裸模型可能把合理推断直接写成用户事实",
+        requiredSkillBehavior: "有来源时才写成事实；否则标记为候选或待确认，不得混入最终事实层",
+        whySkillIsNeeded: "避免无来源内容被误写成真实经历且无法追溯",
+        researchQuestions: ["如何验证候选事实的来源"],
+      },
+    ],
+  });
+
+  assert.equal(delta.status, "ready");
+  assert.deepEqual(delta.skillMustTeach.map((item) => item.id), ["source-boundary"]);
+});

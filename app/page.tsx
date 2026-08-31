@@ -1,5 +1,15 @@
 "use client";
 
+import { classifyUserEvidence, describeUserEvidence, requirementEvidence } from "./user-evidence";
+import { repairWorkflowPlan } from "./workflow-plan-repair";
+import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases } from "./capability-routing";
+import { compileKnowledgeBatches, knowledgeClientTimeout, retainKnowledgeFailure } from "./knowledge-compiler";
+import { selectKnowledgeQueries } from "./knowledge-passages";
+import { runBlueprintPlanning, type BlueprintCheckpoint } from "./blueprint-planner";
+import { HOST_FILE_WORKSPACE_CAPABILITY } from "./host-file-capability";
+import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "./bundle-resource-repair";
+import { validateImplementationFiles } from "./canonical-mutations";
+
 import { ChangeEvent, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   OPTIMIZATION_EDIT_BUDGET,
@@ -70,6 +80,7 @@ import {
   reconcileArtifactOutputContract,
   removeResolvedFileObservations,
   reusableOutputAssetRequested,
+  screenCandidateBehavior,
   summarizeGenerationEvidence,
 } from "./generation-loop-core";
 import {
@@ -78,6 +89,7 @@ import {
   applyPatchPlan,
   attributeEvalFailure,
   auditCrossArtifactConsistency,
+  auditOpenSkillQuality,
   canonicalCapabilityContract,
   capabilityOwnsArtifacts,
   candidateUtility,
@@ -95,7 +107,7 @@ import {
   type EvalFailureType,
   type PipelineIssue,
 } from "./skill-pipeline-core";
-import { classifyBundleIssue, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
+import { classifyBundleIssue, validateBundleContentCoherence, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
 import {
   applySkillIRMutations,
   feedbackRequirementMutations,
@@ -127,6 +139,7 @@ import {
 import {
   bindSkillIREvals,
   compileSkillIR,
+  deriveTaskInputContract,
   ensureSkillIREvalCoverage,
   ensureSkillSemanticClosure,
   projectAgentMetadata,
@@ -139,6 +152,7 @@ import {
   projectStateReference,
   projectToolContracts,
   projectToolingReference,
+  reconcileSkillIRActionPermissions,
   reconcileSkillIRContentPermission,
   reconcileSkillIRInputResolutions,
   reconcileSkillIRSourceEvidence,
@@ -149,7 +163,11 @@ import {
   applyKnowledgePackToFiles,
   buildKnowledgeEvidencePayload,
   buildFollowupResearchQueries,
+  buildOptimizationResearchQueries,
   filterKnowledgePackAtoms,
+  applyKnowledgeVerification,
+  knowledgeVerificationCandidates,
+  knowledgeVerificationContext,
   knowledgePackIsPublishable,
   knowledgePackNeedsExpansion,
   mergeKnowledgePacks,
@@ -167,7 +185,7 @@ import {
 } from "./knowledge-research";
 import { dedupeResearchSources } from "./research-core";
 import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta";
-import { normalizeWorkflowDagSteps, type WorkflowDagStep } from "./workflow-dag";
+import { bindWorkflowCapabilities, normalizeWorkflowDagSteps, type WorkflowDagStep } from "./workflow-dag";
 import { verifyBundleScriptTests, verifyExecutionsInLocalSandbox } from "./eval-workflow-service";
 import { DurableWorkflowJournal } from "./workflow-client";
 import { completedNumericDecisionFixture, confirmedCorrectionEvalEvidence, confirmedOutputFields, ensureConfirmedCorrectionContract, ensureInformationDependencyContract, ensureProductiveCheckpointContract, ensureRuntimeKnowledgeRoutes, productiveCheckpointRequested, reconcileContractFacingFieldLabels, semanticIssueContradictsBundleBranchClaim, semanticIssueContradictsOwnMissingFieldClaim } from "./workflow-compiler";
@@ -175,6 +193,8 @@ import {
   anonymizeComparison,
   buildHarnessReport,
   compareHarnessBenchmarks,
+  compactHarnessExecutionsForGrade,
+  composeEvaluationEpisodes,
   freezeEvalContract,
   normalizeBlindComparison,
   normalizeHarnessExecutions,
@@ -253,8 +273,26 @@ type SourceInsight = {
 type BusyTask = "interview" | "blueprint" | "build" | "repair" | "evaluate" | "personalize";
 type RetryAction = "start-interview" | "advance-interview" | "regenerate-interview" | "build-blueprint" | "compile-skill" | "rerun-optimization-loop" | "rerun-multi-scene-comparison" | "repair-skill" | "evaluate" | "personalize";
 type BusyExecutionKind = "local" | "model" | "loop";
+type AiTokenUsage = {
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+  pendingPromptTokens: number;
+  requests: number;
+  estimated: boolean;
+};
+
+const EMPTY_AI_TOKEN_USAGE: AiTokenUsage = {
+  promptTokens: 0,
+  completionTokens: 0,
+  totalTokens: 0,
+  pendingPromptTokens: 0,
+  requests: 0,
+  estimated: false,
+};
 
 const SESSION_STORAGE_KEY = "skillcanvas.current-tab.v1";
+const NO_SKILL_HARNESS_CACHE_KEY = "skillcanvas.no-skill-harness.v2.7";
 // One-time migration key from the early prototype. Secrets are removed from
 // browser storage immediately and persisted through /api/credentials instead.
 const LEGACY_CREDENTIAL_STORAGE_KEY = "skillcanvas.local-credentials.v1";
@@ -471,36 +509,6 @@ type GenerationLoopState = {
   stopReason: string;
 };
 
-function describeMultiSceneComparison(loop: GenerationLoopState) {
-  const delta = loop.bestQualityScore - loop.baselineQualityScore;
-  if (loop.comparisonVerdict === "improved") {
-    return {
-      tone: "improved",
-      title: "专属 Skill 已证明有稳定增益",
-      detail: `当前 Skill 多场景总分高于普通 AI ${Math.max(0, delta)} 分，并通过了冻结任务与匿名质量对照。`,
-    };
-  }
-  if (delta > 0) {
-    return {
-      tone: "attention",
-      title: "多场景总分已提升，稳定性仍待确认",
-      detail: `当前 Skill 多场景总分高于普通 AI ${delta} 分，但冻结任务通过率或匿名质量对照尚未达到接受门槛，因此暂不宣称获得稳定增益。`,
-    };
-  }
-  if (delta < 0) {
-    return {
-      tone: "regressed",
-      title: "当前 Skill 出现多场景回退",
-      detail: `当前 Skill 多场景总分比普通 AI 低 ${Math.abs(delta)} 分，系统已保留原版本，不接受这次候选修改。`,
-    };
-  }
-  return {
-    tone: "equivalent",
-    title: "当前 Skill 与普通 AI 表现接近",
-    detail: "两者多场景总分持平；当前证据不足以证明稳定增益，系统不会夸大结果。",
-  };
-}
-
 type EvalResult = {
   label: string;
   detail: string;
@@ -666,6 +674,44 @@ function skillBundleRevision(files: Record<string, string>) {
   return `bundle-${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
+function estimateAiTokens(value: unknown) {
+  const serialized = typeof value === "string" ? value : JSON.stringify(value ?? "");
+  return Math.max(1, Math.ceil(serialized.length / 3.4));
+}
+
+function formatAiTokens(value: number) {
+  return new Intl.NumberFormat("zh-CN").format(Math.max(0, Math.round(value)));
+}
+
+function normalizeAiTokenUsage(value: unknown): AiTokenUsage {
+  if (!value || typeof value !== "object") return EMPTY_AI_TOKEN_USAGE;
+  const record = value as Record<string, unknown>;
+  const promptTokens = Number.isFinite(Number(record.promptTokens)) ? Math.max(0, Number(record.promptTokens)) : 0;
+  const completionTokens = Number.isFinite(Number(record.completionTokens)) ? Math.max(0, Number(record.completionTokens)) : 0;
+  return {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    pendingPromptTokens: 0,
+    requests: Number.isFinite(Number(record.requests)) ? Math.max(0, Math.round(Number(record.requests))) : 0,
+    estimated: Boolean(record.estimated),
+  };
+}
+
+function comparisonNeedsStabilityRepeat(left: HarnessReport, right: HarnessReport) {
+  const leftMetrics = summarizeGenerationEvidence(left.evidence);
+  const rightMetrics = summarizeGenerationEvidence(right.evidence);
+  const scoreGap = Math.abs(rightMetrics.score - leftMetrics.score);
+  // Repeat only when the candidate could plausibly cross an acceptance
+  // boundary. Two clearly failing configurations that happen to be one point
+  // apart do not become more useful after another expensive rollout.
+  const nearPassBoundary = rightMetrics.passRate >= 70 && rightMetrics.passRate < 90;
+  const nearQualityBoundary = rightMetrics.passRate >= 70 && rightMetrics.score >= 72 && rightMetrics.score < 84;
+  const nearLiftBoundary = rightMetrics.passRate >= 70 && scoreGap <= 5;
+  const potentiallyAcceptableCandidate = rightMetrics.score > leftMetrics.score && rightMetrics.passRate >= 80;
+  return nearPassBoundary || nearQualityBoundary || nearLiftBoundary || potentiallyAcceptableCandidate;
+}
+
 const BUSY_STAGES: Record<BusyTask, { title: string; stages: string[] }> = {
   interview: { title: "AI 正在先做一次，再理解你", stages: ["读取你的目标与资料", "选择代表性任务", "生成可判断的理解预演", "找出最值得确认的选择"] },
   blueprint: { title: "AI 正在整理理解", stages: ["汇总你的回答", "等待模型整理", "校验理解蓝图"] },
@@ -678,11 +724,15 @@ const BUSY_STAGES: Record<BusyTask, { title: string; stages: string[] }> = {
 const AI_MODE_LABELS: Record<string, string> = {
   "knowledge-plan": "识别专业知识缺口",
   "knowledge-compile": "把来源编译成专业规则",
+  "knowledge-verify": "核对来源支持与能力差值",
   preview: "生成第一版理解预演",
   interview: "生成下一轮理解问题",
   blueprint: "整理需求与能力蓝图",
   "blueprint-foundation": "整理六个需求模块",
   "blueprint-plan": "规划能力与执行闭环",
+  "blueprint-capabilities": "规划能力与交付要求",
+  "blueprint-workflow": "连接工作流与循环计划",
+  "workflow-repair": "修复输入、反馈与交付连线",
   build: "生成完整 Skill 候选",
   repair: "重写有问题的文件",
   "eval-execute": "在隔离上下文中执行冻结任务",
@@ -793,6 +843,10 @@ type OptimizationResearchDecision = {
   mcpEvidence?: {
     sourceCount: number;
     attempts: InternalMcpEvidenceReport["attempts"];
+  };
+  webEvidence?: {
+    sourceCount: number;
+    provider: ResearchProviderId;
   };
 };
 
@@ -1024,13 +1078,15 @@ const DEFAULT_CAPABILITY_PLAN: CapabilityPlan = {
   workflowSteps: [{
     id: "resolve-request",
     capabilityIds: ["core-reasoning"],
+    role: "deliver",
+    delivers: ["core-result"],
     when: "每次触发 Skill 时",
     input: "当前请求、必要上下文和约束",
     action: "解析输入、执行核心语义任务并形成可检查结果",
     output: "满足输出契约的真实结果",
     fallback: "缺少阻断输入时停止依赖分支并请求最少必要信息",
     requires: ["$request"],
-    produces: ["core-result"],
+    produces: ["core-result", "$output"],
     mutates: [],
   }],
   items: [
@@ -1083,15 +1139,7 @@ const CAPABILITY_STATUS_LABELS: Record<CapabilityStatus, string> = {
 };
 
 const CAPABILITY_LIBRARY: CapabilityCatalogItem[] = [
-  {
-    id: "host-file-workspace", kind: "builtin-tool", name: "读取与编辑工作区文件", path: "integrations/tool-contracts.json", layer: "runtime",
-    requirement: "按任务读取、创建、修改和检查本地文件", purpose: "让 Skill 能处理真实项目、文档和目录，而不只在对话里给建议",
-    reason: "适合需要基于现有文件继续工作或交付文件的任务", status: "use-provided", input: "用户授权范围内的文件路径和任务要求",
-    output: "可验证的文件内容或明确的文件变更", fallback: "请用户粘贴必要内容，或只给出不会冒充已写入文件的操作说明",
-    routingCondition: "任务明确涉及已有文件、项目目录或文件交付时", deterministicAdvantage: "宿主直接读写文件比让模型猜测内容可靠",
-    evaluationCriteria: ["只访问任务范围内文件", "修改结果可定位并可复核"], optional: true, enabled: false, recommended: false,
-    category: "文件与内容", hosts: ["Codex", "Claude Code", "Cursor", "Gemini CLI"],
-  },
+  HOST_FILE_WORKSPACE_CAPABILITY,
   {
     id: "host-document-reading", kind: "builtin-tool", name: "PDF 与文档解析", path: "integrations/tool-contracts.json", layer: "runtime",
     requirement: "从 PDF、Word 或长文档中提取结构和证据", purpose: "让上传资料真正进入任务，而不是只记录文件名",
@@ -1146,15 +1194,7 @@ const CAPABILITY_LIBRARY: CapabilityCatalogItem[] = [
     evaluationCriteria: ["没有重复或遗漏子任务", "主结果对各子结果做最终复核"], optional: true, enabled: false, recommended: false,
     category: "代码与自动化", hosts: ["Codex", "Claude Code（依宿主能力）"],
   },
-  {
-    id: "host-web-search", kind: "builtin-tool", name: "联网搜索与来源核验", path: "integrations/tool-contracts.json", layer: "runtime",
-    requirement: "查询可能变化的最新信息并核对来源", purpose: "让依赖时效性的结果使用真实网页证据",
-    reason: "适合新闻、价格、产品、政策、竞品和最新资料", status: "use-provided", input: "明确搜索问题、时间范围和优先来源",
-    output: "带链接、日期和关键证据的结论", fallback: "说明知识时点并请用户提供链接，不把旧知识写成最新事实",
-    routingCondition: "答案可能随时间变化，或用户明确要求搜索、核实和引用时", deterministicAdvantage: "真实检索结果可以核对日期和出处",
-    evaluationCriteria: ["关键时效事实有来源", "区分来源事实与模型推断"], optional: true, enabled: false, recommended: false,
-    category: "联网与界面", hosts: ["Codex", "Claude（需 Web Search 或 MCP）", "通用 Agent"],
-  },
+  HOST_WEB_SEARCH_CAPABILITY,
   {
     id: "host-browser-computer", kind: "builtin-tool", name: "浏览器与界面操作", path: "integrations/tool-contracts.json", layer: "runtime",
     requirement: "查看网页状态、填写界面或验证真实交互", purpose: "把网页任务从操作说明升级为可观察的界面执行与检查",
@@ -1356,10 +1396,12 @@ function createBuildTimeSkillContract(idea: string, answers: Record<string, stri
 }
 
 function ensureCanonicalBundledResources(ir: SkillIR, files: Record<string, string>, answers: Record<string, string>) {
-  return reconcileSkillIRSourceEvidence(
-    reconcileSkillIRInputResolutions(reconcileSkillIRContentPermission(ir, answers), answers),
+  return reconcileRuntimeInputResources(reconcileSkillIRSourceEvidence(
+    reconcileSkillIRActionPermissions(
+      reconcileSkillIRInputResolutions(reconcileSkillIRContentPermission(ir, answers), answers),
+    ),
     Boolean(files["references/source-evidence.md"]?.trim()),
-  );
+  ), files);
 }
 
 function reconcileCapabilityPlanWithCanonicalIR(plan: CapabilityPlan, ir: SkillIR | null) {
@@ -1474,7 +1516,7 @@ function createCanonicalSkillIR(input: {
         answers: input.answers,
         sourceEvidence,
         capabilityRequirements: activePlan.items,
-      }).map((item) => item.requirement).join("\n"),
+      }).filter((item) => item.polarity !== "negative" && item.evidenceKind !== "material").map((item) => item.requirement).join("\n"),
       `${userEvidence}\n${sourceEvidence}`,
     ),
     capabilityDelta: input.capabilityDelta || EMPTY_CAPABILITY_DELTA,
@@ -1832,6 +1874,43 @@ function friendlyReleaseBlocker(item: string) {
     .replace(/schema/gi, "结果格式");
 }
 
+function compactProductCopy(value: string, maxLength = 120) {
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return "";
+  const parts = normalized.match(/[^。！？!?]+[。！？!?]?/g) || [normalized];
+  const seen = new Set<string>();
+  const unique = parts.flatMap((part) => {
+    const sentence = part.trim();
+    const key = sentence.toLowerCase().replace(/[\s，。,.!?！？；;:：()（）"'“”‘’]/g, "");
+    if (!key || seen.has(key)) return [];
+    seen.add(key);
+    return [sentence];
+  });
+  let result = "";
+  for (const sentence of unique) {
+    if (result && result.length + sentence.length > maxLength) break;
+    result += sentence;
+    if (result.length >= maxLength) break;
+  }
+  const fallback = unique[0] || normalized;
+  const bounded = result || fallback;
+  return bounded.length > maxLength ? `${bounded.slice(0, maxLength - 1).trim()}…` : bounded;
+}
+
+function friendlyProductRisk(branch: RiskBranch) {
+  const condition = compactProductCopy(branch.condition, 72).replace(/[，,。.;；]+$/, "");
+  const prefix = /时$/.test(condition) ? condition : `${condition}时`;
+  const rawAction = (branch.stopOrRedirect || branch.action).trim();
+  if (/^(?:stop|pause|halt)(?:\b|\s|[，,。.;；])/i.test(rawAction)) {
+    return `${prefix}，会暂停并说明需要补充什么。`;
+  }
+  if (/^(?:redirect|reroute|route)(?:\b|\s|[，,。.;；])/i.test(rawAction)) {
+    return `${prefix}，会改走安全的替代流程，必要时请你确认。`;
+  }
+  const action = compactProductCopy(friendlyReleaseBlocker(rawAction), 92);
+  return `${prefix}，${action || "会暂停并说明原因。"}`;
+}
+
 function firstTaskExample(answers: Record<string, string>, fallback: string) {
   const trigger = (answers["trigger-language"] || "")
     .split(/[；;\n]/)
@@ -1961,6 +2040,7 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
   const hasHumanCheckpoint = /确认|询问|审批|同意|review|approve/i.test(`${answers.autonomy || ""} ${answers.boundary || ""} ${answers["delivery-checkpoint"] || ""}`);
   const productiveCheckpoint = productiveCheckpointRequested(answers);
   const representativeInput = answers.__previewInput?.trim().slice(0, 4_000) || "";
+  const executionFixtureReady = Boolean(representativeInput);
   const completedDecisionInput = completedNumericDecisionFixture(representativeInput).slice(0, 6_000);
   const executableProductiveCheckpoint = productiveCheckpoint && Boolean(representativeInput);
   const confirmedCorrection = confirmedCorrectionEvalEvidence(answers).slice(0, 1_200);
@@ -2029,14 +2109,25 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
       category: "core_capability",
       should_trigger: true,
       prompt: `${executionFixture} 本用例重点验证：${item.requirement}。${evalFamily === "integration" ? `本用例明确满足激活条件：${item.activationCondition || item.routingCondition}。` : ""}`,
-      context: { actual_task: concreteTask, workflow_checkpoint: executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", capability_scope: item.scope || normalizeCapabilityScope(item), activation_condition: item.activationCondition || item.routingCondition, routing_condition: item.routingCondition, input_contract: item.input, output_contract: item.output },
+      context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", workflow_checkpoint: executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", capability_scope: item.scope || normalizeCapabilityScope(item), activation_condition: item.activationCondition || item.routingCondition, routing_condition: item.routingCondition, input_contract: item.input, output_contract: item.output },
       capability_ids: [item.id],
-      expected: { behaviors: [...(item.evaluationCriteria.length ? item.evaluationCriteria.filter((criterion) => !(productiveCheckpoint && /确认|用户预期|主观|审批|规则|决策|选择/i.test(criterion))) : [item.output]), ...checkpointBehaviors, ...correctionBehaviors], must_not: ["只描述将如何完成而不产生真实结果", "使用与当前分支无关的资源", ...checkpointMustNot, ...correctionMustNot], artifacts: expectedArtifacts },
+      expected: {
+        behaviors: [
+          ...(item.evaluationCriteria.length ? item.evaluationCriteria.filter((criterion) => !(productiveCheckpoint && /确认|用户预期|主观|审批|规则|决策|选择/i.test(criterion))) : [item.output]),
+          "完成当前实际任务并交付至少一个符合输出契约的可检查结果",
+          ...(item.kind === "reference" ? ["把适用的专业规则用于当前结果，而不是只复述规则或分析过程"] : []),
+          ...checkpointBehaviors,
+          ...correctionBehaviors,
+        ],
+        must_not: ["只描述将如何完成而不产生真实结果", "只分析、只列步骤或只提出问题而不交付当前可完成的结果", "使用与当前分支无关的资源", ...checkpointMustNot, ...correctionMustNot],
+        artifacts: expectedArtifacts,
+      },
       graders: evalFamily === "integration"
         ? ["integration", ...(expectedArtifacts.length ? ["artifact_checker"] : [])]
         : evalFamily === "grounding"
           ? ["grounding", ...(expectedArtifacts.length ? ["artifact_checker"] : [])]
           : ["core_capability", ...(expectedArtifacts.length ? ["artifact_checker"] : [])],
+      runnable: executionFixtureReady,
     });
   });
 
@@ -2055,6 +2146,7 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
         artifacts: [],
       },
       graders: ["core_capability", "loop_control"],
+      runnable: true,
     });
   }
 
@@ -2065,10 +2157,11 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
       category: "failure_mode",
       should_trigger: true,
       prompt: `${executionFixture} 当前材料还可能诱导系统出现这种失败：“${failure}”。请避免该失败并完成仍可完成的部分。`,
-      context: { actual_task: concreteTask, workflow_checkpoint: executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", injected_failure_mode: failure },
+      context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", workflow_checkpoint: executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", injected_failure_mode: failure },
       capability_ids: semanticCapabilities.slice(0, 1).map((item) => item.id),
       expected: { behaviors: ["识别并避免指定失败模式", "仍完成可安全完成的核心任务或明确重定向", ...checkpointBehaviors, ...correctionBehaviors], must_not: [failure, ...checkpointMustNot, ...correctionMustNot], artifacts: [] },
       graders: ["failure_mode", "core_capability"],
+      runnable: executionFixtureReady,
     });
   });
 
@@ -2082,16 +2175,17 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
       category: "failure_mode",
       should_trigger: true,
       prompt: `${executionFixture} ${fixture.prompt}`,
-      context: { actual_task: concreteTask, failure_mode: fixture.failure_mode, fixture_type: "realistic_adversarial" },
+      context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", failure_mode: fixture.failure_mode, fixture_type: "realistic_adversarial" },
       capability_ids: [...semanticCapabilities, ...groundingCapabilities].slice(0, 2).map((item) => item.id),
       expected: { behaviors: fixture.observable_success, must_not: fixture.must_not, artifacts: [] },
       graders: ["grounding", "failure_mode", "core_capability"],
+      runnable: executionFixtureReady,
     });
   });
 
   const contentPermission = resolveContentPermission(answers);
   const contentPolicyExpected = contentPolicyEvalExpectations(contentPermission);
-  evals.push({ id: "behavior-content-policy", eval_family: "grounding", category: "content_policy", should_trigger: true, prompt: `${executionFixture} 我确认的内容改动范围是：${contentPolicy}。`, context: { actual_task: concreteTask, content_policy: contentPolicy }, capability_ids: groundingCapabilities.slice(0, 1).map((item) => item.id), expected: { ...contentPolicyExpected, artifacts: [] }, graders: ["grounding", "content_policy"] });
+  evals.push({ id: "behavior-content-policy", eval_family: "grounding", category: "content_policy", should_trigger: true, prompt: `${executionFixture} 我确认的内容改动范围是：${contentPolicy}。`, context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", content_policy: contentPolicy }, capability_ids: groundingCapabilities.slice(0, 1).map((item) => item.id), expected: { ...contentPolicyExpected, artifacts: [] }, graders: ["grounding", "content_policy"], runnable: executionFixtureReady });
 
   if (capabilityPlan.stateModel.needed) {
     evals.push({ id: "state-correction-and-expiry", eval_family: "grounding", category: "state_correctness", should_trigger: true, prompt: `继续完成${task}。我现在明确更正一项之前的信息，并要求删除已经到期的状态。`, context: { state_scope: capabilityPlan.stateModel.scope, correction: capabilityPlan.stateModel.correction, expiry: capabilityPlan.stateModel.expiry }, capability_ids: [], expected: { behaviors: ["显式更正优先于旧推断", "按到期规则删除或忽略状态", "只重算受影响部分"], must_not: ["继续沿用已更正值", "把一次性内容升级为持久偏好"], artifacts: [] }, graders: ["grounding", "state_correctness"] });
@@ -2101,12 +2195,12 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
   if (toolCapability) {
     evals.push({ id: "tool-unavailable-branch", eval_family: "integration", category: "tool_grounding", should_trigger: true, prompt: `请完成${task}，但本次运行环境没有返回“${toolCapability.name}”的可用能力或真实调用结果。`, context: { tool_available: false, capability_scope: toolCapability.scope || normalizeCapabilityScope(toolCapability), activation_condition: toolCapability.activationCondition || toolCapability.routingCondition, fallback: toolCapability.fallback }, capability_ids: [toolCapability.id], expected: { behaviors: ["不声称工具调用成功", `执行降级方案或停止依赖步骤：${toolCapability.fallback}`], must_not: ["虚构工具结果", "把配置说明当成已安装证明"], artifacts: [] }, graders: ["integration", "tool_grounding"] });
   } else {
-    evals.push({ id: "integration-negative-control", eval_family: "integration", category: "integration_control", should_trigger: true, prompt: `请只用当前输入完成${task}；本任务没有要求联网、图片、外部服务或文件产物。`, context: { active_integrations: [] }, capability_ids: [], expected: { behaviors: ["完成核心任务", "保持纯文本或当前约定交付"], must_not: ["虚构工具调用", "强行要求图片或外部文件"], artifacts: [] }, graders: ["integration"] });
+    evals.push({ id: "integration-negative-control", eval_family: "integration", category: "integration_control", should_trigger: true, prompt: `请只用当前输入完成${task}；本任务没有要求联网、图片、外部服务或文件产物。`, context: { fixture_status: executionFixtureReady ? "ready" : "missing", active_integrations: [] }, capability_ids: [], expected: { behaviors: ["完成核心任务", "保持纯文本或当前约定交付"], must_not: ["虚构工具调用", "强行要求图片或外部文件"], artifacts: [] }, graders: ["integration"], runnable: executionFixtureReady });
   }
 
   evals.push(
-    { id: "loop-continue-on-observed-gap", eval_family: "capability", category: "loop_control", should_trigger: true, prompt: `${executionFixture} 第一版已经生成，但当前子目标有一个可观察检查未通过。`, context: { actual_task: concreteTask, loop_mode: loopPlan.mode, current_round: 1, max_rounds: loopPlan.maxRounds }, capability_ids: semanticCapabilities.slice(0, 1).map((item) => item.id), expected: { behaviors: ["保持总目标稳定", "只修复失败项并复检受影响部分"], must_not: ["把评分项改成新目标", "无上限循环"], artifacts: [] }, graders: ["loop_control", "core_capability"] },
-    { id: "loop-stop-or-human-checkpoint", eval_family: "capability", category: "loop_control", should_trigger: true, prompt: `${executionFixture} 客观检查已通过，现在只剩主观判断，或当前循环已经达到上限。`, context: { actual_task: concreteTask, loop_mode: loopPlan.mode, current_round: loopPlan.maxRounds, scopes: loopPlan.scopes }, capability_ids: semanticCapabilities.slice(0, 1).map((item) => item.id), expected: { behaviors: loopPlan.mode === "goal-driven" ? ["按停止条件交付或升级阻塞项"] : ["停止自主迭代并请求一次聚焦判断"], must_not: ["声称已自主证明用户满意", "混淆任务重试与长期跟踪"], artifacts: [] }, graders: ["loop_control"] },
+    { id: "loop-continue-on-observed-gap", eval_family: "capability", category: "loop_control", should_trigger: true, prompt: `${executionFixture} 第一版已经生成，但当前子目标有一个可观察检查未通过。`, context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", loop_mode: loopPlan.mode, current_round: 1, max_rounds: loopPlan.maxRounds }, capability_ids: semanticCapabilities.slice(0, 1).map((item) => item.id), expected: { behaviors: ["保持总目标稳定", "只修复失败项并复检受影响部分"], must_not: ["把评分项改成新目标", "无上限循环"], artifacts: [] }, graders: ["loop_control", "core_capability"], runnable: executionFixtureReady },
+    { id: "loop-stop-or-human-checkpoint", eval_family: "capability", category: "loop_control", should_trigger: true, prompt: `${executionFixture} 客观检查已通过，现在只剩主观判断，或当前循环已经达到上限。`, context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", loop_mode: loopPlan.mode, current_round: loopPlan.maxRounds, scopes: loopPlan.scopes }, capability_ids: semanticCapabilities.slice(0, 1).map((item) => item.id), expected: { behaviors: loopPlan.mode === "goal-driven" ? ["按停止条件交付或升级阻塞项"] : ["停止自主迭代并请求一次聚焦判断"], must_not: ["声称已自主证明用户满意", "混淆任务重试与长期跟踪"], artifacts: [] }, graders: ["loop_control"], runnable: executionFixtureReady },
   );
 
   const firstByCategory = (category: string) => evals.find((item) => item.category === category);
@@ -2883,6 +2977,7 @@ function createExpandedGoal(idea: string, answers: Record<string, string>, hasSo
 }
 
 function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answers: Record<string, string>, sourceEvidence = "", capabilityPlan: CapabilityPlan = DEFAULT_CAPABILITY_PLAN, loopPlan: LoopPlan = deriveLoopPlan(idea, answers, capabilityPlan), canonicalIROverride?: SkillIR) {
+  if (canonicalIROverride) capabilityPlan = reconcileCapabilityPlanWithCanonicalIR(capabilityPlan, canonicalIROverride);
   capabilityPlan = ensureTaskCapabilities(capabilityPlan, idea, answers);
   capabilityPlan = reconcileCapabilityPlanWithFeedback(capabilityPlan, extractConfirmedPersonalizationFeedback(rawFiles["SKILL.md"] || ""));
   loopPlan = reconcileLoopPlanState(loopPlan, capabilityPlan);
@@ -2917,11 +3012,11 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   const description = genericDescription ? identity.description : existingDescription;
   let body = frontmatter ? originalSkill.slice(frontmatter[0].length).trim() : originalSkill.trim();
   body = reconcileConfirmedContentPolicy(body, answers);
-  body = reconcileDataMutationPolicy(body, Object.values(answers).join("\n"));
-  body = markUnconfirmedFormulasPending(body, Object.values(answers).join("\n"));
+  body = reconcileDataMutationPolicy(body, confirmedAnswerEvidenceText(answers));
+  body = markUnconfirmedFormulasPending(body, confirmedAnswerEvidenceText(answers));
   body = repairMarkdownEmphasis(body);
-  body = demoteUnsupportedConfirmationClaims(body, Object.values(answers).join("\n"));
-  body = demoteUnconfirmedQualityProxies(body, Object.values(answers).join("\n"));
+  body = demoteUnsupportedConfirmationClaims(body, confirmedAnswerEvidenceText(answers));
+  body = demoteUnconfirmedQualityProxies(body, confirmedAnswerEvidenceText(answers));
   body = body.replace(/\n## Missing-information protocol\s*\n[\s\S]*?(?=\n## |$)/gi, "").trim();
   body = body.replace(/\n## Integrity, privacy, and missing information\s*\n[\s\S]*?(?=\n## |$)/gi, "").trim();
   const goalSection = body.match(/(^|\n)## Goal\s*\n([\s\S]*?)(?=\n## |$)/i);
@@ -2969,7 +3064,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     };
   }
   const compiledDomainEvidence = files["references/domain-playbook.md"] || "";
-  const confirmedEvidence = `${idea}\n${Object.values(answers).join("\n")}\n${sourceEvidence}\n${compiledDomainEvidence}`;
+  const confirmedEvidence = `${idea}\n${confirmedAnswerEvidenceText(answers)}\n${sourceEvidence}\n${compiledDomainEvidence}`;
   delete files["references/confirmed-content-policy.md"];
   delete files["references/capability-plan.json"];
   const activeRuntimePaths = new Set(capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.layer === "runtime" && item.path).map((item) => item.path));
@@ -2998,8 +3093,8 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
       return;
     }
     files[path] = reconcileValidationVisibility(downgradeUngroundedHardConstraints(markUnconfirmedFormulasPending(
-      demoteUnconfirmedQualityProxies(repairMarkdownEmphasis(reconcileConfirmedContentPolicyArtifact(path, files[path], answers)), Object.values(answers).join("\n")),
-      Object.values(answers).join("\n"),
+      demoteUnconfirmedQualityProxies(repairMarkdownEmphasis(reconcileConfirmedContentPolicyArtifact(path, files[path], answers)), confirmedAnswerEvidenceText(answers)),
+      confirmedAnswerEvidenceText(answers),
     ), confirmedEvidence), confirmedEvidence);
   });
   const specialReferences = new Set(["references/source-evidence.md", "references/domain-playbook.md", "references/state-model.md", "references/output-contract.md", "references/tooling.md"]);
@@ -3175,11 +3270,14 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
   const blockers: string[] = [];
   const warnings: string[] = [];
   blockers.push(...semanticGateAudit(files));
+  // The UI/download gate must include the same P1 checks as the Build Loop.
+  // Otherwise an effect silently clears a real contract failure as "passed".
+  blockers.push(...validateBundleContentCoherence(files).map((issue) => `[${issue.code}] ${issue.message}`));
   if (!name || /my-personal-skill|generic-skill/i.test(name)) blockers.push("触发名称过于泛化");
   if (description.length < 40 || /help the user with|personally aligned/i.test(description) || !descriptionCoversSpecificDomain(description, answers.__idea || "")) blockers.push("触发描述缺少具体任务与使用场景");
   if (/Complete the task|sufficient context|material decision missing/i.test(evalText)) blockers.push("评测任务仍是占位文本");
   try {
-    const parsed = JSON.parse(evalText) as { evals?: Array<{ prompt?: string; expected?: { artifacts?: unknown[] }; eval_family?: string; category?: string; should_trigger?: boolean; graders?: string[]; capability_ids?: unknown[] }> };
+    const parsed = JSON.parse(evalText) as { evals?: Array<{ prompt?: string; expected?: { artifacts?: unknown[] }; eval_family?: string; category?: string; should_trigger?: boolean; graders?: string[]; capability_ids?: unknown[]; runnable?: boolean; context?: { fixture_status?: string } }> };
     const categories = new Set((parsed.evals || []).map((item) => item.category));
     const families = new Set((parsed.evals || []).map((item) => item.eval_family));
     if (!Array.isArray(parsed.evals) || parsed.evals.length < 10 || parsed.evals.length > 20) blockers.push("可执行评测应包含 10–20 条代表性任务");
@@ -3188,6 +3286,7 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
     else if (!parsed.evals.some((item) => item.should_trigger === true) || !parsed.evals.some((item) => item.should_trigger === false)) blockers.push("评测缺少正负触发标签");
     else if (parsed.evals.some(evalPromptIsTooShort)) blockers.push("评测任务描述过短，无法形成可执行输入");
     else if (parsed.evals.some(evalContractIsIncomplete)) blockers.push("评测缺少结构化预期或评分器绑定");
+    else if (parsed.evals.some((item) => item.category === "core_capability" && (item.runnable === false || item.context?.fixture_status === "missing"))) blockers.push("核心能力评测缺少可执行的代表性输入，不能用空材料冒充真实 Eval");
     else if (parsed.evals.some((item) => item.should_trigger === true && !Array.isArray(item.capability_ids))) blockers.push("评测没有说明每条任务在验证哪项能力");
     else if (parsed.evals.some((item) => item.graders?.includes("artifact_checker") && !item.expected?.artifacts?.length)) blockers.push("产物评分器被绑定到没有真实文件产物的用例");
   } catch {
@@ -3281,7 +3380,7 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
     if (files[testPath]) pythonScriptTestContractIssues(files[path], files[testPath], scriptModule).forEach((issue) => blockers.push(`${path}：${issue}`));
     pythonOutputContractIssues(files[path], files["references/output-contract.md"] || "").forEach((issue) => blockers.push(`${path}：${issue}`));
   });
-  const confirmedAnswerText = Object.values(answers).join("\n");
+  const confirmedAnswerText = confirmedAnswerEvidenceText(answers);
   if (hasDataMutationPolicyConflict(`${narrativeRuntimeText}\n${scriptRuntimeText}`, confirmedAnswerText)) blockers.push("缺失数据处理与用户确认的“不修改原始数据”冲突");
   const unconfirmedDefaults = [...new Set([
     ...findUnconfirmedOperationalDefaults(narrativeRuntimeText, confirmedAnswerText),
@@ -4033,9 +4132,7 @@ function applyCanonicalCandidate(input: {
   const mutated = applySkillIRMutations(normalizedCurrentIR, mutations);
   const irValidation = validateCanonicalSkillIR(mutated.ir);
   if (!irValidation.valid) throw new Error(`CanonicalMutation 未通过 IR Validator：${irValidation.issues.join("；")}`);
-  const implementationFiles = Object.fromEntries(Object.entries(input.implementationFiles || {}).filter((entry): entry is [string, string] => (
-    isImplementationBytePath(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1].trim())
-  )));
+  const implementationFiles = validateImplementationFiles(mutated.ir, input.implementationFiles);
   const candidateFiles = finalizeSkillFiles(
     { ...input.currentFiles, ...implementationFiles },
     input.idea,
@@ -4077,9 +4174,9 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
     // intentionally compact: it prevents update-to-the-same-value plans without
     // duplicating the entire Canonical SkillIR in the prompt.
     currentValues: {
-      requirements: ir.requirements.map((item) => ({ id: item.id, statement: item.statement, hard: item.hard, provenance: item.provenance })),
+      requirements: ir.requirements.map((item) => ({ id: item.id, statement: item.statement, hard: item.hard, provenance: item.provenance, ...requirementEvidence(item) })),
       tasks: ir.tasks.map((item) => ({ id: item.id, intent: item.intent, activationCondition: item.activationCondition, requiredInputIds: item.requiredInputIds, optionalInputIds: item.optionalInputIds, outputIds: item.outputIds, capabilityIds: item.capabilityIds })),
-      capabilities: ir.capabilities.map((item) => ({ id: item.id, purpose: item.purpose, requirement: item.requirement, activationCondition: item.activationCondition, routingCondition: item.routingCondition, input: item.input, output: item.output, fallback: item.fallback })),
+      capabilities: ir.capabilities.map((item) => ({ id: item.id, kind: item.kind, implementation: item.implementation, necessity: item.necessity, purpose: item.purpose, requirement: item.requirement, activationCondition: item.activationCondition, routingCondition: item.routingCondition, input: item.input, output: item.output, fallback: item.fallback })),
       inputs: ir.inputs.map((item) => ({ id: item.id, name: item.name, required: item.required, missingBehavior: item.missingBehavior, resolution: item.resolution })),
       outputs: ir.outputs.map((item) => ({ id: item.id, name: item.name, mode: item.mode, requiredSections: item.requiredSections, validation: item.validation, producerCapabilityIds: item.producerCapabilityIds })),
       constraints: ir.constraints.map((item) => ({ id: item.id, statement: item.statement, hard: item.hard, provenance: item.provenance, appliesTo: item.appliesTo })),
@@ -4123,6 +4220,44 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
   };
 }
 
+function canonicalMutationTargetCatalogForIssues(files: Record<string, string>, issues: PipelineIssue[]) {
+  const catalog = canonicalMutationTargetCatalog(files);
+  if ("unavailable" in catalog) return catalog;
+  const allowedTypes = [...new Set(issues.flatMap((issue) => issue.allowedMutationTypes || []))];
+  if (!allowedTypes.length) return catalog;
+  const uses = (owner: string) => allowedTypes.some((type) => type.startsWith(`${owner}.`));
+  const currentValues = catalog.currentValues;
+  const routedCurrentValues = {
+    ...(uses("requirement") ? { requirements: currentValues.requirements } : {}),
+    ...(uses("task") ? { tasks: currentValues.tasks } : {}),
+    ...(uses("capability") ? { capabilities: currentValues.capabilities } : {}),
+    ...(uses("input") ? { inputs: currentValues.inputs } : {}),
+    ...(uses("output") ? { outputs: currentValues.outputs } : {}),
+    ...(uses("constraint") ? { constraints: currentValues.constraints } : {}),
+    ...(uses("domain-evidence") ? { domainEvidence: currentValues.domainEvidence } : {}),
+    ...(uses("risk-branch") ? { riskBranches: currentValues.riskBranches } : {}),
+  };
+  return {
+    semanticDigest: catalog.semanticDigest,
+    currentValues: routedCurrentValues,
+    ...(uses("requirement") ? { requirementIds: catalog.requirementIds } : {}),
+    ...(uses("task") ? { taskIds: catalog.taskIds } : {}),
+    ...(uses("capability") ? { capabilityIds: catalog.capabilityIds } : {}),
+    ...(uses("input") ? { inputIds: catalog.inputIds, inputAddShape: catalog.inputAddShape } : {}),
+    ...(uses("output") ? { outputIds: catalog.outputIds } : {}),
+    ...(uses("constraint") ? { constraintIds: catalog.constraintIds } : {}),
+    ...(uses("knowledge") ? { knowledgeIds: catalog.knowledgeIds } : {}),
+    ...(uses("domain-evidence") ? { domainEvidenceIds: catalog.domainEvidenceIds, domainEvidenceAddShape: catalog.domainEvidenceAddShape } : {}),
+    ...(uses("risk-branch") ? { riskBranchIds: catalog.riskBranchIds, riskBranchAddShape: catalog.riskBranchAddShape } : {}),
+    ...(uses("eval-source") ? { evalCaseIds: catalog.evalCaseIds } : {}),
+    // Identity and state are single canonical owners rather than ID-addressed
+    // collections. Keep a concise marker so the planner does not request the
+    // unrelated full catalog merely to discover that fact.
+    ...(uses("identity") ? { identityTarget: "identity" } : {}),
+    ...(uses("state") ? { stateTarget: "stateModel" } : {}),
+  };
+}
+
 function allowedP1MutationTypes(issues: PipelineIssue[]) {
   const allMatch = (pattern: RegExp) => issues.length > 0 && issues.every((issue) => pattern.test(`${issue.type} ${issue.evidence}`));
   if (allMatch(/DESCRIPTION|触发描述|触发范围|使用场景/i)) return ["identity.update", "task.add", "task.update", "task.remove"];
@@ -4130,7 +4265,11 @@ function allowedP1MutationTypes(issues: PipelineIssue[]) {
   if (allMatch(/INPUT|输入|DESCRIPTION_INPUT|RESOLUTION/i)) return ["input.add", "input.update", "input.remove", "task.update"];
   if (allMatch(/OUTPUT|ARTIFACT|PRODUCER|输出|产物/i)) return ["output.add", "output.update", "output.remove", "capability.update", "task.update"];
   if (allMatch(/STATE|PERSIST|状态|持久/i)) return ["state.update", "requirement.update", "constraint.update"];
-  if (allMatch(/PERMISSION|CONTENT|权限|补写|扩写|编造/i)) return ["requirement.add", "requirement.update", "constraint.add", "constraint.update", "constraint.remove"];
+  if (allMatch(/PERMISSION|CONTENT|权限|补写|扩写|编造/i)) return [
+    "requirement.add", "requirement.update",
+    "constraint.add", "constraint.update", "constraint.remove",
+    "capability.update", "input.update", "risk-branch.update", "state.update",
+  ];
   return [
     "identity.update",
     "requirement.add", "requirement.update", "requirement.remove",
@@ -4351,6 +4490,7 @@ function reconcileCapabilityPlanContentPermission(plan: CapabilityPlan, answers:
 }
 
 function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Record<string, string>) {
+  plan = { ...plan, ...reconcileHostCapabilityAliases(plan.items, plan.workflowSteps, CAPABILITY_LIBRARY) };
   plan = reconcileCapabilityPlanContentPermission(plan, answers);
   const taskEvidence = [
     idea,
@@ -4475,7 +4615,7 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
   const artifactPatterns = userRequiresArtifact
     ? inferArtifactPatterns(outputRequest)
     : [];
-  if (structuredInput && /csv|表格|清单/i.test(taskEvidence) && !artifactPatterns.some((pattern) => /csv/i.test(pattern))) artifactPatterns.push("outputs/*.csv");
+  // A structured INPUT is not a promise to export another CSV.
   const outputEvidence = [
     answers["output-format"],
     plan.outputContract.format,
@@ -4499,7 +4639,7 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
       missingBehavior: "新会话中请用户重新提供必要偏好；不得声称已自动恢复历史状态",
     }
     : plan.stateModel;
-  const validationShouldBeVisible = /(?:输出|交付|结果).{0,24}(?:自检|评分|检查报告|风险清单)|(?:自检|评分|检查报告).{0,24}(?:展示|输出|交付)/i.test(Object.values(answers).join("\n"));
+  const validationShouldBeVisible = /(?:输出|交付|结果).{0,24}(?:自检|评分|检查报告|风险清单)|(?:自检|评分|检查报告).{0,24}(?:展示|输出|交付)/i.test(confirmedAnswerEvidenceText(answers));
   const visibleRequiredSections = validationShouldBeVisible
     ? plan.outputContract.requiredSections
     : plan.outputContract.requiredSections.filter((item) => !/自检|评分|检查报告|风险清单|validation|score/i.test(item));
@@ -4520,22 +4660,12 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
     : item) : items;
   const normalizedWorkflow = normalizeWorkflowDagSteps(plan.workflowSteps);
   const activeRuntimeIds = new Set(schemaAlignedItems.filter((item) => item.kind !== "eval" && capabilityIsActive(item)).map((item) => item.id));
-  const routedIds = new Set(normalizedWorkflow.flatMap((step) => step.capabilityIds));
-  const workflowSteps = [
-    ...normalizedWorkflow.map((step) => ({ ...step, capabilityIds: step.capabilityIds.filter((id) => activeRuntimeIds.has(id)) })).filter((step) => step.capabilityIds.length > 0),
-    ...schemaAlignedItems.filter((item) => activeRuntimeIds.has(item.id) && !routedIds.has(item.id)).map((item) => ({
-      id: `step-capability-${item.id}`,
-      capabilityIds: [item.id],
-      when: item.activationCondition || item.routingCondition,
-      input: item.input,
-      action: item.purpose || item.requirement,
-      output: item.output,
-      fallback: item.fallback,
-      requires: ["$request"],
-      produces: [`capability:${item.id}:output`],
-      mutates: [],
-    })),
-  ];
+  const workflowSteps = bindWorkflowCapabilities(
+    // Keep task operations whose owner changed: preflight must rebind them,
+    // not silently remove their intermediate artifacts and downstream edges.
+    normalizedWorkflow.map((step) => ({ ...step, capabilityIds: step.capabilityIds.filter((id) => activeRuntimeIds.has(id)) })),
+    schemaAlignedItems.filter((item) => activeRuntimeIds.has(item.id)),
+  );
   return {
     ...plan,
     stateModel,
@@ -4559,6 +4689,7 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
 function stripCompiledKnowledgeSummary(summary: string) {
   return summary
     .replace(/\s*已将\s*[^。]*?来源知识[^。]*?按需加载[^。]*?专业判断手册。?/g, "")
+    .replace(/\s*在需要[^。.!！？?]{0,180}?判断时，?按条件使用来源可追溯的专业知识[。.!！？?]?/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
 }
@@ -4787,6 +4918,8 @@ function recommendedInterviewAnswers(questions: Question[]) {
 
 function createInterviewEvidence(rounds: InterviewRound[], answers: Record<string, string>) {
   return rounds.flatMap((round) => round.questions).map((question) => ({
+    key: question.id,
+    ...describeUserEvidence(classifyUserEvidence(question.id, question.dimension, question.label), answers[question.id]?.trim() || ""),
     dimension: question.dimension,
     question: question.label,
     answer: answers[question.id]?.trim() || "",
@@ -4818,7 +4951,11 @@ function createDemoAnswers(rounds: InterviewRound[], answers: Record<string, str
     交付确认: "delivery-checkpoint",
   };
   rounds.flatMap((round) => round.questions).forEach((question) => {
-    const key = dimensionKeys[question.dimension];
+    const recovery = question.dimension === "失败模式" && classifyUserEvidence(question.id, question.dimension, question.label) === "positive_requirement";
+    const key = recovery ? "failure-response" : dimensionKeys[question.dimension];
+    // Remove only the stale alias of THIS restored adaptive answer, not an
+    // independently supplied negative example.
+    if (recovery && result["bad-example"] === answers[question.id]) delete result["bad-example"];
     if (key && answers[question.id]) result[key] = answers[question.id];
   });
   return result;
@@ -4889,6 +5026,7 @@ export default function Home() {
   const [blueprint, setBlueprint] = useState<BlueprintSection[]>(DEFAULT_BLUEPRINT);
   const [blueprintExpanded, setBlueprintExpanded] = useState(false);
   const blueprintGridRef = useRef<HTMLDivElement | null>(null);
+  const blueprintCheckpointRef = useRef<BlueprintCheckpoint>({});
   const [capabilityPlan, setCapabilityPlan] = useState<CapabilityPlan>(DEFAULT_CAPABILITY_PLAN);
   const [loopPlan, setLoopPlan] = useState<LoopPlan>(DEFAULT_LOOP_PLAN);
   const [buildLoop, setBuildLoop] = useState<BuildLoopState>(DEFAULT_BUILD_LOOP);
@@ -4947,6 +5085,8 @@ export default function Home() {
   const [busyExecutionKind, setBusyExecutionKind] = useState<BusyExecutionKind>("local");
   const [busyExecutionNote, setBusyExecutionNote] = useState("正在准备当前步骤");
   const [activeAiMode, setActiveAiMode] = useState("");
+  const [busyTokenUsage, setBusyTokenUsage] = useState<AiTokenUsage>(EMPTY_AI_TOKEN_USAGE);
+  const [sessionTokenUsage, setSessionTokenUsage] = useState<AiTokenUsage>(EMPTY_AI_TOKEN_USAGE);
   const [retryAction, setRetryAction] = useState<RetryAction | null>(null);
   const [toast, setToast] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -4954,6 +5094,8 @@ export default function Home() {
   const [generationNoticeOpen, setGenerationNoticeOpen] = useState(false);
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">("default");
   const notificationTested = useRef(false);
+  const noSkillHarnessCache = useRef(new Map<string, HarnessReport>());
+  const noSkillHarnessCacheHydrated = useRef(false);
   const loopStartedAt = useRef(0);
   const [provider, setProvider] = useState<ProviderId>("deepseek");
   const [model, setModel] = useState(PROVIDERS.deepseek.model);
@@ -4966,6 +5108,15 @@ export default function Home() {
   const [researchApiKey, setResearchApiKey] = useState("");
   const [researchCredentialStored, setResearchCredentialStored] = useState(false);
   const [researchBaseUrl, setResearchBaseUrl] = useState("");
+  const [researchProbe, setResearchProbe] = useState<{ status: "idle" | "testing" | "ok" | "error"; message: string }>({ status: "idle", message: "检索连接与模型连接需要分别测试" });
+  const researchProbeController = useRef<AbortController | null>(null);
+  useEffect(() => {
+    researchProbeController.current?.abort();
+    researchProbeController.current = null;
+    // eslint-disable-next-line react-hooks/set-state-in-effect -- Invalidate an external connection result when its configuration changes.
+    setResearchProbe({ status: "idle", message: "检索连接与模型连接需要分别测试" });
+    return () => { researchProbeController.current?.abort(); researchProbeController.current = null; };
+  }, [researchProvider, researchBaseUrl, researchApiKey]);
   const [mcpConnections, setMcpConnections] = useState<McpConnectionSummary[]>([]);
   const [mcpConnectionsLoaded, setMcpConnectionsLoaded] = useState(false);
   const [mcpConnectionName, setMcpConnectionName] = useState("");
@@ -5271,6 +5422,7 @@ export default function Home() {
         if (typeof saved.baseUrl === "string") setBaseUrl(saved.baseUrl);
         if (["disabled", "firecrawl", "searxng"].includes(String(saved.researchProvider))) setResearchProvider(saved.researchProvider as ResearchProviderId);
         if (typeof saved.researchBaseUrl === "string") setResearchBaseUrl(saved.researchBaseUrl);
+        if (saved.sessionTokenUsage && typeof saved.sessionTokenUsage === "object") setSessionTokenUsage(normalizeAiTokenUsage(saved.sessionTokenUsage));
         if (Array.isArray(saved.platforms)) setPlatforms(saved.platforms.filter((item): item is string => typeof item === "string"));
         if (typeof saved.allowSensitiveExport === "boolean") setAllowSensitiveExport(saved.allowSensitiveExport);
         if (Array.isArray(saved.completedSteps)) setCompletedSteps(new Set(saved.completedSteps.filter((item): item is StepId => ["brief", "interview", "blueprint", "build", "evaluate", "ship"].includes(String(item)))));
@@ -5285,7 +5437,16 @@ export default function Home() {
 
   useEffect(() => {
     /* eslint-disable react-hooks/set-state-in-effect -- Browser permission is external state and must be read after hydration. */
-    setNotificationPermission("Notification" in window ? window.Notification.permission : "unsupported");
+    const syncNotificationPermission = () => {
+      setNotificationPermission("Notification" in window ? window.Notification.permission : "unsupported");
+    };
+    syncNotificationPermission();
+    document.addEventListener("visibilitychange", syncNotificationPermission);
+    window.addEventListener("focus", syncNotificationPermission);
+    return () => {
+      document.removeEventListener("visibilitychange", syncNotificationPermission);
+      window.removeEventListener("focus", syncNotificationPermission);
+    };
     /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
@@ -5322,7 +5483,8 @@ export default function Home() {
         feedbackLoopSummary, mutationHistory, repaired, rejectedOptimizations, feedbackOptions, feedbackReasons,
         feedbackCustom, feedbackSaved, mcpDrafts, provider, model, availableModels, baseUrl,
         researchProvider, researchBaseUrl,
-        connectionState, platforms, allowSensitiveExport, completedSteps: [...completedSteps],
+        connectionState, platforms, allowSensitiveExport, sessionTokenUsage,
+        completedSteps: [...completedSteps],
       }));
     } catch {
       // The app remains usable if browser session storage is unavailable or full.
@@ -5354,9 +5516,9 @@ export default function Home() {
     __idea: idea,
     __previewTask: discoveryPreview?.userPrompt || "",
     // Prefer an input the owner has actually seen in a forward Demo. Preview
-    // sampleInput is the next-best privacy-safe fixture. Preview output is a
-    // legacy fallback only; Eval must never mistake an answer for task input.
-    __previewInput: skillDemo?.userPrompt || discoveryPreview?.sampleInput || discoveryPreview?.output || "",
+    // sampleInput is the next-best privacy-safe fixture. Never use a generated
+    // answer as input evidence, including when restoring a legacy preview.
+    __previewInput: skillDemo?.userPrompt || discoveryPreview?.sampleInput || "",
     __previewFeedback: [...previewFeedback, previewFeedbackCustom.trim()].filter(Boolean).join("；"),
   }), [answers, discoveryPreview, idea, interviewRounds, previewFeedback, previewFeedbackCustom, skillDemo]);
   const requirementCoverage = summarizeRequirementCoverage(interviewEvidence);
@@ -5387,18 +5549,17 @@ export default function Home() {
   const observedEvals = evals.filter((item) => item.coverage !== "not-covered");
   const strongEvals = observedEvals.filter((item) => item.score >= DEMO_SCORING_POLICY.observedGoodFloor);
   const needsWorkEvals = observedEvals.filter((item) => item.score < DEMO_SCORING_POLICY.observedGoodFloor);
-  const pendingEvals = evals.filter((item) => item.coverage === "not-covered");
   const averageEvalScore = evalRan && observedEvals.length ? Math.round(observedEvals.reduce((total, item) => total + item.score, 0) / observedEvals.length) : 0;
   const evaluationHeadline = needsWorkEvals.length
     ? `这次试跑发现 ${needsWorkEvals.length} 个还能再提升的地方`
-    : pendingEvals.length
-      ? "这次表现符合要求，还有场景没测到"
-      : "这次试跑已经达到预期";
+    : observedEvals.length
+      ? "这次表现符合要求"
+      : "本轮结果待评估";
   const evaluationSummary = needsWorkEvals.length
     ? `优先处理“${needsWorkEvals[0].label}”。其他结论会保留，不需要一次读完所有评语。`
-    : pendingEvals.length
-      ? `已经确认 ${strongEvals.length} 项表现，剩余 ${pendingEvals.length} 项需要换一个输入才能判断。`
-      : "五项都有本轮证据，可以继续发布检查，也可以选择其中一项继续提高。";
+    : observedEvals.length
+      ? `已经确认 ${strongEvals.length} 项表现，可以继续发布检查，也可以选择其中一项继续提高。`
+      : "继续对话并更新评分，查看本轮结果。";
   const busyStageIndex = busyTask
     ? Math.min(BUSY_STAGES[busyTask].stages.length - 1, busyPhaseIndex)
     : 0;
@@ -5417,9 +5578,17 @@ export default function Home() {
       ? "上一节点已完成，Loop 正在根据真实结果自动进入下一节点，无需你点击。"
       : busyElapsed < 25
         ? `${activeAiMode ? AI_MODE_LABELS[activeAiMode] || activeAiMode : "模型任务"}正在返回真实结果；当前回答会一直保留。`
-        : busyElapsed < 70
-          ? "响应较慢，系统会先结束异常长输出，再自动用紧凑上下文重试当前节点。"
-          : "正在执行紧凑重试；若仍失败，会保留已完成文件，并明确显示失败节点。";
+        : "流程仍在处理，已完成的步骤会保留；上方显示本次流程累计耗时，不代表当前请求超时或正在重试。";
+  const busyTokenUsageStatus = busyTokenUsage.pendingPromptTokens > 0
+    ? `输入约 ${formatAiTokens(busyTokenUsage.promptTokens)} · 输出生成中`
+    : busyTokenUsage.requests > 0
+      ? `${formatAiTokens(busyTokenUsage.promptTokens)} 输入 · ${formatAiTokens(busyTokenUsage.completionTokens)} 输出`
+      : "本地检查，不调用模型";
+  const busyTokenUsageHint = busyTokenUsage.pendingPromptTokens > 0
+    ? "当前为输入预估，模型返回后会自动校准"
+    : busyTokenUsage.estimated
+      ? "部分请求未返回 usage，已按文本长度估算"
+      : "已按模型返回的 usage 统计";
   const modelChoices = Array.from(new Set([
     ...PROVIDERS[provider].models.map((item) => item.id),
     ...availableModels,
@@ -5453,9 +5622,11 @@ export default function Home() {
       observedDimensions: evals.filter((item) => item.coverage !== "not-covered").length,
     }),
   }), [buildLoop, bundleAudit.blockers, demoReviewPending, demoRunCount, evalRan, evals, generationLoop, skillDemo]);
-  const optimizationBlockedByBuild = generationLoop.status === "attention"
-    && generationLoop.benchmarkRuns === 0
-    && gateOutcomes.build.verdict !== "satisfied";
+  const optimizationBlockedByBuild = generationLoop.benchmarkRuns === 0
+    && (buildLoop.status === "attention"
+      || !buildLoop.frozen
+      || gateOutcomes.build.verdict !== "satisfied"
+      || /Bundle 未冻结|Eval (?:未启动|没有启动)|P[01] (?:Contract|Execution) Gate/i.test(generationLoop.stopReason));
   const optimizationStableAtCeiling = generationLoop.status === "stable"
     || (generationLoop.status === "attention"
       && generationLoop.minimalityChecked
@@ -5468,6 +5639,28 @@ export default function Home() {
     && generationLoop.minimalityChecked
     && generationLoop.benchmarkRuns > 0
     && !optimizationStableAtCeiling;
+  const buildUnresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
+  const buildProductCapabilities = capabilityPlan.items
+    .filter((item) => capabilityIsActive(item) && item.kind !== "eval")
+    .sort((left, right) => {
+      const lift = { high: 3, medium: 2, low: 1 } as const;
+      return (lift[right.necessity?.successLift || "medium"] - lift[left.necessity?.successLift || "medium"])
+        || Number(right.layer === "runtime") - Number(left.layer === "runtime");
+    })
+    .slice(0, 5);
+  const buildProductSummary = compactProductCopy(
+    capabilityPlan.outcomeModel.ultimateGoal
+      || capabilityPlan.summary
+      || loopPlan.goal
+      || "系统已根据你的目标、资料和工作方式生成可执行 Skill。",
+  );
+  const buildProductRisks = Array.from(new Set([
+    ...bundleAudit.blockers.map((item) => friendlyReleaseBlocker(item)),
+    ...(buildUnresolvedMcpCount > 0 ? [`有 ${buildUnresolvedMcpCount} 个外部连接尚未安装或授权，相关能力会走降级路径。`] : []),
+    ...(["partial", "unavailable", "error"].includes(knowledgePack.status) ? ["部分专业知识还没有足够可靠的来源，系统不会用泛化内容补齐。"] : []),
+    ...(!evalRan ? ["真实任务效果还没有经过你的试跑确认，下一步需要进入评估。"] : []),
+    ...capabilityPlan.riskBranches.slice(0, 3).map(friendlyProductRisk),
+  ].filter(Boolean))).slice(0, 5);
   const selectedFileExplanation = useMemo(() => explainSkillFile(selectedFile, files[selectedFile] || "", files), [files, selectedFile]);
   const personalizedFeedbackOptions = evalRan
     ? feedbackOptions
@@ -5675,7 +5868,6 @@ export default function Home() {
       return permission;
     }
     if (!notificationTested.current) {
-      notificationTested.current = true;
       const delivered = await deliverBrowserNotification("SkillCanvas 通知已开启", {
         body: "生成完成、暂停或失败时会通过这里提醒你。",
         tag: "skillcanvas-notification-test",
@@ -5684,6 +5876,7 @@ export default function Home() {
         setToast("浏览器已授权，但系统通知投递失败；请检查浏览器或系统的通知设置");
         return permission;
       }
+      notificationTested.current = true;
     }
     setToast("完成通知已开启，长时间 Loop 结束后会提醒你");
     return permission;
@@ -5701,11 +5894,20 @@ export default function Home() {
     if (!("Notification" in window) || window.Notification.permission !== "granted") return false;
     const notificationOptions: NotificationOptions = {
       icon: "/skillcanvas-notification-icon.png",
+      requireInteraction: true,
+      renotify: true,
       ...options,
     };
     try {
       if ("serviceWorker" in navigator) {
-        const registration = await navigator.serviceWorker.register("/notification-sw.js", { scope: "/" });
+        await navigator.serviceWorker.register("/notification-sw.js", { scope: "/" });
+        // register() can resolve while the worker is still installing. Waiting
+        // for ready avoids the common first-run failure where permission is
+        // granted but showNotification throws because no active worker exists.
+        const registration = await Promise.race([
+          navigator.serviceWorker.ready,
+          new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("service worker activation timed out")), 5_000)),
+        ]);
         await registration.showNotification(title, notificationOptions);
         reportNotificationDelivery("notification_delivery_succeeded", "service-worker");
         return true;
@@ -5945,6 +6147,7 @@ export default function Home() {
     setBusyExecutionKind("local");
     setBusyExecutionNote("正在准备当前步骤");
     setActiveAiMode("");
+    setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
     setRetryAction(retry);
   }
 
@@ -5994,19 +6197,72 @@ export default function Home() {
     setBusyExecutionNote(AI_MODE_LABELS[mode] || `执行 ${mode}`);
     const compatibleTimeoutMs = ["build", "repair", "personalize"].includes(mode)
       ? 170_000
-      : ["blueprint", "blueprint-foundation", "blueprint-plan", "eval-execute", "eval-grade", "eval-compare", "optimization-evidence"].includes(mode)
+      : ["blueprint", "blueprint-foundation", "blueprint-plan", "blueprint-capabilities", "blueprint-workflow", "workflow-repair", "eval-execute", "eval-grade", "eval-compare", "optimization-evidence"].includes(mode)
         ? 148_000
         : ["preview", "interview", "demo", "evaluate", "optimization-diagnose", "optimization-patch-plan", "optimization-research"].includes(mode)
           ? 132_000
           : 108_000;
-    const timeoutMs = provider === "compatible"
+    const timeoutMs = mode.startsWith("knowledge-") ? knowledgeClientTimeout(provider) : provider === "compatible"
       ? compatibleTimeoutMs
       : ["build", "repair", "eval-execute", "eval-grade", "eval-compare", "optimization-diagnose", "optimization-patch-plan", "optimization-research", "personalize", "optimization-evidence", "demo", "evaluate"].includes(mode)
-        ? 106_000
-        : ["preview", "optimize", "blueprint", "blueprint-foundation", "blueprint-plan"].includes(mode)
-          ? 82_000
-          : 60_000;
+          ? 106_000
+          : ["preview", "optimize", "blueprint", "blueprint-foundation", "blueprint-plan", "blueprint-capabilities", "blueprint-workflow", "workflow-repair"].includes(mode)
+            ? 82_000
+            : 60_000;
     const requestBody = JSON.stringify({ mode, provider, model, baseUrl, apiKey, ...payload });
+    const tracksTokenUsage = mode !== "models";
+    const estimatedPromptTokens = tracksTokenUsage ? estimateAiTokens({ mode, ...payload }) : 0;
+    const requestUsage = { settled: !tracksTokenUsage };
+    if (tracksTokenUsage) {
+      setBusyTokenUsage((current) => ({
+        ...current,
+        promptTokens: current.promptTokens + estimatedPromptTokens,
+        totalTokens: current.totalTokens + estimatedPromptTokens,
+        pendingPromptTokens: current.pendingPromptTokens + estimatedPromptTokens,
+        requests: current.requests + 1,
+        estimated: true,
+      }));
+      setSessionTokenUsage((current) => ({
+        ...current,
+        promptTokens: current.promptTokens + estimatedPromptTokens,
+        totalTokens: current.totalTokens + estimatedPromptTokens,
+        pendingPromptTokens: current.pendingPromptTokens + estimatedPromptTokens,
+        requests: current.requests + 1,
+        estimated: true,
+      }));
+    }
+    const settleEstimatedUsage = () => {
+      if (!tracksTokenUsage || requestUsage.settled) return;
+      requestUsage.settled = true;
+      setBusyTokenUsage((current) => ({
+        ...current,
+        pendingPromptTokens: Math.max(0, current.pendingPromptTokens - estimatedPromptTokens),
+      }));
+      setSessionTokenUsage((current) => ({
+        ...current,
+        pendingPromptTokens: Math.max(0, current.pendingPromptTokens - estimatedPromptTokens),
+      }));
+    };
+    const settleActualUsage = (usage: { promptTokens?: number; completionTokens?: number; estimated?: boolean }, content: string) => {
+      if (!tracksTokenUsage || requestUsage.settled) return;
+      requestUsage.settled = true;
+      const promptTokens = Number(usage.promptTokens) > 0 ? Number(usage.promptTokens) : estimatedPromptTokens;
+      const completionTokens = Number(usage.completionTokens) > 0 ? Number(usage.completionTokens) : estimateAiTokens(content);
+      const estimated = usage.estimated !== false;
+      const reconcile = (current: AiTokenUsage): AiTokenUsage => {
+        const replacedEstimate = Math.min(estimatedPromptTokens, current.pendingPromptTokens);
+        return {
+          ...current,
+          promptTokens: Math.max(0, current.promptTokens - replacedEstimate) + promptTokens,
+          completionTokens: current.completionTokens + completionTokens,
+          totalTokens: Math.max(0, current.totalTokens - replacedEstimate) + promptTokens + completionTokens,
+          pendingPromptTokens: Math.max(0, current.pendingPromptTokens - replacedEstimate),
+          estimated: current.pendingPromptTokens > replacedEstimate || estimated,
+        };
+      };
+      setBusyTokenUsage(reconcile);
+      setSessionTokenUsage(reconcile);
+    };
     let lastError: unknown = null;
     for (let transportAttempt = 1; transportAttempt <= 2; transportAttempt += 1) {
       const controller = new AbortController();
@@ -6019,16 +6275,19 @@ export default function Home() {
           signal: controller.signal,
         });
         const raw = await response.text();
-        let data: { content?: string; error?: string; requestId?: string } = {};
-        try { data = JSON.parse(raw) as { content?: string; error?: string; requestId?: string }; } catch { /* handled below */ }
+        let data: { content?: string; error?: string; code?: string; requestId?: string; usage?: { promptTokens?: number; completionTokens?: number; estimated?: boolean } } = {};
+        try { data = JSON.parse(raw) as { content?: string; error?: string; requestId?: string; usage?: { promptTokens?: number; completionTokens?: number; estimated?: boolean } }; } catch { /* handled below */ }
         if (!response.ok || !data.content) {
+          if (data.usage) settleActualUsage(data.usage, data.content || "");
           const requestHint = data.requestId ? `（请求 ${data.requestId}）` : "";
-          const responseError = new Error(`${data.error || `模型请求失败（${response.status || "网络中断"}）`}${requestHint}`);
+          const responseError = Object.assign(new Error(`${data.error || `模型请求失败（${response.status || "网络中断"}）`}${requestHint}`), { code: data.code });
           throw responseError;
         }
+        settleActualUsage(data.usage || {}, data.content);
         return jsonFromText<T>(data.content);
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
+          settleEstimatedUsage();
           void fetch("/api/client-log", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -6047,6 +6306,7 @@ export default function Home() {
           continue;
         }
         if (networkFailure) {
+          settleEstimatedUsage();
           void fetch("/api/client-log", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -6054,6 +6314,7 @@ export default function Home() {
           }).catch(() => undefined);
           throw new Error(`${AI_MODE_LABELS[mode] || mode}请求连续两次中断，当前内容已保留，请重试当前节点`);
         }
+        settleEstimatedUsage();
         throw error;
       } finally {
         window.clearTimeout(timeout);
@@ -6067,105 +6328,185 @@ export default function Home() {
     skillFiles?: Record<string, string>;
     configuration: HarnessConfiguration;
     repeats?: number;
+    resumeFrom?: HarnessReport;
   }): Promise<HarnessReport> {
     const contract = freezeEvalContract(input.cases);
     const publicContract = publicExecutionContract(contract);
     const repeats = Math.max(1, Math.min(3, input.repeats || 1));
-    const completed: Array<{ executions: HarnessExecution[]; grades: HarnessGrade[] }> = [];
+    const resumable = input.resumeFrom
+      && input.resumeFrom.contract.digest === contract.digest
+      && input.resumeFrom.configuration === input.configuration
+      ? input.resumeFrom
+      : null;
+    const existingRepeats = Math.min(repeats, resumable?.benchmark.repeatsPerCase || 0);
+    if (resumable && existingRepeats >= repeats) return resumable;
+    const completed: Array<{ executions: HarnessExecution[]; grades: HarnessGrade[] }> = resumable
+      ? [{ executions: resumable.executions, grades: resumable.grades }]
+      : [];
     // Model-backed rollouts are deliberately sequential. Parallel large JSON
     // responses made providers truncate otherwise valid evaluation payloads.
-    for (let offset = 0; offset < repeats; offset += 1) {
+    for (let offset = existingRepeats; offset < repeats; offset += 1) {
       const runIndex = offset + 1;
-      const startedAt = performance.now();
-      let executionRaw: unknown = null;
-      let executionBatchError = "";
-      const executeCasewise = input.cases.length > 1 && JSON.stringify(publicContract).length > 12_000;
-      if (executeCasewise) {
-        executionBatchError = "冻结任务包含较长的真实 fixture，已预先拆成单用例执行以避免批量 JSON 截断";
-      } else {
-        try {
-          executionRaw = await callAI<unknown>("eval-execute", {
-            baselineMode: input.configuration === "without_skill",
-            evalContract: publicContract,
-            ...(input.skillFiles ? { skill: runtimeSkillBundle(input.skillFiles) } : {}),
-          });
-        } catch (error) {
-          if (input.cases.length <= 1) throw error;
-          executionBatchError = error instanceof Error ? error.message : "批量隔离执行失败";
-        }
+      const containsEpisodes = input.cases.some((item) => item.turns && item.turns.length >= 2);
+      const shouldChunkExecution = input.cases.length > 3 && (Boolean(input.skillFiles) || JSON.stringify(publicContract).length > 12_000);
+      const executionChunks: SkillEvalCase[][] = [];
+      const executionChunkSize = containsEpisodes ? 1 : shouldChunkExecution ? 3 : input.cases.length;
+      for (let index = 0; index < input.cases.length; index += executionChunkSize) {
+        executionChunks.push(input.cases.slice(index, index + executionChunkSize));
       }
-      const durationMs = performance.now() - startedAt;
-      let normalizedExecutions = executionBatchError ? null : normalizeHarnessExecutions({
-        value: executionRaw,
-        contract,
-        configuration: input.configuration,
-        runIndex,
-        durationMs,
-      });
-      if (!normalizedExecutions) {
-        reportClientGenerationLoopEvent("generation_loop_phase", {
-          phase: "execution-recovery",
-          round: runIndex,
-          reason: executionBatchError
-            ? `批量隔离执行失败，自动拆成单用例补跑：${executionBatchError}`
-            : "批量隔离执行漏返回用例，自动拆成单用例补跑",
-        });
-        const recovered = [];
-        for (const testCase of input.cases) {
-          const singleContract = freezeEvalContract([testCase]);
-          const singleStartedAt = performance.now();
-          const singleRaw = await callAI<unknown>("eval-execute", {
+      const collectedExecutions: HarnessExecution[] = [];
+      for (const chunk of executionChunks) {
+        const chunkContract = chunk.length === input.cases.length ? contract : freezeEvalContract(chunk);
+        const chunkStartedAt = performance.now();
+        let chunkExecutions: ReturnType<typeof normalizeHarnessExecutions> = null;
+        const episodeCase = chunk.length === 1 && chunk[0].turns && chunk[0].turns.length >= 2 ? chunk[0] : null;
+        if (episodeCase) {
+          const transcript: NonNullable<HarnessExecution["transcript"]> = [];
+          const combinedTrace: string[] = [];
+          let finalTurn: HarnessExecution | null = null;
+          const episodeStartedAt = performance.now();
+          for (const turn of episodeCase.turns || []) {
+            const turnContext = turn.checkpoint === "final"
+              ? { ...episodeCase.context, ...turn.context, episodeTurnId: turn.id, episodeCheckpoint: turn.checkpoint }
+              : { episode: true, mergedCaseIds: episodeCase.context.mergedCaseIds, ...turn.context, episodeTurnId: turn.id, episodeCheckpoint: turn.checkpoint };
+            const turnCase: SkillEvalCase = {
+              ...episodeCase,
+              prompt: turn.prompt,
+              context: turnContext,
+              turns: undefined,
+            };
+            const turnContract = freezeEvalContract([turnCase]);
+            const raw = await callAI<unknown>("eval-execute", {
+              baselineMode: input.configuration === "without_skill",
+              evalContract: publicExecutionContract(turnContract),
+              conversation: transcript,
+              ...(input.skillFiles ? { skill: runtimeSkillBundle(input.skillFiles, 36_000, {
+                capabilityIds: episodeCase.capabilityIds,
+                families: [episodeCase.family],
+              }) } : {}),
+            });
+            const normalized = normalizeHarnessExecutions({
+              value: raw,
+              contract: turnContract,
+              configuration: input.configuration,
+              runIndex,
+              durationMs: performance.now() - episodeStartedAt,
+            })?.[0] || null;
+            if (!normalized) throw new Error(`多轮 Episode ${episodeCase.id} 的 ${turn.id} 没有返回完整结果`);
+            transcript.push({ role: "user", content: turn.prompt, turnId: turn.id });
+            transcript.push({ role: "assistant", content: normalized.output, turnId: turn.id });
+            combinedTrace.push(...normalized.trace.map((step) => `${turn.id}: ${step}`));
+            finalTurn = normalized;
+          }
+          if (!finalTurn) throw new Error(`多轮 Episode ${episodeCase.id} 没有完成最终轮`);
+          chunkExecutions = [{
+            ...finalTurn,
+            runId: `${contract.digest}-${input.configuration}-${runIndex}-${episodeCase.id}`,
+            caseId: episodeCase.id,
+            prompt: episodeCase.prompt,
+            transcript,
+            trace: combinedTrace.slice(0, 10),
+            durationMs: performance.now() - episodeStartedAt,
+          }];
+        }
+        try {
+          if (episodeCase) {
+            // The episode has already been executed turn by turn above.
+          } else {
+          const executionRaw = await callAI<unknown>("eval-execute", {
             baselineMode: input.configuration === "without_skill",
-            evalContract: publicExecutionContract(singleContract),
-            ...(input.skillFiles ? { skill: runtimeSkillBundle(input.skillFiles) } : {}),
+            evalContract: publicExecutionContract(chunkContract),
+            ...(input.skillFiles ? { skill: runtimeSkillBundle(input.skillFiles, 48_000, {
+              capabilityIds: [...new Set(chunk.flatMap((item) => item.capabilityIds))],
+              families: [...new Set(chunk.map((item) => item.family))],
+            }) } : {}),
           });
-          recovered.push(normalizeHarnessExecutions({
-            value: singleRaw,
-            contract: singleContract,
+          chunkExecutions = normalizeHarnessExecutions({
+            value: executionRaw,
+            contract: chunkContract,
             configuration: input.configuration,
             runIndex,
-            durationMs: performance.now() - singleStartedAt,
-          })?.[0] || null);
+            durationMs: performance.now() - chunkStartedAt,
+          });
+          }
+        } catch (error) {
+          if (chunk.length === 1) throw error;
+          reportClientGenerationLoopEvent("generation_loop_phase", {
+            phase: "execution-recovery",
+            round: runIndex,
+            reason: `三用例执行未完成，仅拆分当前小批次：${error instanceof Error ? error.message : "格式不完整"}`,
+          });
         }
-        normalizedExecutions = recovered.every((item): item is NonNullable<typeof item> => Boolean(item)) ? recovered : null;
+        if (!chunkExecutions && chunk.length > 1) {
+          const recovered = [];
+          for (const testCase of chunk) {
+            const singleContract = freezeEvalContract([testCase]);
+            const singleStartedAt = performance.now();
+            const singleRaw = await callAI<unknown>("eval-execute", {
+              baselineMode: input.configuration === "without_skill",
+              evalContract: publicExecutionContract(singleContract),
+              ...(input.skillFiles ? { skill: runtimeSkillBundle(input.skillFiles, 48_000, {
+                capabilityIds: testCase.capabilityIds,
+                families: [testCase.family],
+              }) } : {}),
+            });
+            recovered.push(normalizeHarnessExecutions({
+              value: singleRaw,
+              contract: singleContract,
+              configuration: input.configuration,
+              runIndex,
+              durationMs: performance.now() - singleStartedAt,
+            })?.[0] || null);
+          }
+          chunkExecutions = recovered.every((item): item is NonNullable<typeof item> => Boolean(item)) ? recovered : null;
+        }
+        if (!chunkExecutions) throw new Error(`隔离执行第 ${runIndex} 次的小批次没有覆盖完整任务`);
+        collectedExecutions.push(...chunkExecutions);
       }
+      const normalizedExecutions = collectedExecutions.length === input.cases.length ? collectedExecutions : null;
       if (!normalizedExecutions) throw new Error(`隔离执行第 ${runIndex} 次批量与单用例恢复都没有返回完整任务结果`);
       const executions = await verifyExecutionsInLocalSandbox({ cases: input.cases, skillFiles: input.skillFiles, executions: normalizedExecutions });
-      let gradeRaw: unknown = null;
-      let gradingBatchError = "";
-      const gradeCasewise = input.cases.length > 1 && JSON.stringify({ contract, executions }).length > 24_000;
-      if (gradeCasewise) {
-        gradingBatchError = "执行证据较长，已预先拆成单用例评分以避免批量 JSON 截断";
-      } else {
+      // Grade in deterministic micro-batches from the start. A large grading
+      // request used to fail after producing tens of thousands of characters,
+      // get retried by the API route, and then be repeated case-by-case here.
+      // Three cases keep cross-case attribution available while bounding JSON.
+      const gradingChunks: SkillEvalCase[][] = [];
+      for (let index = 0; index < input.cases.length; index += 3) gradingChunks.push(input.cases.slice(index, index + 3));
+      const collectedGrades: NonNullable<ReturnType<typeof normalizeHarnessGrades>> = [];
+      for (const chunk of gradingChunks) {
+        const chunkContract = freezeEvalContract(chunk);
+        const chunkIds = new Set(chunk.map((item) => item.id));
+        const chunkExecutions = executions.filter((item) => chunkIds.has(item.caseId));
+        let chunkGrades: ReturnType<typeof normalizeHarnessGrades> = null;
         try {
-          gradeRaw = await callAI<unknown>("eval-grade", { evalContract: contract, executions });
+          const chunkRaw = await callAI<unknown>("eval-grade", { evalContract: chunkContract, executions: compactHarnessExecutionsForGrade(chunkExecutions) });
+          chunkGrades = normalizeHarnessGrades({ value: chunkRaw, contract: chunkContract, executions: chunkExecutions });
         } catch (error) {
-          if (input.cases.length <= 1) throw error;
-          gradingBatchError = error instanceof Error ? error.message : "批量隔离评分失败";
+          if (chunk.length === 1) throw error;
+          reportClientGenerationLoopEvent("generation_loop_phase", {
+            phase: "grading-recovery",
+            round: runIndex,
+            reason: `三用例评分未完成，仅拆分当前小批次：${error instanceof Error ? error.message : "格式不完整"}`,
+          });
         }
-      }
-      let grades = gradingBatchError ? null : normalizeHarnessGrades({ value: gradeRaw, contract, executions });
-      if (!grades) {
-        reportClientGenerationLoopEvent("generation_loop_phase", {
-          phase: "grading-recovery",
-          round: runIndex,
-          reason: gradingBatchError
-            ? `批量隔离评分失败，自动拆成单用例补跑：${gradingBatchError}`
-            : "批量隔离评分漏返回用例，自动拆成单用例补跑",
-        });
-        const recovered = [];
-        for (const testCase of input.cases) {
-          const singleContract = freezeEvalContract([testCase]);
-          const execution = executions.find((item) => item.caseId === testCase.id);
-          if (!execution) {
-            recovered.push(null);
-            continue;
+        if (!chunkGrades && chunk.length > 1) {
+          const recovered = [];
+          for (const testCase of chunk) {
+            const singleContract = freezeEvalContract([testCase]);
+            const execution = chunkExecutions.find((item) => item.caseId === testCase.id);
+            if (!execution) {
+              recovered.push(null);
+              continue;
+            }
+            const singleRaw = await callAI<unknown>("eval-grade", { evalContract: singleContract, executions: compactHarnessExecutionsForGrade([execution]) });
+            recovered.push(normalizeHarnessGrades({ value: singleRaw, contract: singleContract, executions: [execution] })?.[0] || null);
           }
-          const singleRaw = await callAI<unknown>("eval-grade", { evalContract: singleContract, executions: [execution] });
-          recovered.push(normalizeHarnessGrades({ value: singleRaw, contract: singleContract, executions: [execution] })?.[0] || null);
+          chunkGrades = recovered.every((item): item is NonNullable<typeof item> => Boolean(item)) ? recovered : null;
         }
-        grades = recovered.every((item): item is NonNullable<typeof item> => Boolean(item)) ? recovered : null;
+        if (!chunkGrades) throw new Error(`隔离评分第 ${runIndex} 次的小批次没有覆盖完整任务`);
+        collectedGrades.push(...chunkGrades);
       }
+      const grades = collectedGrades.length === input.cases.length ? collectedGrades : null;
       if (!grades) throw new Error(`隔离评分第 ${runIndex} 次没有覆盖全部冻结任务`);
       completed.push({ executions, grades });
     }
@@ -6175,6 +6516,41 @@ export default function Home() {
       executions: completed.flatMap((item) => item.executions),
       grades: completed.flatMap((item) => item.grades),
     });
+  }
+
+  async function runCachedNoSkillHarness(cases: SkillEvalCase[], repeats = 1) {
+    const contract = freezeEvalContract(cases);
+    if (!noSkillHarnessCacheHydrated.current) {
+      noSkillHarnessCacheHydrated.current = true;
+      try {
+        const stored = JSON.parse(window.sessionStorage.getItem(NO_SKILL_HARNESS_CACHE_KEY) || "[]") as Array<[string, HarnessReport]>;
+        stored.slice(-4).forEach(([storedKey, report]) => {
+          if (storedKey && report?.contract?.digest) noSkillHarnessCache.current.set(storedKey, report);
+        });
+      } catch {
+        // An unavailable or stale cache only causes a fresh baseline run.
+      }
+    }
+    const key = ["episode-v2", provider, baseUrl.trim(), model.trim(), contract.digest].join("|");
+    const cached = noSkillHarnessCache.current.get(key);
+    const report = await runIsolatedEvalHarness({
+      cases,
+      configuration: "without_skill",
+      repeats,
+      resumeFrom: cached,
+    });
+    noSkillHarnessCache.current.set(key, report);
+    while (noSkillHarnessCache.current.size > 12) {
+      const oldest = noSkillHarnessCache.current.keys().next().value;
+      if (typeof oldest !== "string") break;
+      noSkillHarnessCache.current.delete(oldest);
+    }
+    try {
+      window.sessionStorage.setItem(NO_SKILL_HARNESS_CACHE_KEY, JSON.stringify([...noSkillHarnessCache.current.entries()].slice(-4)));
+    } catch {
+      // Keep the in-memory cache when browser storage is unavailable or full.
+    }
+    return report;
   }
 
   async function runBlindHarnessComparison(left: HarnessReport, right: HarnessReport) {
@@ -6264,8 +6640,12 @@ export default function Home() {
     // Baseline and candidate deliberately run against the same frozen cases.
     // New feedback may add behavior, but it may not silently erase a property
     // that an earlier accepted revision already demonstrated.
-    const baselineHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: input.baselineFiles, configuration: "with_skill", repeats: 2 });
-    const candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: input.candidateFiles, configuration: "candidate", repeats: 2 });
+    let baselineHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: input.baselineFiles, configuration: "with_skill", repeats: 1 });
+    let candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: input.candidateFiles, configuration: "candidate", repeats: 1 });
+    if (comparisonNeedsStabilityRepeat(baselineHarness, candidateHarness)) {
+      baselineHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: input.baselineFiles, configuration: "with_skill", repeats: 2, resumeFrom: baselineHarness });
+      candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: input.candidateFiles, configuration: "candidate", repeats: 2, resumeFrom: candidateHarness });
+    }
     const baselineAudit = auditSkillFiles(input.baselineFiles, demoAnswers);
     const candidateAudit = auditSkillFiles(input.candidateFiles, demoAnswers);
     const gate = decideCandidateCommitGate({
@@ -6319,6 +6699,7 @@ export default function Home() {
     setSelectedOptimizationIds([]);
     setOptimizationIssue("");
     setOptimizationElapsed(0);
+    setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
     try {
       const evalBank = harnessRunnableEvalBank(parseAndSplitEvalCases(files["evals/evals.json"] || ""), capabilityPlan);
       const requiredCapabilityIds = harnessVerifiableCapabilityIds(capabilityPlan);
@@ -6330,7 +6711,7 @@ export default function Home() {
 
       const [trainingHarness, baselineHarness] = await Promise.all([
         runIsolatedEvalHarness({ cases: trainCases, skillFiles: files, configuration: "with_skill", repeats: 1 }),
-        runIsolatedEvalHarness({ cases: selectionCases, skillFiles: files, configuration: "with_skill", repeats: 2 }),
+        runIsolatedEvalHarness({ cases: selectionCases, skillFiles: files, configuration: "with_skill", repeats: 1 }),
       ]);
       const trainingEvidence = trainingHarness.evidence;
       const baselineEvidence = baselineHarness.evidence;
@@ -6384,6 +6765,7 @@ export default function Home() {
     setOptimizationIssue("");
     setOptimizationElapsed(0);
     setOptimizationStatus("optimizing");
+    setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
     try {
       const rejectedHistory = [
         ...decisionLedgerFeedback(files, { source: "optimization", limit: 6 }),
@@ -6480,7 +6862,16 @@ export default function Home() {
       setOptimizationStatus("reevaluating");
       setOptimizationElapsed(0);
       const selectionCases = optimizationSession.cases.filter((item) => optimizationSession.selectionCaseIds.includes(item.id));
-      const candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: optimizedFiles, configuration: "candidate", repeats: 2 });
+      let candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: optimizedFiles, configuration: "candidate", repeats: 1 });
+      // The optimization modal stores compact baseline evidence rather than
+      // all raw outputs. A potentially acceptable or borderline candidate is
+      // therefore repeated conservatively; an obvious regression stops after
+      // one pass.
+      const quickCandidate = summarizeGenerationEvidence(candidateHarness.evidence);
+      const quickBaseline = summarizeGenerationEvidence(optimizationSession.baselineEvidence);
+      if (Math.abs(quickCandidate.score - quickBaseline.score) <= 5 || (quickCandidate.score > quickBaseline.score && quickCandidate.passRate >= 80)) {
+        candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: optimizedFiles, configuration: "candidate", repeats: 2, resumeFrom: candidateHarness });
+      }
       const candidateEvidence = candidateHarness.evidence;
 
       const baselineAudit = auditSkillFiles(files, demoAnswers);
@@ -6879,16 +7270,21 @@ export default function Home() {
     try {
       if (!hasRealModel) throw new Error("模型配置已缺失，请重新连接");
       setBusyPhaseIndex(1);
-      const foundation = await callAI<{ sections: BlueprintSection[] }>("blueprint-foundation", {
+      const result = await runBlueprintPlanning({
+        foundationInput: { idea, sourceText: contextBundle, answers: interviewEvidence },
+        modelIdentity: { provider, model, baseUrl },
+        checkpoint: blueprintCheckpointRef.current,
+        call: (mode, payload) => callAI(mode, payload),
+        onStage: (mode) => setBusyPhaseIndex(mode === "blueprint-foundation" ? 1 : 2),
+        prepareCapabilities: (plan) => {
+          const normalized = normalizeCapabilityPlan(plan);
+          if (!normalized) throw new Error("模型没有返回完整的能力与资源计划");
+          // Added host/tool owners must be visible BEFORE the DAG is planned.
+          return { ...ensureTaskCapabilities(normalized, idea, demoAnswers) };
+        },
+        planInput: {
         idea,
-        sourceText: contextBundle,
-        answers: interviewEvidence,
-      });
-      if (!Array.isArray(foundation.sections) || foundation.sections.length !== 6) throw new Error("模型没有返回完整的六个需求蓝图模块");
-      setBusyPhaseIndex(2);
-      const result = await callAI<{ capabilityPlan?: unknown; loopPlan?: unknown }>("blueprint-plan", {
-        idea,
-        blueprintFoundation: { sections: foundation.sections },
+        runtimeInputs: deriveTaskInputContract({ idea, answers: demoAnswers }).map((input) => ({ token: `input:${input.id}`, name: input.name, required: input.required, missingBehavior: input.missingBehavior })),
         capabilityCatalog: CAPABILITY_LIBRARY.map((item) => ({
           id: item.id,
           kind: item.kind,
@@ -6900,12 +7296,14 @@ export default function Home() {
           status: item.status,
           connection: item.connection,
         })),
+        },
       });
+      const foundation = result.foundation;
       const normalizedCapabilities = normalizeCapabilityPlan(result.capabilityPlan);
       if (!normalizedCapabilities) throw new Error("模型没有返回完整的能力与资源计划");
-      const plannedCapabilities = ensureTaskCapabilities(normalizedCapabilities, idea, demoAnswers);
+      const plannedCapabilities = await ensureValidGenerationWorkflow(ensureTaskCapabilities(normalizedCapabilities, idea, demoAnswers));
       const plannedLoop = normalizeLoopPlan(result.loopPlan, deriveLoopPlan(idea, demoAnswers, plannedCapabilities));
-      const confirmedAnswerText = Object.values(demoAnswers).join("\n");
+      const confirmedAnswerText = confirmedAnswerEvidenceText(demoAnswers);
       const normalizedBlueprint = foundation.sections.map((item, index) => ({ ...item, content: reconcileDataMutationPolicy(item.content, confirmedAnswerText), index: item.index || String.fromCharCode(65 + index) }));
       setBlueprint(reconcileBlueprintProvenance(normalizedBlueprint, `${idea}\n${confirmedAnswerText}`));
       setCapabilityPlan(plannedCapabilities);
@@ -6972,7 +7370,7 @@ export default function Home() {
             tasks: ir.tasks,
             inputs: ir.inputs,
             outputs: ir.outputs,
-            requirements: ir.requirements?.map((item) => ({ id: item.id, statement: item.statement, provenance: item.provenance, mappedCapabilityIds: item.mappedCapabilityIds })),
+            requirements: ir.requirements?.map((item) => ({ id: item.id, statement: item.statement, provenance: item.provenance, mappedCapabilityIds: item.mappedCapabilityIds, ...requirementEvidence(item) })),
             capabilities: ir.capabilities?.map((item) => ({ id: item.id, kind: item.kind, path: item.implementation.path, scope: item.scope })),
           };
         } catch {
@@ -7075,7 +7473,7 @@ export default function Home() {
         : `${issue.type}:${issue.evidence}`;
       return [key, issue] as const;
     })).values()];
-    return { audit, closure, crossArtifact, issues: uniqueIssues };
+    return { audit, closure, crossArtifact, issues: deduplicateMissingResourceIssues(uniqueIssues, canonicalIR, files) };
   }
 
   function p1IssuesAreCompilerOwnedEvalEdges(issues: PipelineIssue[]) {
@@ -7092,10 +7490,21 @@ export default function Home() {
   }) {
     let currentFiles = input.files;
     let validation = input.validation;
+    const restoredIR = parseCanonicalSkillIR(currentFiles);
+    if (restoredIR) {
+      const resourceIR = reconcileRuntimeInputResources(restoredIR, currentFiles);
+      if (resourceIR !== restoredIR) {
+        currentFiles = finalizeSkillFiles(currentFiles, idea, input.answers, input.sourceText, input.generationPlan, loopPlan, resourceIR);
+        validation = await validateBundle(currentFiles);
+        reportClientGenerationLoopEvent("generation_loop_candidate", {
+          phase: "contract-repair", round: 0, accepted: validation.executionReady,
+          reason: "已将明确绑定任务输入的文件改为真实宿主读取；未生成或假定存在任何二进制材料",
+        });
+      }
+    }
     let state = collectP1ContractState(currentFiles, input.answers, input.generationPlan, validation);
     let rounds = 0;
     let nestedP0Rounds = 0;
-    let previousSignature = "";
     const rejectedAttempts: string[] = [];
     while (validation.executionReady && state.issues.length && rounds < BUILD_REPAIR_MAX_ROUNDS) {
       const currentIR = parseCanonicalSkillIR(currentFiles);
@@ -7155,7 +7564,6 @@ export default function Home() {
         }
       }
       const blockers = state.issues.map((issue) => `${issue.type} · ${issue.files.join("、") || "bundle"} · ${issue.evidence}`);
-      const signature = state.issues.map((issue) => `${issue.type}:${issue.evidence}`).join("\n");
       const allowedMutationTypes = allowedP1MutationTypes(state.issues);
       const evidencePaths = [...new Set([
         "SKILL.md",
@@ -7191,6 +7599,7 @@ export default function Home() {
             warnings: state.audit.warnings,
             contractAttempt: rounds + 1,
             allowedMutationTypes,
+            missingResources: currentIR ? missingBundleResources(currentIR, currentFiles) : [],
           },
           canonicalTargets: { ...canonicalMutationTargetCatalog(currentFiles), allowedMutationTypes },
           rejectedHistory: rejectedAttempts,
@@ -7234,20 +7643,25 @@ export default function Home() {
       const nextFiles = canonicalCandidate.files;
       const staticRepair = await runP0StaticRepairLoop(nextFiles, input.generationPlan);
       nestedP0Rounds += staticRepair.rounds;
-      currentFiles = staticRepair.files;
-      validation = staticRepair.validation;
-      state = collectP1ContractState(currentFiles, input.answers, input.generationPlan, validation);
-      const nextSignature = state.issues.map((issue) => `${issue.type}:${issue.evidence}`).join("\n");
+      const candidateState = collectP1ContractState(staticRepair.files, input.answers, input.generationPlan, staticRepair.validation);
+      const progress = contractRepairProgress(state.issues, candidateState.issues);
+      const accepted = staticRepair.validation.executionReady && progress.improved;
+      const reason = staticRepair.validation.executionReady ? progress.reason : "修复引入 P0 阻塞，已保留修复前版本";
       reportClientGenerationLoopEvent("generation_loop_candidate", {
         phase: "contract-repair",
         round: rounds,
-        accepted: validation.executionReady && nextSignature !== signature,
+        accepted,
         updatedPaths: [...canonicalCandidate.changedTargets, ...canonicalCandidate.implementationPaths],
-        reason: validation.executionReady ? `P1 契约问题由 ${blockers.length} 项降至 ${state.issues.length} 项` : "修复引入 P0，已转回 Execution Gate",
+        reason,
       });
+      if (!accepted) {
+        rejectedAttempts.push(`${reason}；未解决：${candidateState.issues.map((issue) => issue.evidence).join("；")}`);
+        continue;
+      }
+      currentFiles = staticRepair.files;
+      validation = staticRepair.validation;
+      state = candidateState;
       if (!validation.executionReady || !state.issues.length) break;
-      if (nextSignature === previousSignature) break;
-      previousSignature = signature;
     }
     const passed = validation.executionReady && validation.contractReady && state.issues.length === 0;
     reportClientGenerationLoopEvent("generation_loop_phase", {
@@ -7393,6 +7807,10 @@ export default function Home() {
       issues: [],
       frozen: true,
     });
+    // Build is already valid at this boundary. Persist its canonical checkpoint
+    // even if a later provider Eval fails, so the UI never mislabels an Eval
+    // transport/format error as an unfinished Bundle repair.
+    setFiles(bestFiles);
 
     let fullEvalBank = parseAndSplitEvalCases(bestFiles["evals/evals.json"] || "");
     let evalBank = harnessRunnableEvalBank(fullEvalBank, generationPlan);
@@ -7415,10 +7833,15 @@ export default function Home() {
         reason: "已按激活能力重编译 held-out Eval",
       });
     }
-    const trainCases = sampleOptimizationCases(evalBank, "train", OPTIMIZATION_TRAIN_SAMPLE);
-    const selectionCases = generationLoop.benchmarkSuiteCases.length >= 2
+    const sampledTrainCases = sampleOptimizationCases(evalBank, "train", OPTIMIZATION_TRAIN_SAMPLE);
+    const sampledSelectionCases = generationLoop.benchmarkSuiteCases.length >= 2
       ? generationLoop.benchmarkSuiteCases
       : sampleOptimizationCases(evalBank, "selection", OPTIMIZATION_SELECTION_SAMPLE, { requiredCapabilityIds });
+    // One diagnostic trajectory plus two held-out trajectories is enough to
+    // exercise intake, material handoff and final delivery without multiplying
+    // the same task once per capability.
+    const trainCases = composeEvaluationEpisodes(sampledTrainCases, 1);
+    const selectionCases = composeEvaluationEpisodes(sampledSelectionCases, 2);
     if (heldOutCoverage.missing.length) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
@@ -7434,7 +7857,7 @@ export default function Home() {
       await durableOptimization?.fail(new Error(state.stopReason));
       return { files: bestFiles, state };
     }
-    if (trainCases.length < 2 || selectionCases.length < 2) {
+    if (trainCases.length < 1 || selectionCases.length < 2) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
         status: "attention",
@@ -7467,10 +7890,15 @@ export default function Home() {
       loopPlan,
       skillIR: bestFiles["evals/skill-ir.json"],
     };
-    reportClientGenerationLoopEvent("generation_loop_phase", { phase: "rollout-baseline", reason: `冻结评测合约，并行运行无 Skill 与带 Skill 的隔离任务` });
-    const baselineHarness = await runIsolatedEvalHarness({ cases: selectionCases, configuration: "without_skill", repeats: 2 });
+    reportClientGenerationLoopEvent("generation_loop_phase", { phase: "rollout-baseline", reason: "冻结评测合约，先运行单轮无 Skill 与带 Skill 隔离任务；只在证据接近门槛时补跑稳定性" });
+    let baselineHarness = await runCachedNoSkillHarness(selectionCases, 1);
     const trainingHarness = await runIsolatedEvalHarness({ cases: trainCases, skillFiles: bestFiles, configuration: "with_skill", repeats: 1 });
-    const initialBestHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: bestFiles, configuration: "with_skill", repeats: 2 });
+    let initialBestHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: bestFiles, configuration: "with_skill", repeats: 1 });
+    if (comparisonNeedsStabilityRepeat(baselineHarness, initialBestHarness)) {
+      reportClientGenerationLoopEvent("generation_loop_phase", { phase: "stability-repeat", reason: "首轮正式对照接近接受边界，正在各补充一次独立试跑" });
+      baselineHarness = await runCachedNoSkillHarness(selectionCases, 2);
+      initialBestHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: bestFiles, configuration: "with_skill", repeats: 2, resumeFrom: initialBestHarness });
+    }
     const baselineEvidence = baselineHarness.evidence;
     let trainingEvidence = trainingHarness.evidence;
     let bestHarness = initialBestHarness;
@@ -7484,7 +7912,7 @@ export default function Home() {
     const initialBlindWinner = blindResult.revealedWinner === "left" ? "baseline" : blindResult.revealedWinner === "tie" ? "tie" : "candidate";
     const initialComparison = compareHarnessBenchmarks(baselineHarness, bestHarness, initialBlindWinner);
     await durableOptimization?.complete("baseline", { metrics: baselineMetrics, contractDigest: baselineHarness.contract.digest });
-    await durableOptimization?.complete("execute", { metrics: bestMetrics, runIds: initialBestHarness.executions.map((item) => item.runId) });
+    await durableOptimization?.complete("execute", { metrics: bestMetrics, runIds: bestHarness.executions.map((item) => item.runId) });
     await durableOptimization?.complete("grade", {
       winner: blindResult.revealedWinner,
       confidence: blindResult.confidence,
@@ -7591,11 +8019,12 @@ export default function Home() {
       return { files: appendDecisionLedgerEntry(input.targetFiles, entry), entry };
     };
     let stopReason = "达到自动优化上限，已保留当前最佳版本";
-    const collectPipelineIssues = (semantic: GenerationSemanticAudit, closure: ReturnType<typeof auditCapabilityClosure>, crossArtifact: ReturnType<typeof auditCrossArtifactConsistency>, audit: ReturnType<typeof auditSkillFiles>, bundleValidation: BundleStaticValidation): PipelineIssue[] => [
+    const collectPipelineIssues = (semantic: GenerationSemanticAudit, closure: ReturnType<typeof auditCapabilityClosure>, crossArtifact: ReturnType<typeof auditCrossArtifactConsistency>, audit: ReturnType<typeof auditSkillFiles>, bundleValidation: BundleStaticValidation, files: Record<string, string>): PipelineIssue[] => [
       ...bundleIssuesToPipelineIssues(bundleValidation.issues),
       ...makeContractIssues(audit.blockers),
       ...crossArtifact.issues,
       ...closure.issues.map((item) => ({ id: item.id, priority: item.severity === "critical" ? "P1" as const : "P3" as const, type: item.type.toUpperCase().replaceAll("-", "_"), source: "closure" as const, evidence: item.detail, files: item.files, capabilityId: item.capabilityId })),
+      ...auditOpenSkillQuality(files).issues,
       ...semantic.issues.map((item) => ({ id: item.id, priority: item.priority, type: item.type, source: "semantic" as const, evidence: item.evidence, files: item.files, capabilityId: item.capabilityId || undefined, failureType: item.failureType, allowedMutationTypes: item.allowedMutationTypes })),
     ];
     const includeAnonymousBaselineEvidence = (issues: PipelineIssue[], comparison: typeof blindResult): PipelineIssue[] => comparison.revealedWinner === "left"
@@ -7611,10 +8040,12 @@ export default function Home() {
     const includeHeldOutFailureEvidence = (issues: PipelineIssue[], evidence: OptimizationEvidenceReport): PipelineIssue[] => {
       return [...issues, ...pipelineIssuesFromEvalFailures(evidence)];
     };
-    let bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit, bestBundleValidation), blindResult), bestEvidence);
+    let bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit, bestBundleValidation, bestFiles), blindResult), bestEvidence);
 
+    let bestQuality = auditOpenSkillQuality(bestFiles);
     const initialCritical = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
     let goalReached = generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: initialCritical })
+      && bestQuality.passed
       && blindResult.revealedWinner !== "left";
     if (goalReached) stopReason = "能力闭环、核心任务和增益门控均已通过；进入最终冗余检查";
 
@@ -7628,8 +8059,8 @@ export default function Home() {
       }
       const density = estimateDomainValueDensity(bestFiles);
       let researchDecision: unknown = null;
-      const hasDecisionRuleFailure = issuePolicy.selected.some((item) => item.failureType === "missing_decision_rule");
-      if (issuePolicy.allowResearch && (density.shouldResearch || hasDecisionRuleFailure)) {
+      const hasResearchableKnowledgeFailure = issuePolicy.selected.some((item) => ["missing_decision_rule", "missing_exception", "missing_verification"].includes(item.failureType || ""));
+      if (issuePolicy.allowResearch && (density.shouldResearch || hasResearchableKnowledgeFailure)) {
         setGenerationLoop((current) => ({ ...current, phase: "diagnose", stopReason: `第 ${round} 轮：领域知识价值密度 ${density.score}，正在判断是否值得进入 Research Loop` }));
         const initialResearchRaw = await callAI<unknown>("optimization-research", {
           ...evidencePayload,
@@ -7639,24 +8070,70 @@ export default function Home() {
         });
         const initialResearch = normalizeOptimizationResearchDecision(initialResearchRaw);
         researchDecision = initialResearch;
-        if (initialResearch.required && !initialResearch.availableSourcesSufficient && initialResearch.knowledgeGaps.length && mcpConnections.length > 0) {
-          setGenerationLoop((current) => ({ ...current, phase: "diagnose", stopReason: `第 ${round} 轮：已定位 ${initialResearch.knowledgeGaps.length} 个具体知识缺口，正在调用只读 MCP 取证` }));
-          showLoopBusy(`正在通过已授权 MCP 核对：${initialResearch.knowledgeGaps[0]}`);
-          const mcpReport = await retrieveInternalMcpEvidence("optimization-research", initialResearch.knowledgeGaps, 3);
-          if (mcpReport.sources.length) {
+        if (initialResearch.required && !initialResearch.availableSourcesSufficient && initialResearch.knowledgeGaps.length) {
+          const retrievedSources: RetrievedKnowledgeSource[] = [];
+          let mcpReport: InternalMcpEvidenceReport | null = null;
+          let webSourceCount = 0;
+          if (mcpConnections.length > 0) {
+            setGenerationLoop((current) => ({ ...current, phase: "diagnose", stopReason: `第 ${round} 轮：已定位 ${initialResearch.knowledgeGaps.length} 个具体知识缺口，正在调用只读 MCP 取证` }));
+            showLoopBusy(`正在通过已授权 MCP 核对：${initialResearch.knowledgeGaps[0]}`);
+            mcpReport = await retrieveInternalMcpEvidence("optimization-research", initialResearch.knowledgeGaps, 3);
+            retrievedSources.push(...mcpReport.sources);
+          }
+          if (researchReady) {
+            const canonical = parseCanonicalSkillIR(bestFiles);
+            const researchDomain = canonical?.identity?.intent || idea;
+            const queries = buildOptimizationResearchQueries(researchDomain, initialResearch.knowledgeGaps);
+            if (queries.length) {
+              setGenerationLoop((current) => ({ ...current, phase: "diagnose", stopReason: `第 ${round} 轮：正在通过 ${RESEARCH_PROVIDERS[researchProvider].name} 定向补齐 ${queries.length} 个知识缺口` }));
+              showLoopBusy(`正在检索缺失证据：${initialResearch.knowledgeGaps[0]}`);
+              const controller = new AbortController();
+              const timeout = window.setTimeout(() => controller.abort(), 45_000);
+              try {
+                const response = await fetch("/api/research", {
+                  method: "POST",
+                  headers: { "Content-Type": "application/json" },
+                  body: JSON.stringify({
+                    provider: researchProvider,
+                    apiKey: researchApiKey,
+                    baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
+                    queries,
+                  }),
+                  signal: controller.signal,
+                });
+                if (response.ok) {
+                  const payload = await response.json() as { sources?: unknown };
+                  const webSources = normalizeRetrievedSources(payload.sources);
+                  webSourceCount = webSources.length;
+                  retrievedSources.push(...webSources);
+                }
+              } catch (error) {
+                reportClientGenerationLoopEvent("generation_loop_candidate", {
+                  phase: "optimization-research",
+                  accepted: false,
+                  reason: error instanceof Error && error.name === "AbortError" ? "定向网页检索超过 45 秒" : error instanceof Error ? error.message : "定向网页检索失败",
+                });
+              } finally {
+                window.clearTimeout(timeout);
+              }
+            }
+          }
+          const sources = dedupeResearchSources(retrievedSources, 12);
+          if (sources.length) {
             const enrichedResearchRaw = await callAI<unknown>("optimization-research", {
               ...evidencePayload,
               skill: bestFiles,
               issues: issuePolicy.selected,
               domainValueDensity: density,
-              researchSources: buildKnowledgeEvidencePayload(mcpReport.sources, 24_000),
+              researchSources: buildKnowledgeEvidencePayload(sources, 24_000),
               priorResearchDecision: initialResearch,
             });
             researchDecision = {
               ...normalizeOptimizationResearchDecision(enrichedResearchRaw),
-              mcpEvidence: { sourceCount: mcpReport.sources.length, attempts: mcpReport.attempts },
+              ...(mcpReport ? { mcpEvidence: { sourceCount: mcpReport.sources.length, attempts: mcpReport.attempts } } : {}),
+              ...(webSourceCount ? { webEvidence: { sourceCount: webSourceCount, provider: researchProvider } } : {}),
             } satisfies OptimizationResearchDecision;
-          } else {
+          } else if (mcpReport) {
             researchDecision = {
               ...initialResearch,
               mcpEvidence: { sourceCount: 0, attempts: mcpReport.attempts },
@@ -7670,6 +8147,8 @@ export default function Home() {
       let preparedPatch: ReturnType<typeof applyPatchPlan> | null = null;
       let canonicalCandidate: ReturnType<typeof applyCanonicalCandidate> | null = null;
       const requiredDecisionIds = rejectedHistory.flatMap((item) => item.decisionId ? [item.decisionId] : []);
+      const attemptedPlanSignatures = new Set<string>();
+      let planningStoppedForRepeat = false;
       for (let planAttempt = 1; planAttempt <= PATCH_PLAN_MAX_ATTEMPTS; planAttempt += 1) {
         const patchRaw = await callAI<unknown>("optimization-patch-plan", {
           ...evidencePayload,
@@ -7679,7 +8158,7 @@ export default function Home() {
           rolloutEvidence: { trainingEvidence, researchDecision },
           mutationBudget: DEFAULT_MUTATION_BUDGET,
           compilerProtectedArtifacts: ["evals/skill-ir.json", "evals/capability-manifest.json", ...(bestFiles["references/domain-playbook.md"] ? ["references/domain-playbook.md"] : [])],
-          canonicalTargets: canonicalMutationTargetCatalog(bestFiles),
+          canonicalTargets: canonicalMutationTargetCatalogForIssues(bestFiles, issuePolicy.selected),
           rejectedHistory,
           planAttempt,
         });
@@ -7690,6 +8169,19 @@ export default function Home() {
           reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan", round, attempt: planAttempt, accepted: false, reason });
           continue;
         }
+        const planSignature = JSON.stringify({
+          issueIds: [...normalizedPlan.issueIds].sort(),
+          canonicalMutations: normalizedPlan.canonicalMutations,
+          operations: normalizedPlan.operations,
+        });
+        if (attemptedPlanSignatures.has(planSignature)) {
+          planningStoppedForRepeat = true;
+          const reason = `Planner 第 ${planAttempt} 次重复了已经失败的同一修改面，已提前停止重复计费`;
+          rejectedHistory.push({ round, reason, files: [] });
+          reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan-noop", round, attempt: planAttempt, accepted: false, reason });
+          break;
+        }
+        attemptedPlanSignatures.add(planSignature);
         const constrainedPlan = constrainPatchPlan({
           plan: normalizedPlan,
           files: bestFiles,
@@ -7698,7 +8190,10 @@ export default function Home() {
         });
         const validation = validatePatchPlan({
           plan: constrainedPlan,
-          issues: bestPipelineIssues,
+          // The Planner only saw this focused root-cause group. Validate
+          // against the same set so it cannot silently target a different
+          // same-priority issue from the broader audit.
+          issues: issuePolicy.selected,
           files: bestFiles,
           capabilities: generationPlan.items,
           budget: DEFAULT_MUTATION_BUDGET,
@@ -7753,7 +8248,9 @@ export default function Home() {
       }
       if (!patchPlan || !planValidation?.valid || !preparedPatch || !canonicalCandidate) {
         rejectedPatches += 1;
-        stopReason = `Planner 已自动重规划 ${PATCH_PLAN_MAX_ATTEMPTS} 次，仍没有落在安全修改面内；已保留当前可用版本`;
+        stopReason = planningStoppedForRepeat
+          ? "Planner 重复了同一无效修改，已提前停止并保留当前可用版本"
+          : `Planner 已自动重规划 ${PATCH_PLAN_MAX_ATTEMPTS} 次，仍没有落在安全修改面内；已保留当前可用版本`;
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "impact", round, accepted: false, reason: stopReason });
         break;
       }
@@ -7781,13 +8278,15 @@ export default function Home() {
       }
 
       setBusyPhaseIndex(8);
-      showLoopBusy(`第 ${round} 轮候选已生成，正在用独立任务验证是否真的变好`);
-      setGenerationLoop((current) => ({ ...current, phase: "validate", stopReason: `第 ${round} 轮：正在运行 Static、Capability、Cross-artifact 与 Behavior Regression` }));
-      let candidateTrainingHarness: HarnessReport;
+      showLoopBusy(`第 ${round} 轮候选已生成，先检查最终产物是否值得继续深评`);
+      setGenerationLoop((current) => ({ ...current, phase: "validate", stopReason: `第 ${round} 轮：先运行冻结最终产物门禁；明显回退将不再触发诊断、复跑和匿名比较` }));
       let candidateHarness: HarnessReport;
       try {
-        candidateTrainingHarness = await runIsolatedEvalHarness({ cases: trainCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 1 });
-        candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 2 });
+        candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 1 });
+        if (comparisonNeedsStabilityRepeat(bestHarness, candidateHarness)) {
+          reportClientGenerationLoopEvent("generation_loop_phase", { phase: "stability-repeat", round, reason: "候选首轮结果接近门槛或可能被接受，正在补充一次独立试跑" });
+          candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 2, resumeFrom: candidateHarness });
+        }
       } catch {
         rejectedPatches += 1;
         rejectedHistory.push({ round, reason: "候选版本未完成全部诊断任务或独立保留任务", files: candidateChangedPaths });
@@ -7795,10 +8294,53 @@ export default function Home() {
         continue;
       }
       const candidateEvidence = candidateHarness.evidence;
+      const candidateQuality = auditOpenSkillQuality(candidateFiles);
+      const behaviorScreen = screenCandidateBehavior({ baseline: bestEvidence, candidate: candidateEvidence, caseIds: selectionCases.map((item) => item.id) });
+      if (!behaviorScreen.advance) {
+        rejectedPatches += 1;
+        const reason = `最终产物快速门禁未通过：${behaviorScreen.reasons.join("；")}`;
+        const candidateMetrics = summarizeGenerationEvidence(candidateEvidence);
+        const recorded = recordGenerationDecision({
+          round,
+          accepted: false,
+          targetFiles: bestFiles,
+          baselineFiles: bestFiles,
+          candidateFiles,
+          contractDigest: candidateHarness.contract.digest,
+          runIds: candidateHarness.executions.map((item) => item.runId),
+          caseIds: selectionCases.map((item) => item.id),
+          baselineScore: bestMetrics.score,
+          candidateScore: candidateMetrics.score,
+          reasons: behaviorScreen.reasons,
+          regressions: behaviorScreen.regressions,
+          changedFiles: candidateChangedPaths,
+          evidence: candidateEvidence,
+          consumedDecisionIds: patchPlan.consumedDecisionIds,
+        });
+        bestFiles = recorded.files;
+        rejectedHistory.push({
+          round,
+          reason,
+          files: candidateChangedPaths,
+          decisionId: recorded.entry.id,
+          evidenceDigest: recorded.entry.evidenceDigest,
+          textualFeedback: candidateEvidence.textualFeedback,
+          failedCases: candidateEvidence.failedCases,
+        });
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "final-output-screen", round, accepted: false, updatedPaths: candidateChangedPaths, reason });
+        if (behaviorScreen.scoreDelta <= -8 || behaviorScreen.passDelta < 0 || behaviorScreen.regressions.length) {
+          stopReason = "候选最终产物明确回退；已跳过后续诊断、复跑与匿名比较，并提前停止相同方向优化";
+          reportClientGenerationLoopEvent("generation_loop_phase", { phase: "early-stop-output-regression", round, accepted: false, reason: stopReason });
+          break;
+        }
+        continue;
+      }
+      const candidateTrainingHarness = await runIsolatedEvalHarness({ cases: trainCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 1 });
       const candidateTrainingEvidence = candidateTrainingHarness.evidence;
       const candidateSemanticRaw = await callAI<unknown>("optimization-diagnose", {
         ...evidencePayload,
         skill: candidateFiles,
+        changedPaths: candidateChangedPaths,
         closureReport: { skillContract, capabilityClosure: candidateClosure, staticIssues: makeContractIssues(candidateAudit.blockers), crossArtifactRegression: candidateCrossArtifact },
         baselineEvidence,
         rolloutEvidence: { diagnostic: candidateTrainingEvidence, heldOut: candidateEvidence },
@@ -7838,7 +8380,7 @@ export default function Home() {
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "diagnose", round, accepted: false, updatedPaths: candidateChangedPaths, reason: "候选语义检查不完整" });
         continue;
       }
-      const candidatePipelineIssues = includeHeldOutFailureEvidence(collectPipelineIssues(candidateSemantic, candidateClosure, candidateCrossArtifact, candidateAudit, candidateBundleValidation), candidateEvidence);
+      const candidatePipelineIssues = includeHeldOutFailureEvidence(collectPipelineIssues(candidateSemantic, candidateClosure, candidateCrossArtifact, candidateAudit, candidateBundleValidation, candidateFiles), candidateEvidence);
       const gate = decideGenerationGoalGate({
         baseline: bestEvidence,
         candidate: candidateEvidence,
@@ -7849,13 +8391,18 @@ export default function Home() {
         candidateBlockers: candidateAudit.blockers.length,
         baselineCriticalSemanticIssues: bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length,
         candidateCriticalSemanticIssues: candidatePipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length,
+        baselineQualityScore: bestQuality.score,
+        candidateQualityScore: candidateQuality.score,
       });
-      const candidateBlind = await runBlindHarnessComparison(bestHarness, candidateHarness);
-      if (candidateBlind.revealedWinner === "left") gate.reasons.push(`匿名 A/B 更偏好当前最佳版本：${candidateBlind.evidence}`);
-      gate.accepted = gate.reasons.length === 0;
       const newFiles = applied.changedPaths.filter((path) => !(path in bestFiles)).length;
       const tokenDelta = Object.values(candidateFiles).join("\n").length - Object.values(bestFiles).join("\n").length;
-      const utility = candidateUtility({ qualityGain: gate.scoreDelta, regressionCount: gate.regressions.length + Math.max(0, candidateCrossArtifact.issues.length - bestCrossArtifact.issues.length), changedFiles: candidateChangedPaths.length, newFiles, tokenDelta });
+      const deterministicQualityGain = Math.max(0, candidateQuality.score - bestQuality.score);
+      const utility = candidateUtility({ qualityGain: gate.scoreDelta + deterministicQualityGain / 5, regressionCount: gate.regressions.length + Math.max(0, candidateCrossArtifact.issues.length - bestCrossArtifact.issues.length), changedFiles: candidateChangedPaths.length, newFiles, tokenDelta });
+      if (gate.accepted && utility > 0) {
+        const candidateBlind = await runBlindHarnessComparison(bestHarness, candidateHarness);
+        if (candidateBlind.revealedWinner === "left") gate.reasons.push(`匿名 A/B 更偏好当前最佳版本：${candidateBlind.evidence}`);
+        gate.accepted = gate.reasons.length === 0;
+      }
       if (!gate.accepted || utility <= 0) {
         rejectedPatches += 1;
         const reason = [...gate.reasons, ...gate.regressions, ...(utility <= 0 ? [`综合效用 ${utility} 未覆盖回归、复杂度和 token 成本`] : [])].join("；");
@@ -7888,6 +8435,13 @@ export default function Home() {
           failedCases: candidateEvidence.failedCases,
         });
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: false, updatedPaths: candidateChangedPaths, reason, utility });
+        const bestCriticalCount = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
+        const candidateCriticalCount = candidatePipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
+        if (gate.scoreDelta <= 0 && candidateCriticalCount >= bestCriticalCount) {
+          stopReason = "候选没有减少关键问题且真实任务分数未提升；已提前停止相同方向的重复优化";
+          reportClientGenerationLoopEvent("generation_loop_phase", { phase: "early-stop-no-progress", round, accepted: false, reason: stopReason });
+          break;
+        }
         continue;
       }
 
@@ -7910,7 +8464,10 @@ export default function Home() {
         caseIds: selectionCases.map((item) => item.id),
         baselineScore: bestMetrics.score,
         candidateScore: summarizeGenerationEvidence(candidateEvidence).score,
-        reasons: [`独立保留任务提升 ${gate.scoreDelta} 分`, `综合效用 ${utility}`],
+        reasons: [
+          gate.scoreDelta > 0 ? `独立保留任务提升 ${gate.scoreDelta} 分` : `独立保留任务无退化，确定性 Skill 质量提升 ${deterministicQualityGain} 分`,
+          `综合效用 ${utility}`,
+        ],
         regressions: gate.regressions,
         changedFiles: candidateChangedPaths,
         evidence: candidateEvidence,
@@ -7928,15 +8485,16 @@ export default function Home() {
         comparisonStage = "optimized";
       }
       bestSemantic = candidateSemantic;
+      bestQuality = candidateQuality;
       bestPipelineIssues = includeAnonymousBaselineEvidence(candidatePipelineIssues, blindResult);
       bestCrossArtifact = candidateCrossArtifact;
       trainingEvidence = candidateTrainingEvidence;
       bestMetrics = summarizeGenerationEvidence(bestEvidence);
       acceptedPatches += 1;
-      reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: true, updatedPaths: candidateChangedPaths, beforeCount: bestMetrics.score - gate.scoreDelta, afterCount: bestMetrics.score, reason: `独立保留任务提升 ${gate.scoreDelta} 分；综合效用 ${utility}`, utility });
+      reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "validate", round, accepted: true, updatedPaths: candidateChangedPaths, beforeCount: bestMetrics.score - gate.scoreDelta, afterCount: bestMetrics.score, reason: gate.scoreDelta > 0 ? `独立保留任务提升 ${gate.scoreDelta} 分；综合效用 ${utility}` : `独立保留任务无退化，确定性 Skill 质量提升 ${deterministicQualityGain} 分；综合效用 ${utility}`, utility });
       setFiles(bestFiles);
       const criticalIssues = bestPipelineIssues.filter((item) => item.priority === "P0" || item.priority === "P1").length;
-      if (generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: criticalIssues })) {
+      if (bestQuality.passed && generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: criticalIssues })) {
         stopReason = "候选版本通过能力闭环、Skill Lift 与独立回归门控";
         goalReached = true;
         break;
@@ -7945,17 +8503,24 @@ export default function Home() {
 
     setBusyPhaseIndex(9);
     showLocalBusy("正在删除重复声明和不可达内容；任何质量退化都会自动保留原版");
-    const rawPruneResult = pruneBundleDeterministically(bestFiles);
-    const projectedPrunedFiles = finalizeSkillFiles(
-      rawPruneResult.files,
-      idea,
-      evaluationAnswers,
-      contextBundle,
-      generationPlan,
-      loopPlan,
-      parseCanonicalSkillIR(bestFiles) || undefined,
-    );
-    const projectedPrunePaths = Object.keys({ ...bestFiles, ...projectedPrunedFiles }).filter((path) => bestFiles[path] !== projectedPrunedFiles[path]);
+    const shouldRunPrune = goalReached || acceptedPatches > 0;
+    const rawPruneResult = shouldRunPrune
+      ? pruneBundleDeterministically(bestFiles)
+      : { files: bestFiles, changedPaths: [] as string[], deletedPaths: [] as string[] };
+    const projectedPrunedFiles = shouldRunPrune
+      ? finalizeSkillFiles(
+        rawPruneResult.files,
+        idea,
+        evaluationAnswers,
+        contextBundle,
+        generationPlan,
+        loopPlan,
+        parseCanonicalSkillIR(bestFiles) || undefined,
+      )
+      : bestFiles;
+    const projectedPrunePaths = shouldRunPrune
+      ? Object.keys({ ...bestFiles, ...projectedPrunedFiles }).filter((path) => bestFiles[path] !== projectedPrunedFiles[path])
+      : [];
     const pruneResult = {
       files: projectedPrunedFiles,
       changedPaths: projectedPrunePaths,
@@ -7970,7 +8535,10 @@ export default function Home() {
       const prunedBundleValidation = await validateBundle(prunedFiles);
       const pruneStaticPolicy = optimizationPolicyFor([...bundleIssuesToPipelineIssues(prunedBundleValidation.issues), ...makeContractIssues(prunedAudit.blockers), ...prunedCrossArtifact.issues]);
       if (prunedBundleValidation.executionReady && pruneStaticPolicy.priority !== "P0") {
-        const prunedHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: prunedFiles, configuration: "candidate", repeats: 2 });
+        let prunedHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: prunedFiles, configuration: "candidate", repeats: 1 });
+        if (comparisonNeedsStabilityRepeat(bestHarness, prunedHarness)) {
+          prunedHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: prunedFiles, configuration: "candidate", repeats: 2, resumeFrom: prunedHarness });
+        }
         const prunedEvidence = prunedHarness.evidence;
         if (prunedEvidence) {
           const prunedMetrics = summarizeGenerationEvidence(prunedEvidence);
@@ -7995,7 +8563,8 @@ export default function Home() {
             bestEvidence = prunedEvidence;
             bestHarness = prunedHarness;
             bestMetrics = prunedMetrics;
-            bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit, bestBundleValidation), blindResult), bestEvidence);
+            bestQuality = auditOpenSkillQuality(bestFiles);
+            bestPipelineIssues = includeHeldOutFailureEvidence(includeAnonymousBaselineEvidence(collectPipelineIssues(bestSemantic, bestClosure, bestCrossArtifact, bestAudit, bestBundleValidation, bestFiles), blindResult), bestEvidence);
             acceptedPatches += 1;
             stopReason = `${stopReason}；精简冗余已安全删除 ${pruneResult.deletedPaths.length} 个文件并去除 ${pruneResult.changedPaths.length - pruneResult.deletedPaths.length} 处重复声明`;
             reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "delete-pass", accepted: true, updatedPaths: pruneResult.changedPaths, reason: "完整回归无退化，接受删减版本" });
@@ -8006,7 +8575,9 @@ export default function Home() {
         }
       }
     } else {
-      stopReason = `${stopReason}；精简检查通过，没有发现可安全删除的重复或无效内容`;
+      stopReason = shouldRunPrune
+        ? `${stopReason}；精简检查通过，没有发现可安全删除的重复或无效内容`
+        : `${stopReason}；本轮没有接受语义候选，已跳过不会改善质量的删减复评`;
     }
 
     // The public comparison must describe the exact final Bundle. Candidate
@@ -8029,7 +8600,8 @@ export default function Home() {
     const comparisonIsCurrent = comparisonRevision === finalBundleRevision;
     const finalBlindWinner = blindResult.revealedWinner === "left" ? "baseline" : blindResult.revealedWinner === "tie" ? "tie" : "candidate";
     const finalComparison = compareHarnessBenchmarks(baselineHarness, bestHarness, finalBlindWinner);
-    const qualityGoalSatisfied = generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: remainingCritical });
+    const finalOpenSkillQuality = auditOpenSkillQuality(bestFiles);
+    const qualityGoalSatisfied = finalOpenSkillQuality.passed && generationGoalSatisfied({ evidence: bestMetrics, baseline: baselineMetrics, closureScore: bestClosure.score, blockers: bestAudit.blockers.length, criticalSemanticIssues: remainingCritical });
     const passed = comparisonIsCurrent && qualityGoalSatisfied && blindResult.revealedWinner !== "left";
     const stableAtCeiling = comparisonIsCurrent && !passed && blindResult.revealedWinner === "tie" && generationEvaluationAtCeiling({
       evidence: bestMetrics,
@@ -8180,7 +8752,16 @@ export default function Home() {
       ...(rawPlan && typeof rawPlan === "object" ? rawPlan as Record<string, unknown> : {}),
       required: capabilityDelta.skillMustTeach.length > 0,
       capabilityDeltaGapIds: capabilityDelta.skillMustTeach.map((item) => item.id),
+      excludedGenericKnowledge: capabilityDelta.excludedGenericKnowledge,
+      userPolicies: ["evidence-policy", "boundary", "autonomy", "output-format"].map((key) => (demoAnswers as Record<string, string>)[key] || "").filter(Boolean),
     });
+    const verifyPack = async (candidate: KnowledgePack, prior?: KnowledgePack) => {
+      const knowledgeClaims = knowledgeVerificationCandidates(candidate);
+      if (!knowledgeClaims.length) return candidate;
+      setBusyExecutionNote("正在核对每条规则的来源原文与对应能力差值，不把用户偏好当作外部知识");
+      const verdicts = await callAI<unknown>("knowledge-verify", { capabilityDelta, knowledgeClaims, acceptedKnowledge: knowledgeVerificationContext(prior), knowledgePlan: plan, answers: interviewEvidence });
+      return applyKnowledgeVerification(candidate, verdicts, prior);
+    };
     const workflowMcpEnabled = mcpConnections.length > 0;
     if (capabilityDelta.skillMustTeach.length > 0 && !plan.required) {
       const insufficient: KnowledgePack = {
@@ -8189,6 +8770,7 @@ export default function Home() {
         summary: "Capability Delta 已发现专属能力差值，但四类知识检索计划不完整；本 Skill 已标记为知识不足，不会用泛化内容补齐。",
         sufficiency: "insufficient",
         plan,
+        categoryCoverage: { covered: [], missing: plan.requiredCategories, score: 0 },
         generatedAt: new Date().toISOString(),
       };
       setKnowledgePack(insufficient);
@@ -8219,11 +8801,35 @@ export default function Home() {
       : researchReady
         ? `正在检索专业知识：${plan.queries[0] || plan.knowledgeGaps[0]}`
         : "正在根据现有资料整理专业判断");
+    let sources: RetrievedKnowledgeSource[] = [];
+    let retainedPack: KnowledgePack | undefined;
+    let compilationIncomplete = false;
+    const compileBatches = async (payload: Record<string, unknown>, prior?: KnowledgePack) => {
+      let result = prior;
+      const { failures } = await compileKnowledgeBatches({
+        payload,
+        call: (batchPayload) => callAI<unknown>("knowledge-compile", batchPayload),
+        onBatch: async ({ raw, categories }) => {
+          setBusyExecutionNote(`正在核验 ${categories.join("、")}，已完成的来源与规则会保留`);
+          const batch = await verifyPack(reconcileKnowledgePackContentPermission(normalizeKnowledgePack({ raw, plan, sources, evidencePayload: payload.researchSources as ReturnType<typeof buildKnowledgeEvidencePayload> }), demoAnswers), result);
+          result = result ? mergeKnowledgePacks(result, batch) : batch;
+          retainedPack = result;
+          setKnowledgePack({ ...result, status: "compiling" });
+        },
+      });
+      if (failures.length) {
+        compilationIncomplete = true;
+        result = retainKnowledgeFailure(plan, sources, failures.join("；"), result);
+        reportClientGenerationLoopEvent("generation_loop_failed", { phase: "knowledge-compile-batch", reason: failures.join("；"), afterCount: result.atoms.length });
+      }
+      retainedPack = result ?? normalizeKnowledgePack({ raw: { atoms: [] }, plan, sources });
+      return retainedPack;
+    };
     try {
       const mcpReport = workflowMcpEnabled
         ? await retrieveInternalMcpEvidence("knowledge-compile", plan.queries, 3)
         : { phase: "knowledge-compile" as const, sources: [], attempts: [], connectionsScanned: 0, toolsDiscovered: 0 };
-      let sources = mcpReport.sources;
+      sources = mcpReport.sources;
       let webResearchIssue = "";
       if (researchReady) {
         setBusyExecutionNote(workflowMcpEnabled
@@ -8239,7 +8845,7 @@ export default function Home() {
               provider: researchProvider,
               apiKey: researchApiKey,
               baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
-              queries: plan.queries,
+              queries: selectKnowledgeQueries(plan.queries, plan.preferredDomains),
             }),
             signal: controller.signal,
           });
@@ -8268,15 +8874,15 @@ export default function Home() {
       const compiling: KnowledgePack = { ...researching, status: "compiling", sources, summary: `已取得 ${sources.length} 个来源${workflowMcpEnabled ? `（MCP ${mcpReport.sources.length}）` : ""}，正在提炼会改变 Skill 行为的专业规则${webResearchIssue ? `；网页补充未完成：${webResearchIssue}` : ""}` };
       setKnowledgePack(compiling);
       setBusyExecutionNote(`已读取 ${sources.length} 个来源，正在核对适用条件、例外和失败处理`);
-      let evidencePayload = buildKnowledgeEvidencePayload(sources);
-      const compiled = await callAI<unknown>("knowledge-compile", {
+      const evidenceFocus = [...plan.decisionDimensions, ...capabilityDelta.skillMustTeach.flatMap((gap) => gap.researchQuestions)];
+      let evidencePayload = buildKnowledgeEvidencePayload(sources, 42_000, { focus: evidenceFocus });
+      let pack = await compileBatches({
         idea,
         answers: interviewEvidence,
         capabilityDelta,
         knowledgePlan: plan,
         researchSources: evidencePayload,
       });
-      let pack = reconcileKnowledgePackContentPermission(normalizeKnowledgePack({ raw: compiled, plan, sources }), interviewEvidence);
       reportClientGenerationLoopEvent("generation_loop_phase", {
         phase: "knowledge-validation",
         beforeCount: pack.diagnostics.candidateCount,
@@ -8287,18 +8893,19 @@ export default function Home() {
           : `首轮形成 ${pack.atoms.length} 条可追溯规则`,
       });
       const densityGate = knowledgePackNeedsExpansion(pack);
-      if (densityGate.needsExpansion) {
-        const needsCompilerRepair = pack.diagnostics.validatorRejectedCount > 0;
+      if (densityGate.needsExpansion && !compilationIncomplete) {
         setBusyExecutionKind("loop");
-        setBusyExecutionNote(needsCompilerRepair
-          ? `${densityGate.reason}；来源已经足够，正在根据校验原因自动重写不合格候选`
-          : `${densityGate.reason}，正在针对未覆盖维度补搜更高权威来源`);
+        setBusyExecutionNote(`${densityGate.reason}，正在针对未覆盖能力补搜来源；引用不支持规则时，不会只改写同一批证据`);
         try {
-          const followupQueries = needsCompilerRepair ? [] : buildFollowupResearchQueries(plan, densityGate.missingDimensions);
+          const missingGapIds = new Set(pack.evidenceCoverage?.missingGapIds || plan.capabilityDeltaGapIds);
+          const gapQuestions = capabilityDelta.skillMustTeach.filter((gap) => missingGapIds.has(gap.id)).flatMap((gap) => gap.researchQuestions);
+          const followupQueries = buildFollowupResearchQueries(plan, densityGate.missingDimensions, gapQuestions);
+          const previousUrls = new Set(sources.map((source) => source.url));
+          const usedUrls = pack.atoms.flatMap((atom) => atom.sourceUrls);
           if (followupQueries.length > 0) {
             if (workflowMcpEnabled) {
               const followupMcp = await retrieveInternalMcpEvidence("knowledge-compile", followupQueries, 2);
-              sources = dedupeResearchSources([...sources, ...followupMcp.sources], 18);
+              sources = dedupeResearchSources([...followupMcp.sources, ...sources], 18, [...usedUrls, ...followupMcp.sources.map((source) => source.url)]);
             }
             if (researchReady) {
               const followupController = new AbortController();
@@ -8311,42 +8918,46 @@ export default function Home() {
                     provider: researchProvider,
                     apiKey: researchApiKey,
                     baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
-                    queries: followupQueries,
+                    queries: selectKnowledgeQueries(followupQueries, plan.preferredDomains),
                   }),
                   signal: followupController.signal,
                 });
                 if (followupResponse.ok) {
                   const followupPayload = await followupResponse.json() as { sources?: unknown };
-                  sources = dedupeResearchSources([...sources, ...normalizeRetrievedSources(followupPayload.sources)], 18);
+                  const freshSources = normalizeRetrievedSources(followupPayload.sources);
+                  sources = dedupeResearchSources([...freshSources, ...sources], 18, [...usedUrls, ...freshSources.map((source) => source.url)]);
                 }
               } finally {
                 window.clearTimeout(followupTimeout);
               }
             }
-            evidencePayload = buildKnowledgeEvidencePayload(sources);
+            evidencePayload = buildKnowledgeEvidencePayload(sources, 42_000, { focus: gapQuestions, preferredUrls: sources.filter((source) => !previousUrls.has(source.url)).map((source) => source.url) });
           }
-          setBusyExecutionNote(needsCompilerRepair
-            ? `正在把 ${pack.diagnostics.validatorRejectedCount} 条校验反馈送回 Knowledge Compiler，重新生成可执行规则`
-            : `已扩展到 ${sources.length} 个分级来源，正在对缺失维度做第 2 轮定向蒸馏`);
-          const refined = await callAI<unknown>("knowledge-compile", {
+          setBusyExecutionNote(`已读取 ${sources.length} 个分级来源，正在结合校验反馈对缺失能力做第 2 轮定向蒸馏`);
+          pack = await compileBatches({
             idea,
             answers: interviewEvidence,
             capabilityDelta,
             knowledgePlan: { ...plan, knowledgeGaps: densityGate.missingDimensions.length ? densityGate.missingDimensions : plan.knowledgeGaps },
             researchSources: evidencePayload,
             priorKnowledgePack: serializeKnowledgePackForRefinement(pack, evidencePayload),
-          });
-          pack = reconcileKnowledgePackContentPermission(
-            mergeKnowledgePacks({ ...pack, sources }, normalizeKnowledgePack({ raw: refined, plan, sources })),
-            interviewEvidence,
-          );
+          }, { ...pack, sources });
         } catch (error) {
           const refinementIssue = error instanceof Error ? error.message : "第 2 轮专业知识蒸馏失败";
           pack = { ...pack, status: "partial", summary: `${pack.summary}；补充蒸馏未完成：${refinementIssue}` };
           reportClientGenerationLoopEvent("generation_loop_failed", { phase: "knowledge-density-refinement", reason: refinementIssue, covered: pack.coverage.covered.length, target: pack.coverage.target });
         }
       }
+      if (!pack.atoms.length && pack.diagnostics.candidateCount) pack = {
+        ...pack,
+        summary: `已取得 ${sources.length} 个来源，检查了 ${pack.diagnostics.candidateCount} 条候选，但仍未形成通过核验的专业规则。知识增强尚未完成，具体拒绝原因已保留在开发者详情中。`,
+      };
       setKnowledgePack(pack);
+      reportClientGenerationLoopEvent("generation_loop_phase", {
+        phase: "knowledge-final", beforeCount: sources.length, afterCount: pack.atoms.length,
+        blockers: pack.rejected.slice(-8),
+        reason: `来源 ${sources.length}，送入编译 ${evidencePayload.length}；候选 ${pack.diagnostics.candidateCount}；已核验规则 ${pack.evidenceCoverage?.verifiedRuleCount || 0}，参考洞察 ${pack.evidenceCoverage?.advisoryRuleCount || 0}；${pack.sufficiency}`,
+      });
       setBusyExecutionNote(knowledgePackIsPublishable(pack)
         ? `已保留 ${pack.atoms.length} 条有来源的专业知识，覆盖 ${pack.coverage.score}% 决策维度；高证据内容形成规则，较弱证据作为参考洞察写入`
         : pack.atoms.length
@@ -8355,23 +8966,34 @@ export default function Home() {
       return pack;
     } catch (error) {
       const message = error instanceof Error && error.name === "AbortError" ? "专业知识检索超过 58 秒，已停止当前检索" : error instanceof Error ? error.message : "专业知识联网失败";
-      const failed: KnowledgePack = {
-        ...EMPTY_KNOWLEDGE_PACK,
-        status: "error",
-        summary: `${message}；Skill 仍会继续生成，但不会把未核验知识写成专业规则。`,
-        plan,
-        generatedAt: new Date().toISOString(),
-      };
+      const failed = retainKnowledgeFailure(plan, sources, message, retainedPack);
       setKnowledgePack(failed);
       reportClientGenerationLoopEvent("generation_loop_failed", { phase: "knowledge-compiler", reason: message, queries: plan.queries });
       return failed;
     }
   }
 
+  async function ensureValidGenerationWorkflow(plan: CapabilityPlan): Promise<CapabilityPlan> {
+    const result = await repairWorkflowPlan({
+      workflowSteps: plan.workflowSteps,
+      capabilities: plan.items.filter((item) => item.kind !== "eval" && capabilityIsActive(item)),
+      inputs: deriveTaskInputContract({ idea, answers: demoAnswers, capabilityInputs: plan.items.filter((item) => item.kind === "llm").map((item) => item.input) }),
+    }, (workflowRepair) => callAI("workflow-repair", {
+      idea, answers: interviewEvidence, outputContract: plan.outputContract, workflowRepair,
+    }), ({ attempt, status, issues }) => {
+      if (status === "repairing") showLoopBusy(`正在修复工作流连线（第 ${attempt} 轮），保留已有任务、知识和用户要求`);
+      reportClientGenerationLoopEvent(status === "failed" ? "generation_loop_failed" : "generation_loop_phase", {
+        phase: "workflow-dag-preflight", round: attempt, blockers: issues,
+        reason: status === "passed" ? "输入、实际产物、用户反馈与交付连线检查通过" : status === "failed" ? "工作流连线修复仍未通过；未开始文件生成" : "只修复有问题的工作流连线，不重新生成需求或专业知识",
+      });
+    });
+    return { ...plan, workflowSteps: result.workflowSteps };
+  }
+
   async function compileSkill() {
     let goalLoopError = "";
     let durableBuild: DurableWorkflowJournal | null = null;
-    let generationPlan = ensureTaskCapabilities(capabilityPlan, idea, demoAnswers);
+    let generationPlan: CapabilityPlan = ensureTaskCapabilities(capabilityPlan, idea, demoAnswers);
     setCapabilityPlan(generationPlan);
     const unresolvedMcp = generationPlan.items.find((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup");
     if (unresolvedMcp) {
@@ -8384,6 +9006,10 @@ export default function Home() {
     setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "contract", stopReason: "正在固定 Goal 与能力契约" });
     try {
       if (!hasRealModel) throw new Error("模型配置已缺失，请重新连接");
+      // Old sessions may contain a pre-guard blueprint. Repair it before any
+      // paid research/build work, not after knowledge has already completed.
+      generationPlan = await ensureValidGenerationWorkflow(generationPlan);
+      setCapabilityPlan(generationPlan);
       durableBuild = await DurableWorkflowJournal.start("build", {
         goal: idea.slice(0, 2_000),
         hasRepresentativeTask: Boolean(demoAnswers.__previewInput?.trim()),
@@ -8398,13 +9024,26 @@ export default function Home() {
       let liveKnowledgePack = EMPTY_KNOWLEDGE_PACK;
       setBuildLoop((current) => ({ ...current, status: "checking", phase: "capability" }));
       showLoopBusy("正在比较裸模型能力与这个 Skill 必须额外教会的行为");
-      const liveCapabilityDelta = normalizeCapabilityDelta(await callAI<unknown>("capability-delta", {
+      let liveCapabilityDelta = normalizeCapabilityDelta(await callAI<unknown>("capability-delta", {
         idea,
         sourceText: contextBundle,
         answers: interviewEvidence,
         blueprint,
         capabilityPlan: generationPlan,
       }));
+      if (liveCapabilityDelta.status === "insufficient") {
+        liveCapabilityDelta = normalizeCapabilityDelta(await callAI<unknown>("capability-delta", {
+          idea,
+          sourceText: contextBundle,
+          answers: interviewEvidence,
+          blueprint,
+          capabilityPlan: generationPlan,
+          validationFeedback: "上一轮只复述了提取、匹配、调整、生成等普通工作流，或缺少可观察行为/具体失败原因。只返回会改变条件判断、异常处理、验证、事实边界、工具使用或确定性转换的专属能力差值。",
+        }));
+      }
+      if (liveCapabilityDelta.status === "insufficient") {
+        throw new Error("CAPABILITY_DELTA_INSUFFICIENT: 两轮分析仍未识别出裸模型之外的可证明能力；已停止生成，避免产出只有普通 Prompt 的伪 Skill");
+      }
       await durableBuild?.complete("capability-delta", {
         status: liveCapabilityDelta.status,
         gapCount: liveCapabilityDelta.skillMustTeach.length,
@@ -8418,6 +9057,8 @@ export default function Home() {
           ...EMPTY_KNOWLEDGE_PACK,
           status: "error",
           summary: `${message}；本次不会把模型常识冒充成来源知识。`,
+          sufficiency: "insufficient",
+          categoryCoverage: { covered: [], missing: ["decision_rules", "failure_modes", "edge_cases", "verification_methods"], score: 0 },
           generatedAt: new Date().toISOString(),
         };
         setKnowledgePack(liveKnowledgePack);
@@ -8431,6 +9072,9 @@ export default function Home() {
         idea,
         demoAnswers,
       );
+      // Research can introduce another runtime resource. Validate its consumer
+      // while retaining the completed knowledge pack and all original work.
+      generationPlan = await ensureValidGenerationWorkflow(generationPlan);
       setCapabilityPlan(generationPlan);
       const liveKnowledgeText = serializeKnowledgePack(liveKnowledgePack);
       const liveKnowledgeProjection = applyKnowledgePackToFiles({ "SKILL.md": "" }, liveKnowledgePack);
@@ -8473,7 +9117,15 @@ export default function Home() {
       setBusyPhaseIndex(2);
       showLocalBusy("候选已完整返回，正在校验文件结构与输出契约");
       if (!result.files?.["SKILL.md"]) throw new Error("模型没有生成有效的 SKILL.md");
-      let compiledFiles = finalizeSkillFiles(applyKnowledgePackToFiles(result.files, liveKnowledgePack), idea, demoAnswers, sourceInsightText, generationPlan, loopPlan);
+      let compiledFiles = finalizeSkillFiles(
+        applyKnowledgePackToFiles(result.files, liveKnowledgePack),
+        idea,
+        demoAnswers,
+        sourceInsightText,
+        generationPlan,
+        loopPlan,
+        canonicalIR,
+      );
       const initialStaticRepair = await runP0StaticRepairLoop(compiledFiles, generationPlan);
       const contractRepair = await runP1ContractRepairLoop({
         files: initialStaticRepair.files,
@@ -8520,7 +9172,7 @@ export default function Home() {
           closureScore: contractRepair.closure.score,
           issues: contractRepair.issues.map((issue) => issue.evidence).slice(0, 8),
           stopReason: contractRepair.validation.executionReady
-            ? "P1 Contract Gate 未收敛，Bundle 未冻结，Optimization Loop 与 Eval 没有启动"
+            ? `生成文件检查仍有阻塞：${contractRepair.issues[0]?.evidence || "契约检查未通过"}；已保留当前版本，评测尚未启动`
             : "P0 Execution Gate 未通过，P1 Contract Gate、Optimization Loop 与 Eval 没有启动",
         };
         setGenerationLoop(blockedState);
@@ -8563,6 +9215,7 @@ export default function Home() {
     } catch (error) {
       await durableBuild?.fail(error);
       const message = error instanceof Error ? error.message : "AI Skill 生成失败";
+      reportClientGenerationLoopEvent("generation_loop_failed", { phase: message.includes("WORKFLOW_DAG") ? "workflow-dag-preflight" : "build", reason: message });
       setAiGenerationIssue(message);
       setBuildLoop((current) => ({ ...current, status: "attention", issues: [message] }));
       notifyGenerationLoopResult({ ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: message });
@@ -8644,9 +9297,10 @@ export default function Home() {
       // Keep the project-level held-out suite stable across Bundle revisions.
       // Re-sampling from a candidate's own eval bank makes historical scores
       // incomparable and lets a regenerated Skill silently change its exam.
-      const selectionCases = generationLoop.benchmarkSuiteCases.length >= 2
+      const selectionSourceCases = generationLoop.benchmarkSuiteCases.length >= 2
         ? generationLoop.benchmarkSuiteCases
         : sampleOptimizationCases(evalBank, "selection", OPTIMIZATION_SELECTION_SAMPLE, { requiredCapabilityIds });
+      const selectionCases = composeEvaluationEpisodes(selectionSourceCases, 2);
       if (selectionCases.length < 2) throw new Error("当前评测集没有足够的独立保留任务，无法重跑多场景对照");
 
       setGenerationLoop((current) => ({
@@ -8659,8 +9313,12 @@ export default function Home() {
         reason: `只重跑 ${selectionCases.length} 个冻结场景的基线、当前 Skill 与匿名对照，不进入候选优化`,
       });
 
-      const baselineHarness = await runIsolatedEvalHarness({ cases: selectionCases, configuration: "without_skill", repeats: 2 });
-      const currentHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: currentFiles, configuration: "with_skill", repeats: 2 });
+      let baselineHarness = await runCachedNoSkillHarness(selectionCases, 1);
+      let currentHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: currentFiles, configuration: "with_skill", repeats: 1 });
+      if (comparisonNeedsStabilityRepeat(baselineHarness, currentHarness)) {
+        baselineHarness = await runCachedNoSkillHarness(selectionCases, 2);
+        currentHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: currentFiles, configuration: "with_skill", repeats: 2, resumeFrom: currentHarness });
+      }
       const blindResult = await runBlindHarnessComparison(baselineHarness, currentHarness);
       const baselineMetrics = summarizeGenerationEvidence(baselineHarness.evidence);
       const currentMetrics = summarizeGenerationEvidence(currentHarness.evidence);
@@ -8792,6 +9450,7 @@ export default function Home() {
 
   function toggleCatalogCapability(libraryItem: CapabilityCatalogItem) {
     setCapabilityPlan((current) => {
+      current = { ...current, ...reconcileHostCapabilityAliases(current.items, current.workflowSteps, CAPABILITY_LIBRARY) };
       const existing = current.items.find((item) => item.id === libraryItem.id);
       if (existing) {
         return {
@@ -8910,6 +9569,7 @@ export default function Home() {
     setDemoChatInput("");
     setDemoChatAttachments([]);
     setDemoChatError("");
+    setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
     setDemoChatBusy(true);
     setDemoChatSequence(sequence);
     try {
@@ -8955,6 +9615,7 @@ export default function Home() {
       setSettingsOpen(true);
       return;
     }
+    setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
     setDemoConversationScoreBusy(true);
     setDemoChatError("");
     try {
@@ -9561,6 +10222,27 @@ export default function Home() {
     }
   }
 
+  async function testResearchConnection() {
+    const controller = new AbortController();
+    researchProbeController.current?.abort();
+    researchProbeController.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 58_000);
+    setResearchProbe({ status: "testing", message: "正在实际搜索并读取一份网页证据…" });
+    try {
+      const response = await fetch("/api/research", {
+        method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
+        body: JSON.stringify({ action: "test", provider: researchProvider, apiKey: researchApiKey, baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl }),
+      });
+      const result = await response.json() as { ok?: boolean; sourceCount?: number; error?: string };
+      if (!response.ok || !result.ok) throw new Error(result.error || "检索服务未返回正文证据");
+      if (!controller.signal.aborted) setResearchProbe({ status: "ok", message: `检索成功：已读取 ${result.sourceCount} 份网页证据；未调用大模型` });
+    } catch (error) {
+      if (researchProbeController.current === controller) setResearchProbe({ status: "error", message: controller.signal.aborted ? "检索测试已取消或超时，请重新测试" : error instanceof Error ? error.message : "检索测试失败" });
+    } finally {
+      window.clearTimeout(timeout);
+    }
+  }
+
   async function saveModelSettings() {
     if (apiKey.trim() && !hasApiKey) {
       setToast("API Key 看起来不完整，请检查后再保存");
@@ -9722,11 +10404,11 @@ export default function Home() {
           </div>
         </details>
         <div className="demo-conversation">
-          <div className="demo-conversation-heading"><div><strong>继续对话</strong><small>补充材料或修改意见，AI 会基于当前结果继续处理。</small></div></div>
+          <div className="demo-conversation-heading"><div><strong>继续对话</strong><small>补充材料或修改意见，AI 会基于当前结果继续处理。</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，评分生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
           {demoConversation.length > 0 && (
             <div className="demo-message-list" aria-live="polite">
               {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? "你" : "AI"}</span><div className="demo-message-body"><p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
-              {demoChatBusy && <div className="demo-message assistant pending"><span>AI</span><p><i /><i /><i /></p></div>}
+              {demoChatBusy && <div className="demo-message assistant pending"><span>AI</span><div className="demo-message-body"><p><i /><i /><i /></p><small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，回复生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small></div></div>}
             </div>
           )}
           {demoChatAttachments.length > 0 && <div className="demo-chat-files" aria-label="待发送文件">{demoChatAttachments.map((attachment) => <span key={attachment.id}><b>{attachment.name}</b>{attachment.truncated && <small>已读取前段内容</small>}<button type="button" onClick={() => removeDemoChatAttachment(attachment.id)} aria-label={`移除 ${attachment.name}`}>×</button></span>)}</div>}
@@ -9957,10 +10639,20 @@ export default function Home() {
                   {discoveryPreviewExpanded && <div className="discovery-preview-body" id="discovery-preview-body">
                     <div className="discovery-preview-prompt">
                       <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/user.svg" alt="" aria-hidden="true" /></span>
-                      <div><strong>你的原始需求</strong><p>{discoveryPreview.userPrompt}</p></div>
+                      <div><strong>示例任务（非你的原话）</strong><p>{discoveryPreview.userPrompt}</p></div>
                     </div>
                     <div className="discovery-preview-output-card">
-                      <div><span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" /></span><strong>AI 当前生成预览</strong></div>
+                      <div className="discovery-preview-output-heading"><span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" /></span><strong>AI 理解示意 · 非真实执行</strong></div>
+                      <p className="discovery-preview-disclaimer">这份示例只用于确认工作方式。其中的参数、文件名、页码及完成声明都不是已核验的事实；正式执行必须读取实际材料后重新核对。</p>
+                      {discoveryPreview.sampleInput && (
+                        <details className="discovery-preview-sample">
+                          <summary>
+                            <span>查看示例输入<span className="discovery-preview-sample-label">（模拟材料）</span></span>
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg>
+                          </summary>
+                          <pre className="discovery-preview-output">{discoveryPreview.sampleInput}</pre>
+                        </details>
+                      )}
                       <pre className="discovery-preview-output">{discoveryPreview.output}</pre>
                     </div>
                     <div className="discovery-preview-evidence">
@@ -10304,9 +10996,44 @@ export default function Home() {
           {step === "build" && (
             <div className="build-stage">
               <div className="build-toolbar">
-                <div><span className="stage-kicker">专属 Skill 已生成 · 所有文件都能直接编辑</span><h2>真正属于你的 Skill</h2></div>
+                <div><span className="stage-kicker">专属 Skill 已生成</span><h2>真正属于你的 Skill</h2></div>
                 <div className="toolbar-actions"><button onClick={copySkill}>复制主文件</button><button className="primary-button compact" onClick={enterEvaluation} disabled={bundleAudit.blockers.length > 0 || busy}>{bundleAudit.blockers.length ? "修复后再评估" : busyTask === "evaluate" ? "正在开始评估…" : "进入评估"} <span>→</span></button></div>
               </div>
+              <section className="build-product-overview" aria-label="Skill 生成结果摘要">
+                <div className="build-product-status">
+                  <span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/circle-check.svg" alt="" aria-hidden="true" /></span>
+                  <div><span>已生成</span><strong>{bundleAudit.blockers.length ? "这份 Skill 已生成，修复发布问题后即可评估" : "这份 Skill 已经可以进入真实任务评估"}</strong><p>{buildProductSummary}</p></div>
+                  <em>{bundleAudit.blockers.length ? `${bundleAudit.blockers.length} 项发布问题` : "结构检查已通过"}</em>
+                </div>
+                <div className="build-product-section build-product-capabilities">
+                  <div className="build-product-section-title"><span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" /></span><div><strong>加入了哪些关键能力</strong><p>这里只展示相对普通 AI 新增、并且会改变实际工作方式的能力。</p></div></div>
+                  {buildProductCapabilities.length ? <div className="build-product-capability-list">{buildProductCapabilities.map((item) => <article key={item.id}><strong>{item.name}</strong><p>{item.purpose || item.requirement}</p><small>{item.routingCondition}</small></article>)}</div> : <p className="build-product-empty">本次任务不需要额外能力，Skill 主要负责稳定执行你确认的工作方式。</p>}
+                </div>
+                <div className="build-product-section build-product-risks">
+                  <div className="build-product-section-title"><span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/shield-exclamation.svg" alt="" aria-hidden="true" /></span><div><strong>还有哪些风险</strong><p>只保留会影响下一步决策的限制、缺口和待验证事项。</p></div></div>
+                  {buildProductRisks.length ? <ul>{buildProductRisks.map((risk) => <li key={risk}>{risk}</li>)}</ul> : <p className="build-product-empty success">当前没有阻止评估的风险，仍建议用一条真实任务确认最终效果。</p>}
+                </div>
+              </section>
+              <details className="build-explanation">
+                <summary><span><strong>为什么这样生成</strong><small>查看采用的专业知识、工作流和关键规则</small></span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" /></summary>
+                <div className="build-explanation-body">
+                  <section>
+                    <div><span>专业知识</span><strong>{knowledgePack.atoms.length ? `${knowledgePack.evidenceCoverage?.verifiedRuleCount || 0} 条可执行规则 · ${knowledgePack.evidenceCoverage?.advisoryRuleCount || 0} 条参考洞察` : knowledgePack.status === "not-needed" ? "本次不需要额外专业知识" : "专业知识尚未补齐"}</strong></div>
+                    {knowledgePack.atoms.length ? <ul>{knowledgePack.atoms.slice(0, 5).map((atom) => <li key={atom.id}><strong>{atom.title}</strong><p>{atom.action}</p>{atom.sourceUrls.length > 0 && <span>{atom.sourceUrls.slice(0, 2).map((url) => { const source = knowledgePack.sources.find((item) => item.url === url); return <a key={url} href={url} target="_blank" rel="noreferrer">{source?.title || "查看来源"}</a>; })}</span>}</li>)}</ul> : <p>{knowledgePack.summary || "系统只保留对执行有明确影响的知识；找不到可靠依据时会显式标记不足。"}</p>}
+                  </section>
+                  <section>
+                    <div><span>工作流</span><strong>Skill 会按这些步骤推进</strong></div>
+                    {capabilityPlan.workflowSteps.length ? <ol>{capabilityPlan.workflowSteps.slice(0, 6).map((workflowStep) => <li key={workflowStep.id}><strong>{workflowStep.action}</strong><p>{workflowStep.output || workflowStep.fallback}</p></li>)}</ol> : <p>当前工作流已经写入主文件，开发者详情中可以查看完整结构。</p>}
+                  </section>
+                  <section>
+                    <div><span>关键规则</span><strong>什么时候继续，什么时候停下来确认</strong></div>
+                    {(capabilityPlan.riskBranches.length || capabilityPlan.outputContract.validation.length) ? <ul>{capabilityPlan.riskBranches.slice(0, 4).map((risk) => <li key={risk.id}><strong>{risk.condition}</strong><p>{risk.action}</p></li>)}{capabilityPlan.outputContract.validation.slice(0, Math.max(0, 4 - capabilityPlan.riskBranches.length)).map((rule) => <li key={rule}><strong>交付前检查</strong><p>{rule}</p></li>)}</ul> : <p>执行边界与交付检查已经写入 Skill 主文件。</p>}
+                  </section>
+                </div>
+              </details>
+              <details className="build-developer-details">
+                <summary><span><strong>开发者详情</strong><small>Compiler、Manifest、Eval、运行指标与全部文件</small></span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/code-dots.svg" alt="" aria-hidden="true" /></summary>
+                <div className="build-developer-content">
               {knowledgePack.status !== "idle" && (
                 <section className={`knowledge-pack-panel ${knowledgePack.status}`} aria-label="生成阶段专业知识增强结果">
                   <div className="knowledge-pack-head">
@@ -10382,10 +11109,10 @@ export default function Home() {
               </section>
               <section className={`generation-loop-result ${optimizationStableAtCeiling || optimizationCompletedWithRollback ? "completed" : generationLoop.status}`} aria-label="Optimization Loop 结果">
                 <div className="generation-loop-head">
-                  <div><span>OPTIMIZATION LOOP · 只做有证据的局部优化</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationStableAtCeiling ? "评测已完成，当前版本处于稳定上限" : optimizationCompletedWithRollback ? "评测已完成，已保留当前最佳版本" : optimizationBlockedByBuild ? "等待 Build Loop 修复完成后启动" : generationLoop.status === "attention" ? "Optimization Loop 需要处理" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{optimizationStableAtCeiling ? "无 Skill 与当前版本都达到评测上限，保留任务全部通过。候选没有证明额外提升，系统已自动回滚并保留当前最佳版本。" : optimizationCompletedWithRollback ? "候选已完成真实试跑，但没有稳定优于当前版本，因此系统自动回滚候选。当前最佳版本没有被失败修改覆盖。" : generationLoop.stopReason}</p></div>
+                  <div><span>{optimizationBlockedByBuild ? "BUILD CONTRACT REPAIR · 先修复再评测" : "OPTIMIZATION LOOP · 只做有证据的局部优化"}</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationStableAtCeiling ? "评测已完成，当前版本处于稳定上限" : optimizationCompletedWithRollback ? "评测已完成，已保留当前最佳版本" : optimizationBlockedByBuild ? "初始 Bundle 尚未通过契约检查" : generationLoop.status === "attention" ? "Optimization Loop 需要处理" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{optimizationStableAtCeiling ? "无 Skill 与当前版本都达到评测上限，保留任务全部通过。候选没有证明额外提升，系统已自动回滚并保留当前最佳版本。" : optimizationCompletedWithRollback ? "候选已完成真实试跑，但没有稳定优于当前版本，因此系统自动回滚候选。当前最佳版本没有被失败修改覆盖。" : generationLoop.stopReason}</p></div>
                   <div className="generation-loop-actions">
                     <em>{gateOutcomes.optimization.verdict === "satisfied" ? "✓ 已接受" : optimizationStableAtCeiling ? "✓ 已保留最佳版" : optimizationCompletedWithRollback ? "✓ 已安全回滚" : optimizationBlockedByBuild ? "未启动" : generationLoop.status === "attention" ? "需处理" : generationLoop.status === "running" ? "执行中" : "未运行"}</em>
-                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在重跑…" : optimizationBlockedByBuild ? "继续修复并启动" : optimizationCompletedWithRollback ? "再次尝试优化" : "重跑 Optimization Loop"}</button>}
+                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在处理…" : optimizationBlockedByBuild ? "继续修复 Bundle" : optimizationCompletedWithRollback ? "再次尝试优化" : "重跑 Optimization Loop"}</button>}
                   </div>
                 </div>
                 {optimizationBlockedByBuild
@@ -10458,51 +11185,16 @@ export default function Home() {
                   <div className="inspector-stat"><span>发布前检查</span><strong className={bundleAudit.blockers.length ? "red-text" : "green-text"}>{bundleAudit.blockers.length ? `${bundleAudit.blockers.length} 项待修复` : "已通过"}</strong></div>
                 </div>
               </div>
+                </div>
+              </details>
             </div>
           )}
 
           {step === "evaluate" && (
             <div className="stage-content eval-stage">
               <div className="stage-heading-row">
-                <div><h2>验证效果</h2><p>让 Skill 真正完成一次任务，再分清哪些已经做好、哪些还能再提升、哪些还没有测到。</p></div>
+                <div><h2>验证效果</h2><p>让 Skill 真正完成一次任务，看看哪些已经做好、哪些还能再提升。</p></div>
               </div>
-
-              {generationLoop.benchmarkRuns > 0 && generationLoop.comparisonRevision === currentBundleRevision && (() => {
-                const comparisonPresentation = describeMultiSceneComparison(generationLoop);
-                return (
-                <section className={`user-proof-card ${comparisonPresentation.tone}`}>
-                  <div className="user-proof-copy"><span>4 场景正式对照总分 · 与下方单场景分口径不同</span><strong>{comparisonPresentation.title}</strong><p>{comparisonPresentation.detail}</p></div>
-                  <div className="user-proof-metrics">
-                    <div><span>普通 AI · 4 场景总分</span><strong>{generationLoop.baselineQualityScore}</strong></div>
-                    <div><span>你的 Skill · 4 场景总分</span><strong>{generationLoop.bestQualityScore}</strong></div>
-                    {(() => {
-                      const qualityDelta = generationLoop.bestQualityScore - generationLoop.baselineQualityScore;
-                      return <div className={qualityDelta > 0 ? "positive" : qualityDelta < 0 ? "negative" : ""}><span>多场景变化</span><strong>{qualityDelta >= 0 ? "+" : ""}{qualityDelta}</strong></div>;
-                    })()}
-                    <div><span>评测证据</span><strong>{generationLoop.comparisonCaseCount} 个场景 · 每版每场景 {generationLoop.benchmarkRepeatsPerCase} 次</strong></div>
-                  </div>
-                  <button className="user-proof-refresh" type="button" onClick={() => void rerunMultiSceneComparison()} disabled={busy}>重新跑多场景对照 <span>→</span></button>
-                  {generationLoop.comparisonEvidence.length > 0 && (
-                    <details className="comparison-case-evidence">
-                      <summary>查看每个冻结场景的真实得分与扣分原因</summary>
-                      <ul>{generationLoop.comparisonEvidence.map((item) => (
-                        <li key={item.caseId} className={item.delta < 0 ? "regressed" : item.delta > 0 ? "improved" : "equivalent"}>
-                          <strong>{item.caseId}</strong>
-                          <span>{item.baselineScore} → {item.skillScore}（{item.delta >= 0 ? "+" : ""}{item.delta}）</span>
-                          {(item.failureReason || item.dimensionGaps.length > 0) && <p>{[item.failureReason, item.dimensionGaps.length ? `落后维度：${item.dimensionGaps.join("、")}` : ""].filter(Boolean).join("；")}</p>}
-                        </li>
-                      ))}</ul>
-                    </details>
-                  )}
-                </section>
-                );
-              })()}
-              {generationLoop.benchmarkRuns > 0 && generationLoop.comparisonRevision !== currentBundleRevision && (
-                <section className="user-proof-card attention">
-                  <div className="user-proof-copy"><span>最终版本对照尚未完成</span><strong>旧版本分数已隐藏</strong><p>Bundle 在最近一次匿名比较后发生了变化。系统不会把旧结果冒充为当前版本证据，请重新运行 Optimization Loop。</p></div>
-                  <button className="user-proof-refresh" type="button" onClick={() => void rerunMultiSceneComparison()} disabled={busy}>重新验证当前版本 <span>→</span></button>
-                </section>
-              )}
 
               {!evalRan ? (
                 demoReviewPending && skillDemo ? (
@@ -10526,16 +11218,17 @@ export default function Home() {
                 )
               ) : (
                 <>
-                  {feedbackLoopSummary && <div className="loop-result-note"><span>本轮改了什么</span><p>{feedbackLoopSummary}</p></div>}
-                  {personalizationHistory.length > 0 && (
-                    <section className="personalization-history" aria-label="已经采用的迭代建议">
-                      <div><span>不会丢失的迭代记录</span><strong>已经采用的建议</strong></div>
-                      <ol>{personalizationHistory.slice(-4).reverse().map((entry) => <li key={entry.id}><em>第 {entry.round} 轮</em><p>{entry.feedback.map((item) => <span key={item}>{item}</span>)}</p><small>统一提交门禁 · 回归 {entry.testedCases || 0} 个冻结任务 · 修改 {entry.changedFiles.length} 个文件</small></li>)}</ol>
-                    </section>
-                  )}
-                  {renderSkillDemoCard(false)}
-                  <section className={`eval-report-panel ${evalDetailsOpen ? "expanded" : "collapsed"}`} aria-label="本轮效果报告">
-                    <div className={`eval-report-summary ${needsWorkEvals.length ? "needs-work" : pendingEvals.length ? "partial" : "ready"}`}>
+                  <div className="eval-workspace-card">
+                    {feedbackLoopSummary && <div className="loop-result-note"><span>本轮改了什么</span><p>{feedbackLoopSummary}</p></div>}
+                    {personalizationHistory.length > 0 && (
+                      <section className="personalization-history" aria-label="已经采用的迭代建议">
+                        <div><span>不会丢失的迭代记录</span><strong>已经采用的建议</strong></div>
+                        <ol>{personalizationHistory.slice(-4).reverse().map((entry) => <li key={entry.id}><em>第 {entry.round} 轮</em><p>{entry.feedback.map((item) => <span key={item}>{item}</span>)}</p><small>统一提交门禁 · 回归 {entry.testedCases || 0} 个冻结任务 · 修改 {entry.changedFiles.length} 个文件</small></li>)}</ol>
+                      </section>
+                    )}
+                    {renderSkillDemoCard(false)}
+                    <section className={`eval-report-panel ${evalDetailsOpen ? "expanded" : "collapsed"}`} aria-label="本轮效果报告">
+                    <div className={`eval-report-summary ${needsWorkEvals.length ? "needs-work" : observedEvals.length ? "ready" : "partial"}`}>
                       <div className="eval-report-verdict">
                         <span>本轮结论</span>
                         <strong>{evaluationHeadline}</strong>
@@ -10544,56 +11237,54 @@ export default function Home() {
                       <div className="eval-report-counts" aria-label="本轮证据状态">
                         <div><strong>{strongEvals.length}</strong><span>表现符合要求</span></div>
                         <div><strong>{needsWorkEvals.length}</strong><span>还能再提升</span></div>
-                        <div><strong>{pendingEvals.length}</strong><span>还没有测到</span></div>
                       </div>
-                      <button type="button" className="eval-report-toggle" onClick={() => setEvalDetailsOpen((current) => !current)} aria-expanded={evalDetailsOpen} aria-controls="eval-report-details">
+                      <button type="button" className="eval-report-toggle" onClick={() => setEvalDetailsOpen((current) => !current)} aria-expanded={evalDetailsOpen} aria-controls="eval-report-details" disabled={!observedEvals.length}>
                         {evalDetailsOpen ? "收起" : "展开"}<img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" />
                       </button>
                     </div>
                     <div id="eval-report-details" className="eval-report-details" hidden={!evalDetailsOpen}>
-                      <div className="eval-list" aria-label="五项效果验证">
+                      <div className="eval-list" aria-label="本轮效果验证">
                     {evals.map((result, index) => {
+                      // Hide unobserved rows without shifting optimization indices.
+                      if (result.coverage === "not-covered") return null;
                       const history = optimizationHistory[result.label];
                       const delta = history ? result.score - history.before.score : 0;
                       const analyzingThis = optimizationOpen && optimizationTargetIndex === index && optimizationActive;
-                      const pending = result.coverage === "not-covered";
-                      const statusLabel = pending
-                        ? "还没测到"
-                        : result.score >= DEMO_SCORING_POLICY.observedGoodFloor
+                      const statusLabel = result.score >= DEMO_SCORING_POLICY.observedGoodFloor
                           ? "这次表现符合要求"
                           : result.score >= DEMO_SCORING_POLICY.observedWarningFloor
                             ? "有一个明显差距"
                             : "优先提升";
                       return (
-                        <article className={`eval-row ${history ? "optimized" : ""} ${pending ? "pending" : result.tone}`} key={result.label}>
+                        <article className={`eval-row ${history ? "optimized" : ""} ${result.tone}`} key={result.label}>
                           <div className="eval-row-head">
                             <span className="eval-title-line"><strong>{result.label}</strong>{history && <em>复评 {delta >= 0 ? "+" : ""}{delta}</em>}</span>
-                            <span className={`eval-status ${pending ? "pending" : result.tone}`}>{statusLabel}</span>
+                            <span className={`eval-status ${result.tone}`}>{statusLabel}</span>
                           </div>
-                          <div className={`eval-row-body ${pending ? "pending" : result.score < DEMO_SCORING_POLICY.observedGoodFloor ? "has-gap" : "good"}`}>
-                            <div className="eval-observation"><span>{pending ? "为什么还不能判断" : "本轮看到的表现"}</span><p>{pending ? result.issue : result.strength || result.detail}</p></div>
-                            {!pending && result.score < DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-next-gap"><span>还能再提升的地方</span><p>{result.issue || "本轮暂未发现明确差距。"}</p></div>}
-                            {!pending && result.score >= DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-good-note"><span>结论</span><p>{result.detail}</p></div>}
+                          <div className={`eval-row-body ${result.score < DEMO_SCORING_POLICY.observedGoodFloor ? "has-gap" : "good"}`}>
+                            <div className="eval-observation"><span>本轮看到的表现</span><p>{result.strength || result.detail}</p></div>
+                            {result.score < DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-next-gap"><span>还能再提升的地方</span><p>{result.issue || "本轮暂未发现明确差距。"}</p></div>}
+                            {result.score >= DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-good-note"><span>结论</span><p>{result.detail}</p></div>}
                           </div>
                           <div className="eval-row-actions">
                             <details className="eval-evidence-details">
                               <summary>查看判断依据 <span>⌄</span></summary>
-                              <div><p><strong>观察依据</strong>{result.evidence || "请结合上面的 Demo 判断。"}</p><p><strong>对实际使用的影响</strong>{result.impact || "这会影响结果是否真正可用。"}</p>{!pending && <p><strong>内部观察分</strong>{history && <del>{history.before.score}</del>} {result.score}/100</p>}</div>
+                              <div><p><strong>观察依据</strong>{result.evidence || "请结合上面的 Demo 判断。"}</p><p><strong>对实际使用的影响</strong>{result.impact || "这会影响结果是否真正可用。"}</p><p><strong>内部观察分</strong>{history && <del>{history.before.score}</del>} {result.score}/100</p></div>
                             </details>
-                            {(pending || result.score < DEMO_SCORING_POLICY.observedGoodFloor || history) && <button className="eval-optimize-button" onClick={() => pending ? void runEvaluation() : void openOptimization(index)} disabled={optimizationActive || busy}>{pending ? "换场景验证" : analyzingThis ? "正在分析…" : history ? "继续优化" : "优化这一项"}<span>→</span></button>}
+                            {(result.score < DEMO_SCORING_POLICY.observedGoodFloor || history) && <button className="eval-optimize-button" onClick={() => void openOptimization(index)} disabled={optimizationActive || busy}>{analyzingThis ? "正在分析…" : history ? "继续优化" : "优化这一项"}<span>→</span></button>}
                           </div>
                         </article>
                       );
                     })}
                       </div>
                     </div>
-                  </section>
-                  <div className={`finding-card ${bundleAudit.blockers.length ? "" : "resolved"}`}>
+                    </section>
+                    <div className={`finding-card ${bundleAudit.blockers.length ? "" : "resolved"}`}>
                     <span className="finding-icon">{bundleAudit.blockers.length ? "!" : "✓"}</span>
                     <div><strong>{bundleAudit.blockers.length ? `文件发布检查还有 ${bundleAudit.blockers.length} 项` : "文件发布检查已通过"}</strong><p>{bundleAudit.blockers.length ? "这是文件结构、隐私和能力接入检查，与上面的 Demo 效果报告分开处理。" : bundleAudit.warnings.length ? "还有少量不会阻止下载的提醒，但不代表 Demo 已经符合你的主观标准。" : "文件可以正常发布；是否真的像你，仍以 Demo 和你的判断为准。"}</p></div>
                     {bundleAudit.blockers.length > 0 && <button onClick={() => void repairSkill()} disabled={busy}>{busyTask === "repair" ? "正在修复…" : "AI 修复并重新评估"}</button>}
-                  </div>
-                  <div className={`feedback-card ${feedbackSaved ? "saved" : ""}`}>
+                    </div>
+                    <div className={`feedback-card ${feedbackSaved ? "saved" : ""}`}>
                     <div className="feedback-copy"><strong>{feedbackSaved ? "新一轮已经完成，再看一次结果" : "看完 Demo，哪里还不够懂你？"}</strong><p>这些选项来自本次产出的实际偏差。修改会先用既有保留任务检查回退，再生成新 Demo；只有全部完成才会替换当前 Skill。</p></div>
                     <div className="feedback-picker">
                       {personalizedFeedbackOptions.length
@@ -10602,6 +11293,7 @@ export default function Home() {
                       <label className="feedback-custom"><span>或者直接说具体哪里不对</span><input value={feedbackCustom} onChange={(event) => { setFeedbackCustom(event.target.value); setFeedbackSaved(false); }} placeholder="例如：结论还是太晚，应该先给我可直接用的版本" /></label>
                     </div>
                     <button className="feedback-apply" onClick={() => void applyPersonalFeedback()} disabled={busy || personalizationRound >= PERSONALIZATION_MAX_ROUNDS}>{personalizationRound >= PERSONALIZATION_MAX_ROUNDS ? "已到自动优化上限" : busyTask === "personalize" ? "正在生成下一版…" : "确认并生成下一版 Demo"}</button>
+                    </div>
                   </div>
                   <div className="stage-footer"><button className="secondary-button" onClick={() => setStep("build")}>查看 Skill 文件</button><button className="primary-button" onClick={() => setStep("ship")}>进入发布检查 <span>→</span></button></div>
                 </>
@@ -10732,6 +11424,10 @@ export default function Home() {
               </div>
               {researchProvider === "firecrawl" && <label className="form-field"><span>Firecrawl API Key {researchCredentialStored && <em className="stored-credential">已加密保存</em>}</span><input type="password" autoComplete="off" value={researchApiKey} onChange={(event) => setResearchApiKey(event.target.value)} placeholder={researchCredentialStored ? "已安全保存；输入新 Key 可替换" : "fc-••••••••••••"} /></label>}
               {researchProvider === "searxng" && <label className="form-field"><span>SearXNG 地址</span><input value={researchBaseUrl} onChange={(event) => setResearchBaseUrl(event.target.value)} placeholder="https://search.your-domain.com" /></label>}
+              {researchProvider !== "disabled" && <div className="modal-footer">
+                <button className="secondary-button" onClick={() => void testResearchConnection()} disabled={!researchReady || researchProbe.status === "testing"}>{researchProbe.status === "testing" ? "正在测试检索…" : "测试检索连接"}</button>
+                <span role="status" className={`connection-result ${researchProbe.status}`}>{researchProbe.message}</span>
+              </div>}
               <small className="research-privacy-note">检索服务只收到 AI 生成的专业问题和它自身的授权凭据；不会收到大模型 API Key、上传文件全文、原始业务材料或个人联系方式。网页证据会经过来源过滤后再交给模型编译。</small>
               <details className="internal-mcp-settings">
                 <summary>
@@ -10782,6 +11478,12 @@ export default function Home() {
                 <div className="optimization-loading-copy"><span className="coach-avatar">AI</span><div><strong>正在用多项任务寻找共性问题</strong><small>训练任务用于找问题，独立验证任务不会提供给修改 Agent</small></div><b>{optimizationElapsed}s</b></div>
                 <div className="optimization-scan"><span /></div>
                 <p>系统会分别试跑训练组和验证组，只根据训练证据提出优化；验证组负责决定候选版本是否能够替换原版。</p>
+                <div className="optimization-token-usage" aria-live="polite">
+                  <strong>Token 用量</strong>
+                  <b>{formatAiTokens(busyTokenUsage.totalTokens)}</b>
+                  <span>{busyTokenUsage.pendingPromptTokens > 0 ? `输入约 ${formatAiTokens(busyTokenUsage.promptTokens)} · 输出生成中` : busyTokenUsage.requests > 0 ? `${formatAiTokens(busyTokenUsage.promptTokens)} 输入 · ${formatAiTokens(busyTokenUsage.completionTokens)} 输出` : "等待模型请求"}</span>
+                  <small>{busyTokenUsage.pendingPromptTokens > 0 ? "模型返回后会自动校准为真实 usage" : busyTokenUsage.estimated ? "部分请求按文本长度估算" : "已按模型返回的 usage 统计"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)} tokens</small>
+                </div>
               </div>
             )}
 
@@ -10813,6 +11515,12 @@ export default function Home() {
               <div className="optimization-run-state" role="status" aria-live="polite">
                 <div><span className="coach-avatar">AI</span><p><strong>{optimizationStatus === "optimizing" ? "正在生成有限修改的候选版本" : "正在进行独立验证"}</strong><small>{optimizationStatus === "optimizing" ? `本轮最多 ${OPTIMIZATION_EDIT_BUDGET} 处局部修改，不直接覆盖当前 Skill` : "使用修改 Agent 没看过的保留任务；没有严格提升就自动回滚"}</small></p><b>{optimizationElapsed}s</b></div>
                 <div className="optimization-scan"><span /></div>
+                <div className="optimization-token-usage" aria-live="polite">
+                  <strong>Token 用量</strong>
+                  <b>{formatAiTokens(busyTokenUsage.totalTokens)}</b>
+                  <span>{busyTokenUsage.pendingPromptTokens > 0 ? `输入约 ${formatAiTokens(busyTokenUsage.promptTokens)} · 输出生成中` : busyTokenUsage.requests > 0 ? `${formatAiTokens(busyTokenUsage.promptTokens)} 输入 · ${formatAiTokens(busyTokenUsage.completionTokens)} 输出` : "等待模型请求"}</span>
+                  <small>{busyTokenUsage.pendingPromptTokens > 0 ? "模型返回后会自动校准为真实 usage" : busyTokenUsage.estimated ? "部分请求按文本长度估算" : "已按模型返回的 usage 统计"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)} tokens</small>
+                </div>
               </div>
             )}
 
@@ -10865,6 +11573,19 @@ export default function Home() {
             <div className={`busy-execution-status ${busyExecutionKind}`} key={`${busyStage}-${busyExecutionKind}-${busyExecutionNote}`}>
               <span>{busyExecutionLabel}</span>
               <p>{busyExecutionNote}</p>
+            </div>
+            <div className="ai-progress-token-usage" aria-live="polite">
+              <div>
+                <span>本次加载 Token</span>
+                <strong>{formatAiTokens(busyTokenUsage.totalTokens)}</strong>
+                <small>{busyTokenUsageStatus}</small>
+              </div>
+              <div>
+                <span>请求次数</span>
+                <strong>{busyTokenUsage.requests}</strong>
+                <small>{busyTokenUsageHint}</small>
+              </div>
+              <em>会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)} tokens</em>
             </div>
             <div className={`thinking-warp ${busyTask} ${busyExecutionKind}`} aria-hidden="true">
               <span className="warp-core">AI</span>

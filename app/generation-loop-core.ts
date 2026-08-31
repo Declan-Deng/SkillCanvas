@@ -41,6 +41,14 @@ export type GenerationGoalGate = {
   regressions: string[];
 };
 
+export type CandidateBehaviorScreen = {
+  advance: boolean;
+  scoreDelta: number;
+  passDelta: number;
+  reasons: string[];
+  regressions: string[];
+};
+
 /** A passed Loop may be restored after a deterministic compiler migration.
  * Remove only observations whose referenced runtime files no longer exist;
  * path-free quality observations remain visible. */
@@ -55,7 +63,7 @@ export function removeResolvedFileObservations(issues: string[], files: Record<s
 /** Turn a user-facing artifact description into concrete, inspectable globs.
  * This closes a compiler-owned contract gap before any model repair runs. */
 export function inferArtifactPatterns(description: string) {
-  const text = description.toLowerCase();
+  const text = outputArtifactEvidence(description).toLowerCase();
   const patterns: string[] = [];
   const add = (pattern: string) => { if (!patterns.includes(pattern)) patterns.push(pattern); };
   if (/\bpdf\b|便携式文档/.test(text)) add("outputs/*.pdf");
@@ -73,6 +81,12 @@ export function inferArtifactPatterns(description: string) {
   return patterns.length ? patterns : ["outputs/**"];
 }
 
+/** Scope file-format evidence to outputs. "Read PDF, generate Markdown" is
+ * not a request to generate a PDF too. Bare format declarations remain valid. */
+export function outputArtifactEvidence(description: string) {
+  return description.replace(/(?:读取|解析|导入|输入|上传|用户提供的?|\b(?:read|parse|import|upload|input|from)\b)[^。；;\n]*?(?=(?:生成|输出|导出|保存|交付|写入|返回|\b(?:generate|output|export|save|deliver|write|return|to)\b)|[。；;\n]|$)/gi, "");
+}
+
 /** Detect an actual file-delivery promise rather than the mere presence of a
  * file-shaped word. This deliberately requires both a delivery intention and
  * a concrete artifact format, so "read this CSV" does not silently become
@@ -80,7 +94,7 @@ export function inferArtifactPatterns(description: string) {
 export function artifactDeliveryRequested(description: string) {
   const format = /\b(?:pdf|docx?|word|pptx?|powerpoint|xlsx?|excel|csv|json|html?|markdown)\b|\.md\b|文件|可运行产物|图片|图像|海报|封面/i;
   const delivery = /交付|输出|导出|生成|保存|下载|创建|写入|产出|返回|给我|拿到|得到|需要|想要|希望|要一份/i;
-  return description.split(/[\n；;]/).some((segment) => format.test(segment) && delivery.test(segment));
+  return outputArtifactEvidence(description).split(/[\n；;]/).some((segment) => format.test(segment) && delivery.test(segment));
 }
 
 /** A reusable runtime asset needs explicit evidence that the output structure
@@ -120,6 +134,9 @@ function inferFamily(item: Record<string, unknown>) {
 }
 
 function providesFocusedEvidence(item: Record<string, unknown>, capability: ClosureCapability) {
+  const fixtureContext = item.context && typeof item.context === "object" && !Array.isArray(item.context) ? item.context as Record<string, unknown> : {};
+  if (item.runnable === false || fixtureContext.fixture_status === "missing") return false;
+  if (item.category === "core_capability" && ["required-value-missing", "core-input-missing"].includes(String(fixtureContext.workflow_checkpoint || ""))) return false;
   if (!Array.isArray(item.capability_ids) || !item.capability_ids.includes(capability.id)) return false;
   const family = inferFamily(item);
   if (family === "trigger") return false;
@@ -217,8 +234,43 @@ export function summarizeGenerationEvidence(report: OptimizationEvidenceReport):
   return { score, passRate: total ? Math.round((passed / total) * 100) : 0, passed, total };
 }
 
-/** A candidate can replace the current best bundle only when it improves the
- * held-out goal score without reducing closure or introducing regressions. */
+/** Cheap first-stage candidate gate. It uses only the already-produced final
+ * held-out artifacts and prevents an obviously worse candidate from paying for
+ * another diagnostic rollout, semantic critic, and anonymous comparison. */
+export function screenCandidateBehavior(input: {
+  baseline: OptimizationEvidenceReport;
+  candidate: OptimizationEvidenceReport;
+  caseIds: string[];
+}): CandidateBehaviorScreen {
+  const selected = new Set(input.caseIds);
+  const beforeCases = input.baseline.cases.filter((item) => selected.has(item.caseId));
+  const afterCases = input.candidate.cases.filter((item) => selected.has(item.caseId));
+  const beforeById = new Map(beforeCases.map((item) => [item.caseId, item]));
+  const beforeScore = beforeCases.length ? Math.round(beforeCases.reduce((sum, item) => sum + item.score, 0) / beforeCases.length) : 0;
+  const afterScore = afterCases.length ? Math.round(afterCases.reduce((sum, item) => sum + item.score, 0) / afterCases.length) : 0;
+  const beforePassed = beforeCases.filter((item) => item.passed).length;
+  const afterPassed = afterCases.filter((item) => item.passed).length;
+  const regressions = afterCases.flatMap((item) => {
+    const before = beforeById.get(item.caseId);
+    if (!before) return [];
+    if (before.passed && !item.passed) return [`${item.caseId} 从通过变为失败`];
+    if (item.score <= before.score - 8) return [`${item.caseId} ${before.score}→${item.score}`];
+    return [];
+  });
+  const scoreDelta = afterScore - beforeScore;
+  const passDelta = afterPassed - beforePassed;
+  const reasons: string[] = [];
+  if (afterCases.length !== beforeCases.length) reasons.push("候选没有返回完整的冻结任务结果");
+  if (passDelta < 0) reasons.push(`通过任务减少（${beforePassed}→${afterPassed}）`);
+  if (scoreDelta <= -6) reasons.push(`最终产物明显回退（${beforeScore}→${afterScore}）`);
+  if (beforePassed === 0 && afterPassed === 0 && scoreDelta < 0) reasons.push(`候选仍未通过任何任务且分数下降（${beforeScore}→${afterScore}）`);
+  if (regressions.length) reasons.push(`出现 ${regressions.length} 项明确行为回退`);
+  return { advance: reasons.length === 0, scoreDelta, passDelta, reasons, regressions };
+}
+
+/** A candidate can replace the current best bundle when it improves held-out
+ * behavior, or when deterministic Skill quality improves while held-out
+ * behavior stays equal. Closure and regression guards always remain hard. */
 export function decideGenerationGoalGate(input: {
   baseline: OptimizationEvidenceReport;
   candidate: OptimizationEvidenceReport;
@@ -229,6 +281,8 @@ export function decideGenerationGoalGate(input: {
   candidateBlockers: number;
   baselineCriticalSemanticIssues: number;
   candidateCriticalSemanticIssues: number;
+  baselineQualityScore?: number;
+  candidateQualityScore?: number;
 }): GenerationGoalGate {
   const selected = new Set(input.caseIds);
   const beforeCases = input.baseline.cases.filter((item) => selected.has(item.caseId));
@@ -236,15 +290,23 @@ export function decideGenerationGoalGate(input: {
   const beforeById = new Map(beforeCases.map((item) => [item.caseId, item]));
   const beforeScore = beforeCases.length ? Math.round(beforeCases.reduce((sum, item) => sum + item.score, 0) / beforeCases.length) : 0;
   const afterScore = afterCases.length ? Math.round(afterCases.reduce((sum, item) => sum + item.score, 0) / afterCases.length) : 0;
+  const beforePassed = beforeCases.filter((item) => item.passed).length;
+  const afterPassed = afterCases.filter((item) => item.passed).length;
+  const newlyPassed = afterCases.filter((item) => item.passed && beforeById.get(item.caseId)?.passed === false).length;
   const reasons: string[] = [];
   const regressions: string[] = [];
+  const qualityImproved = Number.isFinite(input.baselineQualityScore)
+    && Number.isFinite(input.candidateQualityScore)
+    && Number(input.candidateQualityScore) > Number(input.baselineQualityScore);
 
   afterCases.forEach((item) => {
     const before = beforeById.get(item.caseId);
     if (before?.passed && !item.passed) regressions.push(`${item.caseId} 从通过变为失败`);
     else if (before && item.score < before.score - 8) regressions.push(`${item.caseId} ${before.score}→${item.score}`);
   });
-  if (afterScore <= beforeScore) reasons.push(`保留任务没有严格提升（${beforeScore}→${afterScore}）`);
+  if (afterScore < beforeScore || (afterScore === beforeScore && !qualityImproved)) reasons.push(`保留任务没有严格提升（${beforeScore}→${afterScore}）`);
+  if (afterCases.length && afterPassed === 0) reasons.push("候选没有通过任何保留任务，分数提升不能替代真实成功");
+  else if (beforePassed < beforeCases.length && newlyPassed === 0) reasons.push("候选没有修复任何原有失败用例");
   if (input.candidateClosure < input.baselineClosure) reasons.push(`能力闭环下降（${input.baselineClosure}%→${input.candidateClosure}%）`);
   if (input.candidateBlockers > input.baselineBlockers) reasons.push(`新增 ${input.candidateBlockers - input.baselineBlockers} 个发布阻塞问题`);
   if (input.baselineCriticalSemanticIssues === 0 && input.candidateCriticalSemanticIssues > 0) reasons.push(`新增 ${input.candidateCriticalSemanticIssues} 个关键语义冲突`);
