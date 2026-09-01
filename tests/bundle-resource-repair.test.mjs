@@ -3,12 +3,14 @@ import test from "node:test";
 import { readFile } from "node:fs/promises";
 import ts from "typescript";
 import * as canonical from "../app/canonical-mutations.ts";
-import { compileSkillIR, auditSkillIRFiles, projectSkillMarkdown, projectCapabilityManifest, projectToolContracts, projectToolingReference, bindSkillIREvals, ensureSkillIREvalCoverage } from "../app/skill-ir.ts";
+import { compileSkillIR, auditSkillIRFiles, projectSkillIRFiles, bindSkillIREvals, ensureSkillIREvalCoverage, skillIRDigest } from "../app/skill-ir.ts";
+import { isSkillIRProjectionIssue, rebuildSkillIRProjections, contractRepairFailureReason } from "../app/skill-projection-repair.ts";
 import { compileWorkflowDag } from "../app/workflow-dag.ts";
 import { validateImplementationFiles, applySkillIRMutations, validateCanonicalSkillIR } from "../app/canonical-mutations.ts";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "../app/bundle-resource-repair.ts";
 import { auditCapabilityClosure } from "../app/generation-loop-core.ts";
 import { capabilities, workflow } from "./fixtures/blueprint.mjs";
+import { providerRepairNeedsUserAction } from "../app/eval-prompt.ts";
 
 function fixture(inputName = "合同 PDF", path = "references/contract.pdf") {
   const plan = structuredClone(capabilities.capabilityPlan);
@@ -32,12 +34,15 @@ function fixture(inputName = "合同 PDF", path = "references/contract.pdf") {
 function project(ir) {
   const bank = ensureSkillIREvalCoverage(ir, "");
   const bound = bindSkillIREvals(ir, bank);
-  return { ir: bound, files: {
-    "SKILL.md": projectSkillMarkdown(bound), "evals/skill-ir.json": JSON.stringify(bound),
-    "evals/capability-manifest.json": JSON.stringify(projectCapabilityManifest(bound)), "evals/evals.json": bank,
-    "integrations/tool-contracts.json": projectToolContracts(bound), "references/tooling.md": projectToolingReference(bound),
-  } };
+  return { ir: bound, files: projectSkillIRFiles(bound) };
 }
+
+test("runtime input repair has the same canonical digest before and after JSON persistence", () => {
+  const repaired = reconcileRuntimeInputResources(fixture().ir, {});
+  const restored = JSON.parse(JSON.stringify(repaired));
+  assert.equal(skillIRDigest(repaired), skillIRDigest(restored));
+  assert.deepEqual(auditSkillIRFiles(project(repaired).files).filter((issue) => /PROJECTION_DRIFT|已漂移/.test(issue)), []);
+});
 
 for (const [name, path] of [["合同 PDF", "references/contract.pdf"], ["实验记录 DOCX", "references/notes.docx"], ["销售数据 XLSX", "references/data.xlsx"]]) {
   test(`runtime material ${path} is read from the real input without fabricating a bundled file`, () => {
@@ -170,7 +175,7 @@ test("no-op and regressive repairs are not progress", () => {
 
 // Run the actual page repair coordinator and candidate application. Only the
 // model and UI are mocked; IR mutation, resource validation and projection run.
-async function runRepairScenario(responses) {
+async function runRepairScenario(responses, options = {}) {
   const source = ts.createSourceFile("page.tsx", await readFile(new URL("../app/page.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
   const wanted = new Set(["runP1ContractRepairLoop", "applyCanonicalCandidate"]);
   const functions = [];
@@ -183,12 +188,24 @@ async function runRepairScenario(responses) {
   const code = ts.transpileModule(functions.join("\n"), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   const { ir } = fixture("合同 PDF", "references/check-rules.md");
   const initial = project(ir).files;
+  if (options.referencePresent) initial["references/check-rules.md"] = "# 检查规则\n保留原始证据。";
+  if (options.drift) {
+    const manifest = JSON.parse(initial["evals/capability-manifest.json"]);
+    manifest.skill_ir.digest = "old-in-memory-digest";
+    initial["evals/capability-manifest.json"] = JSON.stringify(manifest);
+    initial["references/output-contract.md"] += "\nStale projection";
+  }
   const events = [], calls = [];
-  const collect = (files) => ({ audit: { warnings: [] }, closure: {}, crossArtifact: {}, issues: missingBundleResources(canonical.parseCanonicalSkillIR(files), files)
-    .map((item) => issue("MISSING_IMPLEMENTATION", `能力 ${item.capabilityId} 的实现文件不存在：${item.path}`, [item.path], item.capabilityId)) });
-  const validate = (files) => ({ executionReady: true, contractReady: collect(files).issues.length === 0 });
+  const collect = (files) => ({ audit: { warnings: [] }, closure: {}, crossArtifact: {}, issues: [
+    ...missingBundleResources(canonical.parseCanonicalSkillIR(files), files)
+      .map((item) => issue("MISSING_IMPLEMENTATION", `能力 ${item.capabilityId} 的实现文件不存在：${item.path}`, [item.path], item.capabilityId)),
+    ...auditSkillIRFiles(files).map((evidence) => issue("SKILL_IR_CLOSURE", evidence, ["evals/skill-ir.json"])).filter(isSkillIRProjectionIssue),
+  ] });
+  const validate = (files) => ({ executionReady: !(options.rebuildIntroducesP0 && files !== initial), contractReady: collect(files).issues.length === 0 });
   const deps = {
-    ...canonical, reconcileRuntimeInputResources, missingBundleResources, contractRepairProgress,
+    ...canonical, reconcileRuntimeInputResources, missingBundleResources, contractRepairProgress, providerRepairNeedsUserAction,
+    isSkillIRProjectionIssue, contractRepairFailureReason,
+    rebuildSkillIRProjections: options.noopRebuild ? (files) => ({ files, changedPaths: [] }) : rebuildSkillIRProjections,
     idea: "检查文档", loopPlan: workflow.loopPlan, BUILD_REPAIR_MAX_ROUNDS: 2,
     ensureCanonicalBundledResources: (value) => value,
     finalizeSkillFiles: (files, _idea, _answers, _source, _plan, _loop, value) => ({ ...files, ...project(value).files }),
@@ -196,18 +213,57 @@ async function runRepairScenario(responses) {
     p1IssuesAreCompilerOwnedEvalEdges: () => false,
     isSafeSkillFilePath: (path) => !path.includes(".."),
     allowedP1MutationTypes: () => ["identity.update", "capability.update"], canonicalMutationTargetCatalog: () => ({}),
-    setBuildLoop: () => {}, setGenerationLoop: () => {},
+    setBuildLoop: () => {}, setGenerationLoop: () => {}, setFiles: (files) => events.push({ event: "preserved-files", files }),
     reportClientGenerationLoopEvent: (event, data) => events.push({ event, ...data }),
     runP0StaticRepairLoop: async (files) => ({ files, validation: validate(files), rounds: 0 }),
     callAI: async (_mode, body) => {
       calls.push(structuredClone(body));
-      return responses[Math.min(calls.length - 1, responses.length - 1)];
+      const response = responses[Math.min(calls.length - 1, responses.length - 1)];
+      if (response instanceof Error) throw Object.assign(response, { repairTest: { calls, events, initial } });
+      return response;
     },
   };
   const run = new Function(...Object.keys(deps), `${code}\nreturn runP1ContractRepairLoop;`)(...Object.values(deps));
   const result = await run({ files: initial, validation: validate(initial), generationPlan: capabilities.capabilityPlan, answers: {}, sourceText: "", skillIR: ir });
   return { result, initial, events, calls };
 }
+
+test("production P1 repairs projection drift without a model call or consuming semantic rounds", async () => {
+  const run = await runRepairScenario([], { drift: true, referencePresent: true });
+  assert.equal(run.result.passed, true);
+  assert.equal(run.result.rounds, 0);
+  assert.equal(run.calls.length, 0);
+  assert.equal(run.result.files["evals/skill-ir.json"], run.initial["evals/skill-ir.json"]);
+  assert.equal(run.result.files["references/check-rules.md"], run.initial["references/check-rules.md"]);
+  assert.ok(run.events.some((event) => event.phase === "projection-repair" && event.accepted));
+});
+
+test("production P1 removes projection blockers before asking the model about a real missing reference", async () => {
+  const run = await runRepairScenario([{ implementationFiles: { "references/check-rules.md": "# 检查规则\n逐条核对来源。" } }], { drift: true });
+  assert.equal(run.result.passed, true);
+  assert.equal(run.calls.length, 1);
+  assert.equal(run.result.rounds, 1);
+  assert.ok(run.calls[0].evaluation.blockers.every((blocker) => !/PROJECTION_DRIFT|已漂移/.test(blocker)));
+  assert.equal(run.calls[0].evaluation.missingResources.length, 1);
+});
+
+test("production P1 stops a no-op compiler repair without sending projections to the model", async () => {
+  const run = await runRepairScenario([], { drift: true, referencePresent: true, noopRebuild: true });
+  assert.equal(run.result.passed, false);
+  assert.equal(run.calls.length, 0);
+  assert.equal(run.result.files, run.initial);
+  assert.match(run.result.failureReason, /程序重建未通过/);
+  assert.match(run.result.failureReason, /评测尚未启动/);
+  assert.doesNotMatch(run.result.failureReason, /不收敛|未收敛/);
+});
+
+test("production P1 rejects a projection candidate that introduces a P0 failure", async () => {
+  const run = await runRepairScenario([], { drift: true, referencePresent: true, rebuildIntroducesP0: true });
+  assert.equal(run.result.passed, false);
+  assert.equal(run.calls.length, 0);
+  assert.equal(run.result.files, run.initial);
+  assert.match(run.result.failureReason, /基础检查阻塞/);
+});
 
 test("production P1 coordinator rejects ineffective edits and then converges with the real missing reference", async () => {
   const run = await runRepairScenario([
@@ -229,4 +285,16 @@ test("production P1 coordinator retains the original bundle when two repairs sti
   assert.equal(run.calls.length, 2);
   assert.equal(run.result.issues.length, 1);
   assert.ok(run.events.filter((event) => event.event === "generation_loop_candidate").every((event) => event.accepted === false));
+});
+
+test("production P1 coordinator stops on insufficient balance and preserves files without a second repair", async () => {
+  for (const failure of [new Error("Insufficient Balance（请求 test）"), Object.assign(new Error("模型账户余额或额度不足，请充值后重试当前步骤。"), { code: "AI_ACCOUNT_LIMIT" })]) {
+    await assert.rejects(runRepairScenario([failure]), (error) => {
+      assert.equal(error, failure);
+      assert.equal(error.repairTest.calls.length, 1);
+      assert.deepEqual(error.repairTest.events.find((event) => event.event === "preserved-files").files, error.repairTest.initial);
+      assert.equal(error.repairTest.events.some((event) => /仍未收敛/.test(event.reason)), false);
+      return true;
+    });
+  }
 });

@@ -1,4 +1,4 @@
-import { bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, isReadOnlyHostEvidence, isUserReplyToken, normalizeWorkflowDagSteps, WORKFLOW_TERMINALS, type WorkflowDagStep } from "./workflow-dag.ts";
+import { bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, isReadOnlyHostEvidence, isUserReplyToken, normalizeWorkflowDagSteps, workflowCapabilityRouteIssues, WORKFLOW_TERMINALS, type WorkflowDagStep } from "./workflow-dag.ts";
 
 export type WorkflowPlanCapability = {
   id: string; kind: string; input: string; output: string; requirement?: string;
@@ -178,7 +178,7 @@ export function inspectWorkflowPlan(context: WorkflowPlanContext) {
   const ids = new Set(context.capabilities.map((item) => item.id));
   const ownershipIssues = steps.flatMap((step) => !step.capabilityIds.length || step.capabilityIds.some((id) => !ids.has(id))
     ? [`Workflow step ${step.id} 缺少有效的 capability owner；必须使用当前已启用能力的 id`] : []);
-  const issues = [...result.issues.map((item) => item.message), ...ownershipIssues];
+  const issues = [...result.issues.map((item) => item.message), ...ownershipIssues, ...workflowCapabilityRouteIssues(steps, context.capabilities)];
   if (!steps.length) issues.push("Workflow 没有可执行步骤");
   return { valid: !issues.length, steps, ordered: result.ordered, initialInputs, issues };
 }
@@ -206,7 +206,7 @@ export function applyWorkflowStepPatch(steps: WorkflowDagStep[], payload: Record
     if (index < 0 || seen.has(String(update.id))) throw new Error(`修复节点不存在或重复：${String(update.id)}`);
     if (!update.changes || typeof update.changes !== "object" || Array.isArray(update.changes)) throw new Error("节点 changes 必须是对象");
     const changes = update.changes as Record<string, unknown>;
-    const fields = new Set(["capabilityIds", "role", "when", "input", "action", "output", "fallback", "requires", "produces", "mutates", "delivers", "resumeProduces"]);
+    const fields = new Set(["capabilityIds", "availableCapabilityIds", "role", "when", "input", "action", "output", "fallback", "requires", "produces", "mutates", "delivers", "resumeProduces"]);
     if (Object.keys(changes).some((key) => !fields.has(key))) throw new Error("节点补丁不能改 id 或包含未知字段");
     seen.add(String(update.id));
     next[index] = { ...next[index], ...changes };
@@ -298,9 +298,14 @@ export async function repairWorkflowPlan(
     }
     // Preserve actual task operations and their artifacts. Auto-inserted
     // resource helpers may be folded into an explicit consuming operation.
-    for (const step of originalSteps.filter((entry) => !entry.id.startsWith("step-capability-"))) {
+    for (const step of originalSteps.filter((entry) => !entry.id.startsWith("step-capability-")
+      || entry.mutates.length || ["persist", "await-input", "await-approval"].includes(entry.role || "")
+      || originalSteps.some((consumer) => consumer.id !== entry.id && entry.produces.some((token) => consumer.requires.includes(token))))) {
       if (!retainedIds.has(step.id)) rejectionIssues.push(`修复不能删除原任务步骤 ${step.id}；请保留该步骤并修复依赖`);
       const replacement = proposed.find((entry) => entry.id === step.id);
+      for (const id of step.capabilityIds.filter((id) => context.capabilities.some((capability) => capability.id === id && ["builtin-tool", "mcp", "script"].includes(capability.kind)))) {
+        if (replacement && !replacement.capabilityIds.includes(id)) rejectionIssues.push(`步骤 ${step.id} 必须保留已规划的工具 ${id}，不能降级为可用能力或仅用模型模拟`);
+      }
       // Valid data edges and write effects are not expendable just because
       // another edge is broken. Missing raw-input aliases may be rebound.
       for (const token of step.requires.filter((token) => !cyclicSteps.has(step.id) && originalArtifacts.has(token) && !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token))) {
@@ -340,6 +345,6 @@ For duplicate business producers, retain the first producer's token and give lat
 NEVER list a terminal marker in delivers. If delivers is [$output], replace it with the actual artifact: for saving, add a concrete unique file-path token to produces alongside $output and list that file token in delivers. Do not hide a missing file by listing only input text or a completion marker.
 Only explicit deliver/persist steps may produce $output; also list the actual business tokens in delivers. Normal and revised outputs can each have conditional delivery steps; do not join mutually exclusive branches as AND dependencies. Read/search/extraction is not delivery. Retain all real steps with stable ids and all their business artifacts. Do not remove a validation failure by deleting work.
 An orphan validation result is a missing delivery gate, NOT a new terminal: find the deliver/persist node for the EXACT artifact that the validate node checks. Add that validation-result token to the delivery's requires (retaining its artifact and real confirmation dependencies); delivery's when/action must require validation to pass and report failures without claiming completion. If validation currently follows delivery, separate generation from delivery and add a real post-validation handoff. Never relabel validate as deliver or delete a checkpoint to solve this. Different artifact versions/branches need their own validation, not an unrelated shared gate.
-All active capabilities must have a real route. Fix BOTH sides of every orphan tool: bind its requires to real inputs AND add its produced token to the actual consuming node's requires/action. Renaming its output alone does not connect it. Do not insert an unused search task or make optional search a prerequisite for every task.
+All active capabilities must have a real route. Optional builtin-tool/MCP providers that are available but not scheduled belong in the actual LLM read/transform consumer's availableCapabilityIds; this is not an instruction or permission to call them. Retain existing availability IDs when changing this list. Never demote a required tool, artifact producer, write, checkpoint or real task operation to availability. Selected optional host adapters may also be owned by the content operation that consumes their evidence; selection alone does not require a separate task node or global output. Document/image reading and spreadsheet analysis are conditional on real relevant material. Spreadsheet analysis is not permission to export a file; preserve explicit persistence and its content dependencies. Fix BOTH sides of every remaining orphan tool: bind its requires to real inputs AND add its produced token to the actual consuming node's requires/action. Renaming its output alone does not connect it. Do not insert an unused search task or make optional search a prerequisite for every task.
 Alternatively absorb a generated read-only builtin-tool helper with foldedSteps:[{"id":"exact-step-capability-helper-id","intoStepId":"exact-existing-consumer-id"}]. In stepUpdates update the consumer's action to explain when to call that tool, which actual input/query to pass, and how its result is used. Keep the helper's valid input dependencies in the consumer's requires, and retain any helper product that another node consumes. The compiler transfers capability ownership and removes ONLY that synthetic node. This is useful for a duplicate document reader or optional source lookup inside content analysis. Never fold writes, MCP external actions, real task operations, approval/checkpoint nodes or delivery. Do not merely remove a helper's capabilityIds: that creates another missing route. Never invent builtin-* aliases for catalog host-* ids; use exact enabled ids. Never add/delete capabilities, change user requirements, weaken output contracts or reverse negative examples.
 File persistence depends on generated content. mutates requires the prior state and an ordered version/completion token. $-prefixed business tokens are allowed but must have producers. Stop when an actual required tool is unavailable, never simulate it. Fix every listed compiler issue and return only the repaired graph, no files or prose.`;

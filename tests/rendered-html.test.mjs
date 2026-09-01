@@ -21,7 +21,7 @@ async function render() {
 test("evaluation UI hides unobserved rows and counts without changing optimization targets", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
-  const report = page.slice(page.indexOf('<section className={`eval-report-panel'), page.indexOf('<div className={`finding-card', page.indexOf('<section className={`eval-report-panel')));
+  const report = page.slice(page.indexOf('<section className={`eval-report-panel'), page.indexOf('<div className="finding-card"', page.indexOf('<section className={`eval-report-panel')));
   assert.match(report, /evals\.map\(\(result, index\) => \{\s*\/\/[^\n]*\n\s*if \(result\.coverage === "not-covered"\) return null;/);
   assert.match(report, /openOptimization\(index\)/);
   assert.doesNotMatch(report, /pendingEvals|还没测到|还没有测到|为什么还不能判断|换场景验证/);
@@ -97,13 +97,12 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   const liveCompileBoundary = page.slice(liveCompileStart, liveCompileEnd);
   assert.match(liveCompileBoundary, /finalizeSkillFiles\([\s\S]*canonicalIR/);
   const projectionBoundary = page.slice(page.indexOf("const frozenIR = bindSkillIREvals"), page.indexOf("function auditSkillFiles"));
-  assert.match(projectionBoundary, /files\["SKILL\.md"\] = projectSkillMarkdown\(frozenIR\)/);
-  assert.match(projectionBoundary, /files\["evals\/evals\.json"\] = projectEvalBank\(frozenIR\)/);
+  assert.match(projectionBoundary, /return projectSkillIRFiles\(frozenIR, files\)/);
   assert.doesNotMatch(projectionBoundary, /ensure(?:Description|Productive|Information|Confirmed|Instruction|SkillSemantic)|reconcile(?:ConfirmedContent|ValidationVisibility|DataMutation)/);
   assert.match(page, /function auditSkillFiles\(/);
   assert.match(page, /function sanitizeSkillFiles\(/);
   assert.match(page, /function createSpecificEvals\(/);
-  assert.match(page, /version:\s*"2\.7"/);
+  assert.match(page, /version:\s*EVAL_COMPILER_VERSION/);
   assert.match(page, /本用例携带的代表性输入材料如下，必须实际处理这些内容/);
   assert.match(page, /本用例没有携带核心输入材料/);
   assert.match(page, /__previewInput:\s*skillDemo\?\.userPrompt\s*\|\|\s*discoveryPreview\?\.sampleInput/);
@@ -251,7 +250,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /callAI<\{ updatedFiles\?: Record<string, unknown>/);
   assert.match(page, /AI 修复并重新评估/);
   assert.match(page, /AI 正在修复发布前问题/);
-  assert.match(page, /还有少量不会阻止下载的提醒/);
+  assert.doesNotMatch(page, /文件发布检查已通过|还有少量不会阻止下载的提醒/);
+  assert.match(page, /bundleAudit.blockers.length > 0 && <div className="finding-card">/);
   assert.match(page, /AI 工具建议/);
   assert.match(page, /目标、子目标与循环/);
   assert.match(page, /AI 已推荐并采用一条可执行流程/);
@@ -361,7 +361,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /Multi-turn conversation evidence/);
   assert.match(route, /A file attached during the conversation is user-provided material/);
   assert.match(page, /const CAPABILITY_LIBRARY/);
-  assert.match(page, /宿主 Tools 与外部 MCP 分开选择/);
+  assert.match(page, /<strong className="capability-library-title"><img[^>]*\/>添加能力<\/strong>/);
+  assert.doesNotMatch(page, /宿主 Tools 与外部 MCP 分开选择/);
   assert.match(page, /function explainSkillFile\(/);
   assert.match(page, /里面具体有什么/);
   assert.match(page, /确认并生成下一版 Demo/);
@@ -733,9 +734,9 @@ test("an ambiguous optimization patch is replanned instead of crashing the Loop"
   assert.match(page, /preparedPatch\s*=\s*applyPatchPlan/);
 });
 
-test("Eval v2.7 covers completed decision branches and script field mapping", async () => {
+test("the current Eval compiler covers completed decision branches and script field mapping", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(page, /version:\s*"2\.7"/);
+  assert.match(page, /version:\s*EVAL_COMPILER_VERSION/);
   assert.match(page, /workflow-decision-values-provided/);
   assert.match(page, /completedNumericDecisionFixture\(representativeInput\)/);
   assert.match(page, /CSV 精确列名及顺序/);
@@ -744,7 +745,7 @@ test("Eval v2.7 covers completed decision branches and script field mapping", as
   assert.match(page, /core_capability", \.\.\.\(expectedArtifacts\.length \? \["artifact_checker"\]/);
   assert.match(page, /generationLoop\.status !== "idle" && generationLoop\.issues\.length/);
   assert.match(page, /__previewInput:\s*restoredPreviewInput/);
-  assert.match(page, /savedEvalVersion === "2\.7"/);
+  assert.match(page, /savedEvalVersion === EVAL_COMPILER_VERSION/);
   assert.match(page, /savedLoopSnapshot\.status !== "running"/);
   assert.match(page, /const optimizationRunInFlight = useRef\(false\)/);
   assert.match(page, /if \(optimizationRunInFlight\.current\) return/);

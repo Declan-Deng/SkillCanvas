@@ -26,6 +26,8 @@ test("host aliases converge without merging MCP connections or overriding disabl
   assert.deepEqual(steps[0].capabilityIds, ["builtin-document-reading"]);
   const unknown = tool("builtin-custom-reader", "Read another repository");
   assert.equal(reconcileHostCapabilityAliases([unknown], [], catalog).items[0].id, unknown.id);
+  const optional = reconcileHostCapabilityAliases([alias], [{ ...node("reason", ["$request"], ["report"], "transform", ["core"]), availableCapabilityIds: [alias.id] }], catalog);
+  assert.deepEqual(optional.workflowSteps[0].availableCapabilityIds, ["host-document-reading"]);
 });
 
 // Reconstruct the reported post-selection failure with unrelated task vocabularies.
@@ -104,22 +106,19 @@ for (const renamed of [false, true]) test(`actual selectable search entry routes
   assert.ok(result.workflowSteps.every((step) => !step.id.startsWith("step-capability-")));
 });
 
-test("a newly selected document reader consumes supplied material but still needs a real consumer", async () => {
+test("a newly selected optional document reader is embedded in a real consumer, never a delivery", async () => {
   const core = { id: "core", kind: "llm", input: "Materials", output: "Report", fallback: "Ask" };
   const context = { inputs: [], capabilities: [core, catalog[0]], workflowSteps: [
     node("compose", ["$request"], ["report"], "transform", ["core"]),
     { ...node("deliver", ["report"], ["$output"], "deliver", ["core"]), delivers: ["report"] },
   ] };
-  const before = inspectWorkflowPlan(context);
-  const helper = before.steps.find((step) => step.id === "step-capability-host-document-reading");
-  assert.deepEqual(helper.requires, ["$request"]);
-  assert.equal(before.valid, false, "reading supplied material is not task completion");
-  assert.ok(!helper.produces.includes("$output"));
-  const result = await repairWorkflowPlan(context, () => ({ stepUpdates: [{ id: "compose", changes: {
-    requires: ["$request", ...helper.produces], action: "Build the report from the actual document-reading results",
-  } }] }));
-  assert.equal(result.attempts, 1);
-  assert.ok(result.workflowSteps.findIndex((step) => step.id === helper.id) < result.workflowSteps.findIndex((step) => step.id === "compose"));
+  const result = await repairWorkflowPlan(context, () => assert.fail("optional input adapter needs no model repair"));
+  assert.equal(result.attempts, 0);
+  assert.deepEqual(result.workflowSteps.map((step) => step.id), ["compose", "deliver"]);
+  assert.deepEqual(result.workflowSteps[0].requires, ["$request"]);
+  assert.ok(result.workflowSteps[0].capabilityIds.includes("host-document-reading"));
+  assert.deepEqual(result.workflowSteps[0].produces, ["report"]);
+  assert.deepEqual(result.workflowSteps[1].capabilityIds, ["core"]);
 });
 
 test("optional lookup cannot discard a derived query dependency to appear connected", () => {

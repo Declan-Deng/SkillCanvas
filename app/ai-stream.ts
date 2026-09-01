@@ -1,5 +1,12 @@
 type StreamContent = string | Array<string | { text?: string }> | null | undefined;
 
+export class IncompleteCompletionStreamError extends Error {
+  constructor() {
+    super("模型输出流在完成前中断；当前内容已保留，请重试当前步骤");
+    this.name = "IncompleteCompletionStreamError";
+  }
+}
+
 function deltaText(content: StreamContent) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -11,7 +18,7 @@ function deltaText(content: StreamContent) {
  * because it may occur inside JSON string values. */
 export async function readCompletionResponse(upstream: Response, streamRequested: boolean, onProgress: () => void) {
   const contentType = upstream.headers.get("content-type") || "";
-  if (!streamRequested || !/text\/event-stream/i.test(contentType) || !upstream.body) return upstream.text();
+  if (!upstream.ok || !streamRequested || !/text\/event-stream/i.test(contentType) || !upstream.body) return upstream.text();
 
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
@@ -35,10 +42,14 @@ export async function readCompletionResponse(upstream: Response, streamRequested
         usage?: typeof usage;
       };
       const choice = event.choices?.[0];
-      content += deltaText(choice?.delta?.content);
-      reasoningContent += choice?.delta?.reasoning_content || "";
+      const delta = deltaText(choice?.delta?.content);
+      const reasoning = choice?.delta?.reasoning_content || "";
+      content += delta;
+      reasoningContent += reasoning;
       if (choice?.finish_reason) finishReason = choice.finish_reason;
       if (event.usage) usage = event.usage;
+      // Empty keepalives must not keep a stuck generation alive indefinitely.
+      if (delta || reasoning || choice?.finish_reason) onProgress();
     } catch {
       // Ignore keepalives or provider-specific non-JSON events. The existing
       // malformed/empty response path decides whether a retry is required.
@@ -48,7 +59,6 @@ export async function readCompletionResponse(upstream: Response, streamRequested
   while (true) {
     const { value, done } = await reader.read();
     if (done) break;
-    onProgress();
     buffer += decoder.decode(value, { stream: true });
     const lines = buffer.split(/\r?\n/);
     buffer = lines.pop() || "";
@@ -56,6 +66,7 @@ export async function readCompletionResponse(upstream: Response, streamRequested
   }
   buffer += decoder.decode();
   if (buffer.trim()) consumeLine(buffer);
+  if (!finishReason) throw new IncompleteCompletionStreamError();
   return JSON.stringify({
     choices: [{ finish_reason: finishReason, message: { content, reasoning_content: reasoningContent } }],
     usage,

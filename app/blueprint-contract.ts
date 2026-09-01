@@ -159,6 +159,7 @@ export function blueprintStageIssues(mode: BlueprintPlanningMode, value: unknown
       enumeration(step, "role", path, ["read", "transform", "validate", "persist", "deliver", "await-input", "await-approval"]);
       // Empty owners reach the dedicated owner-binding repair; never guess one here.
       for (const key of ["capabilityIds", "requires", "produces", "mutates", "resumeProduces"]) strings(step, key, path);
+      if (Object.hasOwn(step, "availableCapabilityIds")) strings(step, "availableCapabilityIds", path);
       strings(step, "delivers", path, ["deliver", "persist"].includes(String(step.role)) ? 1 : 0);
     }, 1);
     child(value, "loopPlan", "", (loop, path) => {

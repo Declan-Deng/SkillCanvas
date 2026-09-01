@@ -67,7 +67,8 @@ export function markUnsupportedPreviewMetrics(output: string, userPrompt: string
 export function normalizeDiscoveryPreview(value: unknown): DiscoveryPreview | null {
   if (!value || typeof value !== "object") return null;
   const candidate = value as Record<string, unknown>;
-  const userPrompt = clean(candidate.userPrompt, 2_400);
+  // These are reused as executable Eval inputs, not just preview labels.
+  const userPrompt = typeof candidate.userPrompt === "string" ? candidate.userPrompt.trim() : "";
   const rawOutput = clean(candidate.output, 8_000);
   const output = markUnsupportedPreviewMetrics(rawOutput, userPrompt);
   const learned = stringList(candidate.learned, 5, 180);
@@ -78,7 +79,7 @@ export function normalizeDiscoveryPreview(value: unknown): DiscoveryPreview | nu
     title: clean(candidate.title, 80) || "AI 的第一版理解预演",
     scenario: clean(candidate.scenario, 320) || "根据当前目标和资料生成的预演，不代表最终 Skill。",
     userPrompt,
-    sampleInput: clean(candidate.sampleInput, 4_000),
+    sampleInput: typeof candidate.sampleInput === "string" ? candidate.sampleInput.trim() : "",
     output,
     learned,
     uncertainties: Array.from(new Set([

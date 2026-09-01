@@ -1,6 +1,11 @@
+import { hostEvidenceAdapter } from "./host-evidence-adapters.ts";
+
 export type WorkflowDagStep = {
   id: string;
   capabilityIds: string[];
+  /** Optional providers available to this operation, not scheduled calls or
+   * additional producers. Execution and permission are resolved at runtime. */
+  availableCapabilityIds?: string[];
   when: string;
   input: string;
   action: string;
@@ -53,7 +58,8 @@ export function normalizeWorkflowDagSteps(value: unknown): WorkflowDagStep[] {
     const id = rawId.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || `step-${index + 1}`;
     return [{
       id,
-      capabilityIds: unique(raw.capabilityIds, 12),
+      capabilityIds: unique(raw.capabilityIds),
+      ...(unique(raw.availableCapabilityIds).length ? { availableCapabilityIds: unique(raw.availableCapabilityIds) } : {}),
       when: typeof raw.when === "string" ? raw.when.trim().slice(0, 320) : "每次执行到该步骤时",
       input: typeof raw.input === "string" ? raw.input.trim().slice(0, 420) : "",
       action,
@@ -123,7 +129,27 @@ export function closeWorkflowDagTerminals(steps: WorkflowDagStep[], _initialInpu
 type RoutableCapability = { id: string; kind: string; input: string; output: string; requirement?: string; purpose?: string; activationCondition?: string; routingCondition?: string; fallback: string; affects?: string[]; optional?: boolean; scope?: string };
 const label = (text: string) => text.replace(/[\s`*_，,；;：:。.!！]/g, "").toLowerCase();
 
+export function isOptionalToolAvailability(capability: RoutableCapability) {
+  return ["builtin-tool", "mcp"].includes(capability.kind)
+    && capability.optional !== false && capability.scope !== "global"
+    && Boolean(capability.optional || ["conditional", "optional"].includes(capability.scope || ""))
+    && !capability.affects?.some((effect) => /artifact-output|file-output/.test(effect));
+}
+
+export function workflowCapabilityRouteIssues(steps: WorkflowDagStep[], capabilities: RoutableCapability[]) {
+  return steps.flatMap((step) => (step.availableCapabilityIds || []).flatMap((id) => {
+    const capability = capabilities.find((item) => item.id === id);
+    return !capability || !isOptionalToolAvailability(capability)
+      || !["read", "transform"].includes(step.role || "transform") || step.mutates.length
+      || !step.capabilityIds.some((owner) => capabilities.some((item) => item.id === owner && item.kind === "llm"))
+      ? [`Workflow step ${step.id} 的可选能力 ${id} 无效；必需操作、产物写入与确认不能降级为能力可用性声明`] : [];
+  }));
+}
+
 export function isReadOnlyHostEvidence(capability: RoutableCapability) {
+  // The spreadsheet interface includes file export. Only its explicitly
+  // scoped analysis facet may be embedded; never treat the whole tool as read-only.
+  if (capability.id === "host-spreadsheet-analysis") return false;
   const operation = `${capability.id} ${capability.requirement} ${capability.purpose}`;
   return capability.kind === "builtin-tool"
     && /read|search|读取|解析|搜索|检索|查询|核对来源/i.test(operation)
@@ -145,7 +171,7 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
       needsBinding.add(step.id);
     }
   }
-  const routed = new Set(steps.flatMap((step) => step.capabilityIds));
+  const routed = new Set(steps.flatMap((step) => [...step.capabilityIds, ...(step.availableCapabilityIds || [])]));
   const missing = capabilities.filter((item) => !routed.has(item.id));
   for (const item of missing) {
     if (item.kind === "reference" && item.affects?.includes("runtime-workflow")) {
@@ -158,7 +184,7 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
       }
     }
     const persist = /artifact-output|file-output/.test((item.affects || []).join(" "))
-      || /(?:保存|写入|导出|save|write|export).{0,24}(?:文件|file|artifact|pdf|docx|csv)/i.test(`${item.requirement} ${item.output}`);
+      || (!isOptionalToolAvailability(item) && /(?:保存|写入|导出|save|write|export).{0,24}(?:文件|file|artifact|pdf|docx|csv)/i.test(`${item.requirement} ${item.output}`));
     const step: WorkflowDagStep = {
       id: `step-capability-${item.id}`, capabilityIds: [item.id], when: item.activationCondition || item.routingCondition || "执行相关任务时",
       input: item.input, action: item.purpose || item.requirement || item.id, output: item.output, fallback: item.fallback,
@@ -203,25 +229,53 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
   }
   const folded = new Set<string>();
   for (const helper of steps) {
-    if (!helper.id.startsWith("step-capability-") || helper.mutates.length || helper.role === "persist") continue;
+    if (!helper.id.startsWith("step-capability-") || helper.mutates.length || !["read", "transform"].includes(helper.role || "transform")) continue;
     const capability = capabilities.find((item) => helper.capabilityIds.length === 1 && item.id === helper.capabilityIds[0]);
     // An optional, read-only evidence lookup belongs inside the content
     // operation that can use it. Do not force an unused synthetic query/result
     // into the global DAG. Required searches and externally-writing tools keep
     // their own explicit producers/consumers and remain subject to validation.
-    if (!capability || !isReadOnlyHostEvidence(capability) || !(capability.optional || ["conditional", "optional"].includes(capability.scope || ""))
-      || !/搜索|检索|来源核验|查询|核对来源|search|source verification/i.test(`${capability.id} ${capability.requirement} ${capability.purpose}`)
+    const adapter = capability && hostEvidenceAdapter(capability);
+    const optionalSearch = capability && isReadOnlyHostEvidence(capability)
+      && /搜索|检索|来源核验|查询|核对来源|search|source verification/i.test(`${capability.id} ${capability.requirement} ${capability.purpose}`);
+    const wireName = capability?.id.replace(/^host-/, "").replace(/-/g, "_");
+    const syntheticProducts = new Set([`capability:${capability?.id}:output`, ...["output", "results"].flatMap((suffix) => [`${wireName}_${suffix}`, `$${wireName}_${suffix}`])]);
+    if (!capability || helper.id !== `step-capability-${capability.id}` || !isOptionalToolAvailability(capability)
       || helper.delivers?.length || helper.resumeProduces?.length
-      || helper.produces.some((token) => isTerminal(token) || isUserReplyToken(token))
-      || helper.requires.some((token) => !["$request", "$source"].includes(token) && !token.startsWith("unbound:"))
+      || helper.produces.some((token) => !syntheticProducts.has(token) || isTerminal(token) || isUserReplyToken(token))
+      || helper.requires.some((token) => isTerminal(token) || isUserReplyToken(token))
       || steps.some((step) => step !== helper && helper.produces.some((token) => [...step.requires, ...step.mutates, ...(step.delivers || [])].includes(token)))) continue;
-    const endpoints = steps.filter((step) => explicitDelivery(step) || pauseTerminalForStep(step));
-    const consumers = steps.filter((step) => step !== helper && step.role !== "read" && step.role !== "persist" && step.role !== "validate" && !pauseTerminalForStep(step)
+    // Walk real edges to delivery (including validation and approval), not
+    // array position or only the node immediately before the final output.
+    const reachesEnd = new Set(steps.filter((step) => explicitDelivery(step) || pauseTerminalForStep(step)).map((step) => step.id));
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const step of steps) if (!reachesEnd.has(step.id) && steps.some((consumer) => reachesEnd.has(consumer.id) && consumer.requires.some((token) => step.produces.includes(token)))) {
+        reachesEnd.add(step.id); changed = true;
+      }
+    }
+    const consumers = steps.filter((step) => step !== helper && !step.id.startsWith("step-capability-")
+      && step.role !== "persist" && step.role !== "validate" && !pauseTerminalForStep(step)
       && step.capabilityIds.some((id) => capabilities.some((item) => item.id === id && item.kind === "llm"))
       && (step.role !== "deliver" || step.delivers?.some((token) => step.produces.includes(token)))
-      && (explicitDelivery(step) || endpoints.some((end) => end.requires.some((token) => step.produces.includes(token)))));
-    if (!consumers.length) continue;
-    consumers.forEach((step) => { step.capabilityIds = unique([...step.capabilityIds, capability.id]); });
+      // A helper reading an intermediate artifact can only be absorbed by an
+      // operation that already consumes that exact artifact. Never discard a
+      // query/data dependency or guess a new edge from a later producer.
+      && helper.requires.every((token) => ["$request", "$source"].includes(token) || token.startsWith("unbound:") || step.requires.includes(token))
+      && businessOutputs(step).length > 0 && step.requires.length > 0 && reachesEnd.has(step.id));
+    const canEmbedEvidence = Boolean(adapter || optionalSearch);
+    const targets = canEmbedEvidence ? consumers : consumers.filter((step) => ["read", "transform"].includes(step.role || "transform") && !step.mutates.length);
+    if (!targets.length) continue;
+    // The runtime projection binds each adapter's actual arguments and result
+    // use to the owning operation. No fake global *_output token or completed
+    // marker is created. Conditions make these available adapters, not an
+    // instruction to invoke every selected tool on every task.
+    targets.forEach((step) => {
+      if (canEmbedEvidence) step.capabilityIds = unique([...step.capabilityIds, capability.id]);
+      else step.availableCapabilityIds = unique([...(step.availableCapabilityIds || []), capability.id]);
+      step.requires = unique([...step.requires, ...helper.requires.filter((token) => !token.startsWith("unbound:"))]);
+    });
     folded.add(helper.id);
   }
   return steps.filter((step) => !folded.has(step.id));

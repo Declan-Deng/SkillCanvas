@@ -1,6 +1,7 @@
 import { auditSkillIRFiles } from "./skill-ir.ts";
 import { hasUnscopedActionPermissionConflict } from "./action-permission.ts";
 import { capabilityDeltaGapIsDefensible, type CapabilityDeltaGap } from "./capability-delta.ts";
+import { danglingPromptDelimiter } from "./eval-prompt.ts";
 
 export type BundleIssuePriority = "P0" | "P1";
 export type BundleIssueCategory = "P0_EXECUTION_BLOCKER" | "P1_CONTRACT_BLOCKER";
@@ -214,7 +215,7 @@ function normalizeSentence(value: string) {
   return value
     .toLowerCase()
     .replace(/^\s*(?:[-*+]\s+|\d+[.)、]\s*)/, "")
-    .replace(/[\s`*_>#“”"'。，、；：:!?！？()（）\[\]{}-]+/g, "")
+    .replace(/[\s`*_>#“”"'。，、；：:!?！？()（）[\]{}-]+/g, "")
     .trim();
 }
 
@@ -273,9 +274,8 @@ function validatePromptCompleteness(files: Record<string, string>, issues: Bundl
   });
   prompts.forEach((prompt) => {
     if (/[；;]\s*$/.test(prompt.value)) pushIssue(issues, "INCOMPLETE_PROMPT", prompt.path, `${prompt.key} 以未完成的分号结尾`);
-    const unmatchedPair = [["“", "”"], ["「", "」"], ["『", "』"], ["（", "）"], ["【", "】"]]
-      .find(([open, close]) => prompt.value.split(open).length !== prompt.value.split(close).length);
-    if (unmatchedPair) pushIssue(issues, "INCOMPLETE_PROMPT", prompt.path, `${prompt.key} 含未闭合的 ${unmatchedPair[0]}${unmatchedPair[1]}，疑似模型输出被截断`);
+    const dangling = danglingPromptDelimiter(prompt.value);
+    if (dangling) pushIssue(issues, "INCOMPLETE_PROMPT", prompt.path, `${prompt.key} 末尾停留在 ${dangling}，引述或括号内容尚未填写`);
     if (PROMPT_TEMPLATE_SIGNAL.test(prompt.value)) pushIssue(issues, "TEMPLATE_PROMPT_TEXT", prompt.path, `${prompt.key} 仍含生成器样板词：${prompt.value.match(PROMPT_TEMPLATE_SIGNAL)?.[0] || "template"}`);
   });
 }

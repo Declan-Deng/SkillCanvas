@@ -72,6 +72,9 @@ export function isAuthoredReferencePath(path: string) {
 export function validateImplementationFiles(ir: SkillIR, value: Record<string, unknown> = {}): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [path, content] of Object.entries(value)) {
+    if (COMPILER_OWNED_SEMANTIC_PATHS.has(path)) {
+      throw new Error(`IMPLEMENTATION_FILE_INVALID: ${path} 是编译器管理的文件，不能直接修改；纯投影漂移由程序重建，行为变更必须通过 canonicalMutations 修改对应契约后重新编译`);
+    }
     if (!isRepairImplementationPath(path) || typeof content !== "string" || !content.trim()) {
       throw new Error(`IMPLEMENTATION_FILE_INVALID: ${path}；仅支持 scripts/assets 和非编译器管理的 references/*.md 或 *.txt，不能用文本冒充二进制文件`);
     }

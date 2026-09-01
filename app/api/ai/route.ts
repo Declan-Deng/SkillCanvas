@@ -1,8 +1,10 @@
 import { compactInterviewEvidenceForRetry, compactSkillBundleForOptimization, compactSkillBundleForTrial, compactSourceContextForTrial } from "../../ai-context";
 import { recordAiDiagnostic, type AiDiagnosticLevel } from "../../ai-diagnostics";
 import { isRetryableNetworkFailure, safeNetworkFailureReason } from "../../ai-retry";
+import { providerAccountFailure } from "../../eval-prompt";
+import { canonicalBuildContext, generationAttemptBudget } from "../../generation-request";
 import { knowledgeAttemptTimeout } from "../../knowledge-compiler";
-import { readCompletionResponse } from "../../ai-stream";
+import { IncompleteCompletionStreamError, readCompletionResponse } from "../../ai-stream";
 import { persistDiagnostic, readServerCredentials, tenantContext } from "../../server-data";
 import { checkRequestRate } from "../../request-guard";
 import { demoScoringPolicyPrompt, qualityScoringPolicyPrompt } from "../../gate-outcome";
@@ -65,7 +67,6 @@ function attemptOutputTokenBudget(mode: AIMode, attempt: number, retryReason = "
   // max_tokens is a ceiling, not forced verbosity. A proven output-limit stop
   // gets one larger ceiling; ordinary retries retain their normal budget.
   if (attempt > 1 && retryReason === "output-limit-recovery") return Math.min(9_600, MAX_OUTPUT_TOKENS[mode] * 2);
-  if (mode === "build" && attempt > 1) return 7_200;
   return MAX_OUTPUT_TOKENS[mode];
 }
 
@@ -579,6 +580,7 @@ Mark attention whenever the user selected "not sure", a choice is inferred, a co
   }
 
   if (mode === "build") {
+    const canonicalContext = canonicalBuildContext(body, typedAnswers);
     return {
       system: `You create concise, production-quality Codex Agent Skills from a Canonical SkillIR compiled from a structured requirements interview. SkillIR is the single source of truth; capability and loop plans are readable projections only. Your output will pass through a deterministic compiler, so resolve conflicts instead of merely concatenating inputs. Return valid JSON only with this shape: {"files":{"exact/relative/path":"complete file content as a string"}}. Valid paths may include SKILL.md, references/, scripts/, assets/, integrations/, evals/, and agents/openai.yaml.
 
@@ -617,8 +619,12 @@ Rules:
 - Apply personalization precedence consistently: current explicit task instructions > confirmed reusable preferences > user-approved examples > working inferences > generic defaults. State which inputs may affect wording, structure, content selection, decision rules, or only presentation; do not let one example rewrite factual conclusions.
 - Treat the approved outputContract as the source of truth. A human response needs observable required content; a machine output needs the exact schema; an artifact output needs actual file paths and validation. Do not generate fake artifact checks for text-only outputs.
 - Preserve each capability's global, task-specific, conditional, or optional scope. A conditional image/tool capability may affect its own routing and integration eval, but must not make images or files mandatory for unrelated text-only tasks.
-- All file values must be strings.`,
-      user: `Canonical SkillIR (single source of truth):\n${skillIR}\n\nWhat the user wants AI to help with:\n${idea}\n\nConfirmed understanding interview:\n${answers}\n\nApproved understanding blueprint:\n${blueprint}\n\nCapability projection for readability:\n${capabilityPlan}\n\nGoal and loop projection for readability:\n${loopPlan}\n\nUser-provided material:\n${sources || "None"}`,
+- All file values must be strings.${canonicalContext ? `
+
+CANONICAL BUILD OUTPUT SCOPE (overrides file-generation instructions above):
+The local compiler, not this model call, owns evals/evals.json, evals/skill-ir.json, evals/capability-manifest.json, evals/graders.json, evals/result.schema.json, evals/run_evals.py, evals/artifact_checker.py, agents/openai.yaml, references/output-contract.md, references/state-model.md, references/loop-plan.md, references/tooling.md, integrations/tool-contracts.json, and references/domain-playbook.md. Do NOT generate these files: they are projected from the intact canonical contract after this call. Keep their required links in SKILL.md. This does not waive any test, tool contract, knowledge rule or check.
+Return a concise SKILL.md and only the other approved implementation resources (including complete scripts, their independent evals/script-tests/ tests, assets and task-specific references). Do not repeat the canonical contract as prose. Preserve every declared resource path, runtime behavior and confirmation boundary.` : ""}`,
+      user: canonicalContext || `Canonical SkillIR (single source of truth):\n${skillIR}\n\nWhat the user wants AI to help with:\n${idea}\n\nConfirmed understanding interview:\n${answers}\n\nApproved understanding blueprint:\n${blueprint}\n\nCapability projection for readability:\n${capabilityPlan}\n\nGoal and loop projection for readability:\n${loopPlan}\n\nUser-provided material:\n${sources || "None"}`,
     };
   }
 
@@ -1110,13 +1116,25 @@ export async function POST(request: Request) {
           }, tenant.tenantId);
         }
         const controller = new AbortController();
-        const attemptTimeoutMs = attemptTimeoutBudget(body.mode, attempt, provider);
+        const abortFromCaller = () => controller.abort();
+        request.signal.addEventListener("abort", abortFromCaller, { once: true });
+        if (request.signal.aborted) controller.abort();
+        const generationBudget = generationAttemptBudget(body.mode, attempt);
+        const attemptTimeoutMs = generationBudget
+          ? retryReason === "streaming-not-supported" ? generationBudget.totalMs : generationBudget.idleMs
+          : attemptTimeoutBudget(body.mode, attempt, provider);
+        let timeoutKind = "idle";
         let timeout = setTimeout(() => controller.abort(), attemptTimeoutMs);
+        const hardTimeout = generationBudget ? setTimeout(() => {
+          timeoutKind = "total";
+          controller.abort();
+        }, generationBudget.totalMs) : undefined;
         const refreshIdleDeadline = () => {
           clearTimeout(timeout);
           timeout = setTimeout(() => controller.abort(), attemptTimeoutMs);
         };
-        const streamRequested = attempt === 1 && provider === "compatible" && (body.mode === "blueprint-foundation" || body.mode === "blueprint-plan" || body.mode === "blueprint-capabilities" || body.mode === "blueprint-workflow");
+        const streamRequested = retryReason !== "streaming-not-supported" && (Boolean(generationBudget)
+          || (attempt === 1 && provider === "compatible" && (body.mode === "blueprint-foundation" || body.mode === "blueprint-plan" || body.mode === "blueprint-capabilities" || body.mode === "blueprint-workflow")));
         const requestBody: Record<string, unknown> = {
           model,
           messages: [
@@ -1125,14 +1143,17 @@ export async function POST(request: Request) {
               role: "user",
               content: attempt === 1 || blueprintRepair
                 ? user
-                : `${user}\n\nThe previous attempt did not finish correctly. Return one complete valid JSON object now. Escape every backslash inside string values and do not use Markdown fences.${body.mode === "blueprint-foundation" || body.mode === "blueprint-plan" ? " Retry transport removed repeated wording but retained every confirmed decision and balanced evidence from every source section. Do not omit a requirement merely because its wording is shorter." : ""}${body.mode === "repair" ? " For a P1 repair, canonicalMutations must be a non-empty array. Use identity.update with changes for trigger-description scope, or exact fields such as inputId plus changes, outputId plus changes, requirementId plus changes, or capabilityId plus changes; do not return prose-only advice or edits to compiler-owned projections." : ""}${body.mode === "optimize" ? " Keep the response compact: return only small CanonicalMutation objects and scripts/assets implementation bytes." : ""}${body.mode === "build" ? " Keep the entire JSON response compact enough to finish: generate 10-12 high-value eval cases, remove repeated prose, and create only files required by the approved capability plan. Prefer a complete concise bundle over an expansive truncated bundle." : ""}`,
+                : `${user}\n\nThe previous attempt did not finish correctly. Return one complete valid JSON object now. Escape every backslash inside string values and do not use Markdown fences.${body.mode === "blueprint-foundation" || body.mode === "blueprint-plan" ? " Retry transport removed repeated wording but retained every confirmed decision and balanced evidence from every source section. Do not omit a requirement merely because its wording is shorter." : ""}${body.mode === "repair" ? " For a P1 repair, canonicalMutations must be a non-empty array. Use identity.update with changes for trigger-description scope, or exact fields such as inputId plus changes, outputId plus changes, requirementId plus changes, or capabilityId plus changes; do not return prose-only advice or edits to compiler-owned projections." : ""}${body.mode === "optimize" ? " Keep the response compact: return only small CanonicalMutation objects and scripts/assets implementation bytes." : ""}${body.mode === "build" ? " Keep the JSON concise but complete. Follow the original output scope; do not regenerate compiler-owned files or omit approved implementation resources." : ""}`,
             },
           ],
           temperature: attempt === 2 || body.mode === "evaluate" ? 0.15 : 0.35,
           max_tokens: attemptOutputTokenBudget(body.mode, attempt, retryReason),
           response_format: { type: "json_object" },
         };
-        if (streamRequested) requestBody.stream = true;
+        if (streamRequested) {
+          requestBody.stream = true;
+          if (generationBudget && provider !== "compatible") requestBody.stream_options = { include_usage: true };
+        }
 
         // DeepSeek V4 enables thinking by default. This app needs the final JSON,
         // while reasoning tokens can consume the budget and leave content empty.
@@ -1168,8 +1189,13 @@ export async function POST(request: Request) {
             }
           });
         } catch (error) {
+          if (request.signal.aborted) throw error;
+          if (error instanceof IncompleteCompletionStreamError && attempt === 1) {
+            retryReason = "incomplete-stream";
+            continue;
+          }
           if (error instanceof Error && error.name === "AbortError" && attempt === 1 && canRetryAfterTimeout(body.mode)) {
-            retryReason = `timeout-after-${attemptTimeoutMs}ms`;
+            retryReason = `timeout-${timeoutKind}-after-${timeoutKind === "total" ? generationBudget?.totalMs : attemptTimeoutMs}ms`;
             continue;
           }
           if (isRetryableNetworkFailure(error) && attempt === 1 && canRetryAfterTimeout(body.mode)) {
@@ -1185,12 +1211,14 @@ export async function POST(request: Request) {
               elapsedMs: Date.now() - startedAt,
               provider,
               model,
-              reason: `attempt budget ${attemptTimeoutMs}ms exhausted`,
+              reason: `${timeoutKind} budget ${timeoutKind === "total" ? generationBudget?.totalMs : attemptTimeoutMs}ms exhausted`,
             }, tenant.tenantId);
           }
           throw error;
         } finally {
           clearTimeout(timeout);
+          clearTimeout(hardTimeout);
+          request.signal.removeEventListener("abort", abortFromCaller);
         }
         if (!upstream.ok) {
           let message = `模型服务返回 ${upstream.status}`;
@@ -1209,7 +1237,8 @@ export async function POST(request: Request) {
             retryReason = `upstream-status-${upstream.status}`;
             continue;
           }
-          return Response.json({ error: message.slice(0, 300), requestId }, { status: 502 });
+          const accountFailure = providerAccountFailure(upstream.status, message);
+          return Response.json({ error: message.slice(0, 300), ...accountFailure, upstreamStatus: upstream.status, requestId }, { status: 502 });
         }
 
         let data: CompletionResponse;
@@ -1237,10 +1266,10 @@ export async function POST(request: Request) {
           writeAiDiagnostic("warn", { event: "ai_output_truncated", requestId, mode: body.mode, attempt, outputChars: content.length, promptTokens: data.usage?.prompt_tokens, completionTokens: data.usage?.completion_tokens, reason: "finish=length; split only the failed knowledge batch; no identical retry" }, tenant.tenantId);
           return Response.json({ error: "本批专业规则达到输出上限；已保留来源，将拆小当前批次", code: "AI_OUTPUT_TRUNCATED", requestId, usage: blueprintUsage }, { status: 502 });
         }
-        if (choice?.finish_reason === "length" && ["blueprint", "blueprint-plan", "blueprint-foundation", "blueprint-capabilities", "blueprint-workflow", "preview", "workflow-repair"].includes(body.mode)) {
+        if (choice?.finish_reason === "length") {
           writeAiDiagnostic("warn", { event: "ai_output_truncated", requestId, mode: body.mode, attempt, elapsedMs: Date.now() - startedAt, outputChars: content.length, promptTokens: data.usage?.prompt_tokens, completionTokens: data.usage?.completion_tokens, reason: `finish=length; outputBudget=${requestBody.max_tokens}; ${splitBlueprint && attempt === 1 ? "retry with bounded larger output ceiling" : "no further retry"}` }, tenant.tenantId);
           if (splitBlueprint && attempt === 1) { retryReason = "output-limit-recovery"; continue; }
-          const label = ({ "blueprint-foundation": "需求整理", "blueprint-capabilities": "能力与交付规划", "blueprint-workflow": "工作流与循环规划", "blueprint-plan": "蓝图规划", "preview": "预演理解", "workflow-repair": "工作流连线修复" } as Record<string, string>)[body.mode] || "蓝图生成";
+          const label = ({ "blueprint-foundation": "需求整理", "blueprint-capabilities": "能力与交付规划", "blueprint-workflow": "工作流与循环规划", "blueprint-plan": "蓝图规划", "preview": "预演理解", "workflow-repair": "工作流连线修复", build: "Skill 生成", repair: "生成修复" } as Record<string, string>)[body.mode] || "当前步骤";
           return Response.json({ error: `${label}达到模型输出上限，被截断（finish=length）；不是回答格式错误。已保留此前完成的阶段，请重试当前步骤；若重复出现，请换用支持更长输出的模型`, code: "AI_OUTPUT_TRUNCATED", mode: body.mode, requestId,
             usage: splitBlueprint ? blueprintUsage : { promptTokens: data.usage?.prompt_tokens ?? Math.ceil((system.length + user.length) / 3.4), completionTokens: data.usage?.completion_tokens ?? Math.ceil(content.length / 3.4), estimated: data.usage?.prompt_tokens == null || data.usage?.completion_tokens == null },
           }, { status: 502 });
@@ -1391,10 +1420,14 @@ export async function POST(request: Request) {
     }
     return Response.json({ error: "模型请求没有完成，请重试当前步骤", requestId }, { status: 502 });
   } catch (error) {
+    if (error instanceof IncompleteCompletionStreamError) {
+      writeAiDiagnostic("error", { event: "ai_request_exception", requestId, mode: modeForLog, elapsedMs: Date.now() - startedAt, reason: "incomplete-stream" }, tenant.tenantId);
+      return Response.json({ error: error.message, code: "AI_STREAM_INCOMPLETE", requestId }, { status: 502 });
+    }
     const networkFailure = isRetryableNetworkFailure(error);
     const message = error instanceof Error
       ? error.name === "AbortError"
-        ? "模型连续两次都没有及时完成；已保留全部确认项并压缩重复上下文重试，当前内容仍已保留"
+        ? "模型响应停滞或超过本步骤的总时长上限；已停止请求，当前回答与已完成内容仍已保留。请重试当前步骤或检查模型服务状态"
         : networkFailure
           ? "上游模型连接连续中断；系统已使用保留全部确认项的精简上下文重试，当前内容仍已保留"
           : error.message

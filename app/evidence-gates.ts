@@ -408,7 +408,7 @@ export function deriveScopeProvenance(skill: string, evidence: string) {
 }
 
 export function hardNegativePrompts(idea: string) {
-  const task = idea.trim().slice(0, 80) || "当前任务";
+  const task = idea.trim() || "当前任务";
   return [
     `解释“${task}”通常有哪些方法，只做方法分析，不执行该任务。`,
     `只检查一份与“${task}”相关的已有结果，指出问题但不要重做成品。`,
@@ -418,7 +418,7 @@ export function hardNegativePrompts(idea: string) {
 }
 
 export function realisticFailureFixtures(idea: string, options: { allowFactualCreation?: boolean; explicitRestriction?: boolean } = {}) {
-  const task = idea.trim().slice(0, 100) || "当前任务";
+  const task = idea.trim() || "当前任务";
   if (options.allowFactualCreation) return [{
     id: "grounding-explicit-creation-permission",
     prompt: `请完成“${task}”。我只提供了部分信息，并且已经明确允许你在确认的范围内主动补写和新增内容。`,

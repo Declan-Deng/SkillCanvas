@@ -39,6 +39,7 @@ export function reconcileHostCapabilityAliases<T extends HostCapability>(
     items: [...groups].map(([id, entries]) => ({ ...(entries.find((item) => item.id === id) || entries[0]), id })),
     workflowSteps: workflowSteps.map((step) => ({ ...step,
       capabilityIds: [...new Set(step.capabilityIds.map((id) => aliases.get(id) || id))],
+      ...(step.availableCapabilityIds ? { availableCapabilityIds: [...new Set(step.availableCapabilityIds.map((id) => aliases.get(id) || id))] } : {}),
     })),
   };
 }

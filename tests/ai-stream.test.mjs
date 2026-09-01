@@ -25,7 +25,7 @@ test("compatible SSE chunks are reconstructed without losing JSON whitespace", a
   assert.equal(parsed.choices[0].message.reasoning_content, "private");
   assert.equal(parsed.choices[0].finish_reason, "stop");
   assert.equal(parsed.usage.completion_tokens, 9);
-  assert.equal(progress, chunks.length);
+  assert.equal(progress, 3, "DONE and keepalives are not generation progress");
 });
 
 test("non-SSE responses pass through unchanged", async () => {

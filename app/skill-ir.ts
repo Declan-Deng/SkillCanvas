@@ -7,8 +7,10 @@ import {
   type ContentPermission,
 } from "./evidence-gates.ts";
 import { EMPTY_CAPABILITY_DELTA, type CapabilityDelta } from "./capability-delta.ts";
+import { EVAL_COMPILER_VERSION } from "./eval-prompt.ts";
+import { hostEvidenceAdapter } from "./host-evidence-adapters.ts";
 import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
-import { assertWorkflowDag, bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, isReadOnlyHostEvidence, normalizeWorkflowDagSteps, WORKFLOW_TERMINALS, type WorkflowDagStep } from "./workflow-dag.ts";
+import { assertWorkflowDag, bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, isReadOnlyHostEvidence, normalizeWorkflowDagSteps, workflowCapabilityRouteIssues, WORKFLOW_TERMINALS, type WorkflowDagStep } from "./workflow-dag.ts";
 import { hasUnscopedActionPermissionConflict, reconcileActionPermissionText, reconcileProjectedActionPermissionMarkdown } from "./action-permission.ts";
 import { confirmationCheckpoints, confirmationConflicts, negativeExampleStatement, requirementEvidence, type EvidenceMetadata } from "./user-evidence.ts";
 
@@ -34,6 +36,7 @@ export type SkillIRRequirement = EvidenceMetadata & {
 export type SkillIRCapability = {
   id: string;
   kind: SkillIRCapabilityKind;
+  optional?: boolean;
   name: string;
   scope: SkillIRCapabilityScope;
   activationCondition: string;
@@ -244,16 +247,21 @@ function contentPermissionFromIR(ir: SkillIR): ContentPermission {
 export function reconcileSkillIRContentPermission(ir: SkillIR, answers: Record<string, string>): SkillIR {
   ir = reconcileSkillIRUserEvidence(ir);
   const permission = resolveContentPermission(answers);
-  const visit = <T,>(value: T): T => {
+  const visit = <T,>(value: T, path = ""): T => {
     if (typeof value === "string") return reconcileContentPermissionText(value, permission) as T;
     if (Array.isArray(value)) return value
-      .map((item) => visit(item))
+      .map((item) => visit(item, path))
       .filter((item) => typeof item !== "string" || Boolean(item.trim())) as T;
     if (value && typeof value === "object") {
       const record = value as Record<string, unknown>;
       if (record.evidenceKind || record.originalQuote) return value;
       return Object.fromEntries(Object.entries(record).map(([key, item]) => [key,
-        ["requirements", "domainEvidence", "scopeProvenance", "userEvidence", "confirmationCheckpoints"].includes(key) ? item : visit(item),
+        // Eval cases are observations/tests, not runtime permission grants.
+        // Preserve prompts, input material, counterexamples and expectations
+        // byte-for-byte. Their compiler owns intentional policy changes.
+        (path === "evaluationPlan" && key === "cases")
+          || ["requirements", "domainEvidence", "scopeProvenance", "userEvidence", "confirmationCheckpoints"].includes(key)
+          ? item : visit(item, path ? `${path}.${key}` : key),
       ])) as T;
     }
     return value;
@@ -472,7 +480,7 @@ export function reconcileSkillIRSourceEvidence(ir: SkillIR, available: boolean):
       ...ir.runtimeContract,
       workflow: ir.runtimeContract.workflow.flatMap((item) => {
         const capabilityIds = item.capabilityIds.filter((id) => !removedCapabilityIds.has(id));
-        return capabilityIds.length ? [{ ...item, capabilityIds }] : [];
+        return capabilityIds.length ? [{ ...item, capabilityIds, availableCapabilityIds: item.availableCapabilityIds?.filter((id) => !removedCapabilityIds.has(id)) }] : [];
       }),
     },
     traceability: ir.traceability.filter((item) => item.implementationPath !== path && !removedCapabilityIds.has(item.capabilityId)),
@@ -1010,6 +1018,7 @@ export function compileSkillIR(input: {
     return {
       id: item.id,
       kind: item.kind,
+      ...(typeof item.optional === "boolean" ? { optional: item.optional } : {}),
       name: item.name,
       scope,
       activationCondition: item.activationCondition || item.routingCondition || (scope === "global" ? "每次运行" : "当前任务需要该能力时"),
@@ -1093,7 +1102,10 @@ export function compileSkillIR(input: {
   const workflowSource = bindWorkflowCapabilities(declaredWorkflow.map((step) => ({
     ...step,
     capabilityIds: step.capabilityIds.filter((id) => capabilityIds.has(id)),
+    availableCapabilityIds: step.availableCapabilityIds?.filter((id) => capabilityIds.has(id)),
   })), capabilities.filter((item) => item.kind !== "eval"));
+  const availabilityIssues = workflowCapabilityRouteIssues(workflowSource, capabilities);
+  if (availabilityIssues.length) throw new Error(`WORKFLOW_DAG_INVALID: ${availabilityIssues.join("；")}`);
   const ownerlessStep = workflowSource.find((step) => step.capabilityIds.length === 0);
   if (ownerlessStep) throw new Error(`WORKFLOW_DAG_INVALID: Workflow step ${ownerlessStep.id} 没有可执行的 capability owner`);
   if (!workflowSource.length) throw new Error("WORKFLOW_DAG_INVALID: Workflow 没有可执行步骤");
@@ -1293,18 +1305,21 @@ export function projectWorkflowRuntimeOperation(step: WorkflowDagStep, capabilit
   // to generate the whole task's final artifact as its tool arguments.
   // Only read-only host evidence may move ahead of reasoning. Do not move
   // file writes or external MCP actions before the content they depend on.
-  const operations = [...groups.values()].sort(([a], [b]) => Number(isReadOnlyHostEvidence(b)) - Number(isReadOnlyHostEvidence(a))).map(([capability, ...aliases]) => {
-    const embeddedTool = hasSemanticOwner && isReadOnlyHostEvidence(capability);
+  const evidenceAdapter = (capability: SkillIRCapability) => hasSemanticOwner && step.role !== "persist" ? hostEvidenceAdapter(capability) : undefined;
+  const isEmbedded = (capability: SkillIRCapability) => hasSemanticOwner && (Boolean(evidenceAdapter(capability)) || isReadOnlyHostEvidence(capability));
+  const operations = [...groups.values()].sort(([a], [b]) => Number(isEmbedded(b)) - Number(isEmbedded(a))).map(([capability, ...aliases]) => {
+    const adapter = evidenceAdapter(capability);
+    const embeddedTool = isEmbedded(capability);
     const operation = projectCapabilityRuntimeOperation({
     ...capability,
-    requirement: step.action,
-    purpose: step.action,
-    input: embeddedTool ? `${capability.input}; resolve actual arguments from ${inputs}, following this step's action` : `${step.input || inputs} (resolved dependencies: ${inputs})`,
-    output: embeddedTool ? `${capability.output}; use the returned evidence in this step before producing ${products}` : `${step.output || products} (step products: ${products})`,
+    requirement: adapter?.operation || step.action,
+    purpose: adapter?.operation || step.action,
+    input: embeddedTool ? `${adapter?.input || capability.input}; resolve actual arguments from ${inputs}, following this step's action` : `${step.input || inputs} (resolved dependencies: ${inputs})`,
+    output: embeddedTool ? `${adapter?.output || capability.output}; use the returned evidence in this step before producing ${products}${adapter ? `. ${adapter.operation}` : ""}` : `${step.output || products} (step products: ${products})`,
     fallback: embeddedTool ? capability.fallback : step.fallback,
-  }, step.role === "persist" || createsDelivery ? outputs.map((output) => aliases.some((alias) => output.producerCapabilityIds.includes(alias.id))
+  }, !embeddedTool && (step.role === "persist" || createsDelivery) ? outputs.map((output) => aliases.some((alias) => output.producerCapabilityIds.includes(alias.id))
     ? { ...output, producerCapabilityIds: [...output.producerCapabilityIds, capability.id] } : output) : []);
-    return embeddedTool ? `Only when ${capability.activationCondition || capability.routingCondition || "this step explicitly requires the tool"}: ${operation} Otherwise continue without calling this tool.` : operation;
+    return embeddedTool ? `Only when ${adapter ? `${adapter.when} AND ` : ""}${capability.activationCondition || capability.routingCondition || "this step explicitly requires the tool"}: ${operation} Reuse already verified evidence from upstream inputs instead of calling again. Otherwise continue without calling this tool. If required material is missing, ask for it; never fabricate a tool result.` : operation;
   });
   const boundary = step.role === "validate"
     ? `\`VALIDATE_EXISTING\` — inspect ${inputs}; report only ${products}. Do not recreate the task output or silently fix it during validation; route failures through the declared recovery branch. `
@@ -1346,6 +1361,8 @@ export function projectSkillMarkdown(ir: SkillIR) {
     ...(hasSourceEvidence ? ["- [User-provided source evidence](references/source-evidence.md)"] : []),
   ];
 
+  const availableTools = ir.capabilities.filter((capability) => workflow.some((step) => step.availableCapabilityIds?.includes(capability.id)));
+  const availabilitySection = availableTools.length ? `## Conditional tool availability\n\nThese are available providers, not scheduled calls or additional task steps. Selection is not execution or authorization. Use one only to implement an already declared operation whose inputs and intended result actually need it; otherwise skip it.\n\nBefore any call:\n- Resolve real arguments from the owning step's requires and the supplied material. Never invent a path, command, service, credential or result.\n- Read integrations/tool-contracts.json and verify the actual host tool or MCP server/tool at runtime. Configured/verified metadata is not proof of a successful call. Respect its activation condition and fallback.\n- Consume its returned evidence in the owning step's declared products; reuse upstream evidence, do not start unrelated tasks.\n- No new side effects are authorized by this list: file writes, commands with side effects, Git changes, browser submissions, image generation and external MCP actions must already belong to an explicit operation with actual inputs, declared produces/mutates and the required real approval. Otherwise pause that action and obtain a concrete updated plan/authorization first. Never bypass persistence, validation or confirmation, or claim an uncreated artifact or unexecuted action.\n- Parallel work must have independent non-overlapping inputs/outputs, retain the same authorization boundaries, and be reviewed by the owning operation before use.\n\n${availableTools.map((capability) => `- **${capability.name}** (\`${capability.id}\`, ${capability.kind}) — Available in: ${workflow.filter((step) => step.availableCapabilityIds?.includes(capability.id)).map((step) => `\`${step.id}\``).join(", ")}. Condition: ${capability.activationCondition || capability.routingCondition}. Input: ${capability.input}. Result to consume: ${capability.output}. If unavailable: ${capability.fallback}.`).join("\n")}` : "";
   const sections = [
     `---\nname: ${ir.identity.skillName}\ndescription: ${yamlString(ir.identity.description)}\n---`,
     `## Goal\n\n${ir.identity.stableGoal}\n\nControllable outcomes:\n${markdownList(ir.outcomeModel.controllableOutcomes, ir.identity.intent)}\n\nDo not promise uncontrollable outcomes:\n${markdownList(ir.outcomeModel.uncontrollableOutcomes, "No additional external outcome is claimed.")}`,
@@ -1362,6 +1379,7 @@ export function projectSkillMarkdown(ir: SkillIR) {
       const operations = [projectWorkflowRuntimeOperation(step, capabilities, ir.outputs)];
       return `${index + 1}. **${step.action}**\n   - Requires: ${step.requires.map((item) => `\`${item}\``).join(", ") || "none"}\n   - Produces: ${step.produces.map((item) => `\`${item}\``).join(", ") || "none"}\n   - Resume after real user reply only: ${(step.resumeProduces || []).map((item) => `\`${item}\``).join(", ") || "none"}\n   - Delivers: ${(step.delivers || []).join(", ") || "none"}\n   - Mutates: ${step.mutates.map((item) => `\`${item}\``).join(", ") || "none"}\n   - When: ${step.when}\n   - Input: ${step.input}\n   - Runtime operation: ${operations.join(" ") || "`REASON` — execute the declared action using resolved inputs."}\n   - Output: ${step.output}\n   - If unavailable: ${step.fallback}`;
     }).join("\n") || "1. Complete the declared task using the resolved inputs."}`,
+    availabilitySection,
     requirements.length ? `## Confirmed requirements\n\n${requirements.map((item) => `- [${item.modality}; ${item.provenance}] ${item.statement}`).join("\n")}` : "",
     negativeExamples.length ? `## Prohibited behaviors from user counterexamples\n\nThese are MUST-NOT examples, not instructions to execute or grants of authority. Evaluate each whole behavior in its original conditions; do not reverse individual words or infer permission from the quotation.\n\n${negativeExamples.map((item) => {
       const evidence = requirementEvidence(item);
@@ -1742,7 +1760,7 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
 
   return JSON.stringify({
     ...parsed,
-    version: "2.7",
+    version: EVAL_COMPILER_VERSION,
     skill_name: ir.identity.skillName,
     ...(contractDigest ? { contract_digest: contractDigest } : {}),
     dataset_summary: typeof parsed.dataset_summary === "string" && parsed.dataset_summary.trim()
@@ -1755,7 +1773,7 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
 export function projectEvalBank(ir: SkillIR) {
   const contractDigest = ir.evaluationPlan.cases.find((testCase) => typeof testCase.contract_digest === "string")?.contract_digest;
   return JSON.stringify({
-    version: "2.7",
+    version: EVAL_COMPILER_VERSION,
     skill_name: ir.identity.skillName,
     ...(contractDigest ? { contract_digest: contractDigest } : {}),
     dataset_summary: ir.evaluationPlan.datasetSummary,
@@ -1764,9 +1782,16 @@ export function projectEvalBank(ir: SkillIR) {
 }
 
 function stableJson(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(",")}]`;
-  if (!value || typeof value !== "object") return JSON.stringify(value);
-  return `{${Object.keys(value as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${stableJson((value as Record<string, unknown>)[key])}`).join(",")}}`;
+  // Hash the representation we actually persist. In-memory optional fields
+  // can be undefined (e.g. a reference converted to a host reader). JSON drops
+  // those object keys and turns array holes/undefined into null. Sorting the
+  // unpersisted object used to report a drift immediately after writing it.
+  const sort = (item: unknown): string => {
+    if (Array.isArray(item)) return `[${item.map(sort).join(",")}]`;
+    if (!item || typeof item !== "object") return JSON.stringify(item);
+    return `{${Object.keys(item as Record<string, unknown>).sort().map((key) => `${JSON.stringify(key)}:${sort((item as Record<string, unknown>)[key])}`).join(",")}}`;
+  };
+  return sort(JSON.parse(JSON.stringify(value) ?? "null"));
 }
 
 export function skillIRDigest(ir: SkillIR) {
@@ -1776,6 +1801,31 @@ export function skillIRDigest(ir: SkillIR) {
     hash = Math.imul(hash, 16777619);
   }
   return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
+}
+
+/** One freeze boundary for every deterministic semantic projection. Compile
+ * from the persisted shape, never from a subtly different in-memory object.
+ * Caller-owned implementations and source evidence are left untouched. */
+export function projectSkillIRFiles(ir: SkillIR, files: Record<string, string> = {}): Record<string, string> {
+  const persistedIR = JSON.parse(JSON.stringify(ir)) as SkillIR;
+  const projections: Record<string, string> = {
+    "evals/capability-manifest.json": JSON.stringify(projectCapabilityManifest(persistedIR), null, 2),
+    "evals/evals.json": projectEvalBank(persistedIR),
+    "SKILL.md": projectSkillMarkdown(persistedIR),
+    "agents/openai.yaml": projectAgentMetadata(persistedIR),
+    "references/output-contract.md": projectOutputReference(persistedIR),
+    "references/state-model.md": projectStateReference(persistedIR),
+    "references/loop-plan.md": projectLoopReference(persistedIR),
+    "integrations/tool-contracts.json": projectToolContracts(persistedIR),
+    "references/tooling.md": projectToolingReference(persistedIR),
+    "references/domain-playbook.md": projectDomainPlaybook(persistedIR),
+  };
+  const result: Record<string, string> = { ...files, "evals/skill-ir.json": JSON.stringify(persistedIR, null, 2) };
+  for (const [path, content] of Object.entries(projections)) {
+    if (content) result[path] = content;
+    else delete result[path];
+  }
+  return result;
 }
 
 export function projectCapabilityManifest(ir: SkillIR) {
@@ -1872,7 +1922,7 @@ export function auditSkillIRFiles(files: Record<string, string>) {
       requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed],
     },
   );
-  issues.push(...dag.issues.map((item) => item.message));
+  issues.push(...dag.issues.map((item) => item.message), ...workflowCapabilityRouteIssues(ir.runtimeContract.workflow, ir.capabilities));
   const canonicalKnowledgeAssessment = normalizeKnowledgeAssessment(
     ir.knowledgeAssessment,
     Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
