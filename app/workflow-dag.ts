@@ -126,8 +126,40 @@ export function closeWorkflowDagTerminals(steps: WorkflowDagStep[], _initialInpu
   });
 }
 
-type RoutableCapability = { id: string; kind: string; input: string; output: string; requirement?: string; purpose?: string; activationCondition?: string; routingCondition?: string; fallback: string; affects?: string[]; optional?: boolean; scope?: string };
+type RoutableCapability = { id: string; kind: string; name?: string; input: string; output: string; requirement?: string; purpose?: string; activationCondition?: string; routingCondition?: string; fallback: string; affects?: string[]; optional?: boolean; scope?: string };
 const label = (text: string) => text.replace(/[\s`*_，,；;：:。.!！]/g, "").toLowerCase();
+
+function ownerMatchScore(step: WorkflowDagStep, capability: RoutableCapability) {
+  const stepText = `${step.id} ${step.action} ${step.input} ${step.output}`.toLowerCase();
+  const capabilityText = `${capability.id} ${capability.name || ""} ${capability.requirement || ""} ${capability.purpose || ""} ${capability.input} ${capability.output}`.toLowerCase();
+  const words = capabilityText.match(/[a-z0-9]{3,}|[\u4e00-\u9fff]{2,8}/g) || [];
+  return words.reduce((score, word) => score + (stepText.includes(word) ? Math.min(8, word.length) : 0), 0);
+}
+
+/** A model may omit an owner or name one that a later necessity gate removes.
+ * Rebind the operation from real graph neighbours and enabled semantic
+ * capabilities. Ambiguous ties keep all matching semantic owners instead of
+ * inventing a capability id or deleting the operation. */
+export function bindOwnerlessWorkflowSteps(steps: WorkflowDagStep[], capabilities: RoutableCapability[]) {
+  const enabledIds = new Set(capabilities.map((item) => item.id));
+  const semantic = capabilities.filter((item) => item.kind === "llm");
+  if (!semantic.length) return steps;
+  return steps.map((step) => {
+    const existing = step.capabilityIds.filter((id) => enabledIds.has(id));
+    if (existing.length) return { ...step, capabilityIds: existing };
+    const connected = steps.filter((other) => other.id !== step.id && (
+      other.produces.some((token) => step.requires.includes(token))
+      || step.produces.some((token) => other.requires.includes(token))
+    ));
+    const neighbourIds = new Set(connected.flatMap((other) => other.capabilityIds));
+    const neighbourOwners = semantic.filter((item) => neighbourIds.has(item.id));
+    const pool = neighbourOwners.length ? neighbourOwners : semantic;
+    const scored = pool.map((item) => ({ item, score: ownerMatchScore(step, item) }));
+    const best = Math.max(...scored.map((item) => item.score));
+    const selected = best > 0 ? scored.filter((item) => item.score === best).map((item) => item.item) : pool;
+    return { ...step, capabilityIds: selected.map((item) => item.id) };
+  });
+}
 
 export function isOptionalToolAvailability(capability: RoutableCapability) {
   return ["builtin-tool", "mcp"].includes(capability.kind)
@@ -278,7 +310,7 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
     });
     folded.add(helper.id);
   }
-  return steps.filter((step) => !folded.has(step.id));
+  return bindOwnerlessWorkflowSteps(steps.filter((step) => !folded.has(step.id)), capabilities);
 }
 
 /** Compile a real DAG. Dependencies may be satisfied only by declared initial

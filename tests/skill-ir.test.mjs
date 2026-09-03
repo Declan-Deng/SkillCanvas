@@ -17,6 +17,7 @@ import {
   projectDomainPlaybook,
   projectWorkflowRuntimeOperation,
   projectEvalBank,
+  projectSkillIRFiles,
   projectSkillMarkdown,
   projectToolContracts,
   reconcileSkillIRActionPermissions,
@@ -24,6 +25,7 @@ import {
   reconcileSkillIRInputResolutions,
   reconcileSkillIRSourceEvidence,
 } from "../app/skill-ir.ts";
+import { auditCapabilityClosure } from "../app/generation-loop-core.ts";
 import {
   applySkillIRMutations,
   normalizeCanonicalMutations,
@@ -174,7 +176,7 @@ test("Canonical SkillIR compilation blocks a workflow with unmet artifact depend
   }), /WORKFLOW_DAG_INVALID.*resume-record/);
 });
 
-test("Canonical SkillIR compilation blocks workflow steps without an active capability owner", () => {
+test("Canonical SkillIR compilation rebinds a retained operation whose prior owner was filtered out", () => {
   const plan = fixturePlan();
   plan.workflowSteps = [{
     id: "orphan-step",
@@ -187,15 +189,29 @@ test("Canonical SkillIR compilation blocks workflow steps without an active capa
     requires: ["$request"],
     produces: ["orphan-output"],
     mutates: [],
+  }, {
+    id: "deliver-result",
+    capabilityIds: ["core-resume"],
+    role: "deliver",
+    when: "after validation",
+    input: "checked result",
+    action: "deliver the checked result",
+    output: "final result",
+    fallback: "stop",
+    requires: ["orphan-output"],
+    produces: ["$output"],
+    delivers: ["orphan-output"],
+    mutates: [],
   }];
-  assert.throws(() => compileSkillIR({
+  const ir = compileSkillIR({
     skillName: "orphan-workflow",
     idea: "根据 JD 修改简历",
     answers: { inputs: "目标 JD；真实经历" },
     plan,
     loop: { mode: "hybrid", goal: "交付岗位匹配的简历", maxRounds: 3, stopConditions: [], escalationConditions: [], scopes: [] },
     requirements: [{ id: "goal", requirement: "根据 JD 修改简历", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
-  }), /WORKFLOW_DAG_INVALID.*capability owner/);
+  });
+  assert.deepEqual(ir.runtimeContract.workflow.find((step) => step.id === "orphan-step")?.capabilityIds, ["core-resume"]);
 });
 
 test("Canonical SkillIR preserves an input-required branch beside the productive path", () => {
@@ -805,7 +821,12 @@ test("search and passive assets cannot impersonate a file producer", () => {
 test("Eval bindings and manifest are projections of the same SkillIR", () => {
   const evalText = JSON.stringify({ evals: [
     { id: "trigger-1", eval_family: "trigger", capability_ids: [] },
-    { id: "core-1", eval_family: "capability", capability_ids: ["core-resume"] },
+    {
+      id: "core-1", eval_family: "capability", category: "core_capability", capability_ids: ["core-resume"],
+      prompt: "请根据完整的目标岗位说明与候选人真实经历，生成一份可以直接核对的岗位定制简历内容。",
+      context: { fixture_status: "ready" }, expected: { behaviors: ["交付岗位定制简历内容"], artifacts: [] },
+      graders: ["core_capability"], runnable: true,
+    },
   ] });
   const ir = bindSkillIREvals(compile(), evalText);
   const manifest = projectCapabilityManifest(ir);
@@ -855,6 +876,86 @@ test("canonical eval compiler deterministically closes every active capability a
   assert.equal(domainCase?.prompt, "这是一个包含目标岗位要求和候选人经历的真实简历改写任务，请产出可以直接使用的改写结果。");
   const bound = bindSkillIREvals(ir, covered);
   assert.deepEqual(bound.capabilities.find((item) => item.id === domainCapability.id)?.evalCaseIds, [domainCase.id]);
+});
+
+test("canonical eval compiler does not accept an unfocused optional tool case as coverage", () => {
+  const ir = compile();
+  const shellCapability = {
+    ...structuredClone(ir.capabilities[0]),
+    id: "host-shell-code",
+    kind: "builtin-tool",
+    name: "Terminal execution",
+    scope: "optional",
+    activationCondition: "Only when deterministic local execution is required and the host exposes a terminal",
+    routingCondition: "Use only for deterministic local execution",
+    input: "validated command and working directory",
+    output: "command receipt and observable output",
+    implementation: { path: "integrations/host-shell-code.md", layer: "runtime", status: "requires-setup" },
+    connection: undefined,
+  };
+  ir.capabilities.push(shellCapability);
+  ir.tasks[0].capabilityIds.push(shellCapability.id);
+  const seed = JSON.stringify({ evals: [
+    { id: "trigger-explicit", eval_family: "trigger", category: "trigger_explicit", should_trigger: true, capability_ids: [], prompt: "请使用这个 Skill，根据完整的目标岗位说明和候选人经历，生成一份可以直接核对的岗位定制简历。" },
+    { id: "trigger-implicit", eval_family: "trigger", category: "trigger_implicit", should_trigger: true, capability_ids: [], prompt: "我已经给出目标岗位和完整经历，请按照我们确认的规则继续处理并交付可检查结果。" },
+    { id: "trigger-context", eval_family: "trigger", category: "trigger_context", should_trigger: true, capability_ids: [], prompt: "继续处理下一份新材料，沿用任务目标但重新核对其中的事实与岗位要求。" },
+    { id: "trigger-negative", eval_family: "trigger", category: "trigger_negative", should_trigger: false, capability_ids: [], prompt: "只解释岗位定制简历通常包含哪些部分，不要替我生成或修改任何内容。" },
+    {
+      id: "core-resume", eval_family: "capability", category: "core_capability", should_trigger: true,
+      capability_ids: ["core-resume"], graders: ["core_capability"], runnable: true,
+      prompt: "目标岗位要求 Python、SQL 和检索增强生成经验；候选人经历包含相关项目和可核验的业务结果。请据此生成岗位定制简历。",
+      context: { fixture_status: "ready" }, expected: { behaviors: ["交付岗位定制简历"], artifacts: [] },
+    },
+    {
+      id: "unfocused-shell", eval_family: "integration", category: "core_capability", should_trigger: true,
+      capability_ids: ["host-shell-code"], graders: ["integration"], runnable: true,
+      prompt: "使用现有材料完成岗位定制简历，并确保最终内容可以核对。",
+      context: { fixture_status: "ready" }, expected: { behaviors: ["交付结果"], artifacts: [] },
+    },
+  ] });
+
+  const covered = ensureSkillIREvalCoverage(ir, seed);
+  const parsed = JSON.parse(covered);
+  const focused = parsed.evals.filter((item) => item.capability_ids?.includes(shellCapability.id)
+    && item.context && Object.keys(item.context).some((key) => /activ|tool|integration|routing|scope/i.test(key)));
+  assert.equal(focused.length, 1);
+  const bound = bindSkillIREvals(ir, covered);
+  assert.deepEqual(bound.capabilities.find((item) => item.id === shellCapability.id)?.evalCaseIds, [focused[0].id]);
+  const files = projectSkillIRFiles(bound);
+  assert.ok(!auditCapabilityClosure(files).issues.some((issue) => issue.type === "missing-eval" && issue.capabilityId === shellCapability.id));
+});
+
+test("canonical eval compiler preserves a runnable failure-mode episode", () => {
+  const ir = compile();
+  const seed = JSON.stringify({ evals: [
+    { id: "trigger-explicit", eval_family: "trigger", category: "trigger_explicit", should_trigger: true, capability_ids: [], prompt: "请使用这个 Skill，根据完整的目标岗位说明和候选人经历，生成一份可以直接核对的岗位定制简历。" },
+    { id: "trigger-implicit", eval_family: "trigger", category: "trigger_implicit", should_trigger: true, capability_ids: [], prompt: "我已经给出目标岗位和完整经历，请按照我们确认的规则继续处理并交付可检查结果。" },
+    { id: "trigger-context", eval_family: "trigger", category: "trigger_context", should_trigger: true, capability_ids: [], prompt: "继续处理下一份新材料，沿用任务目标但重新核对其中的事实与岗位要求。" },
+    { id: "trigger-negative", eval_family: "trigger", category: "trigger_negative", should_trigger: false, capability_ids: [], prompt: "只解释岗位定制简历通常包含哪些部分，不要替我生成或修改任何内容。" },
+    {
+      id: "core-resume", eval_family: "capability", category: "core_capability", should_trigger: true,
+      capability_ids: ["core-resume"], graders: ["core_capability"], runnable: true,
+      prompt: "目标岗位要求 Python、SQL 和检索增强生成经验；候选人经历包含相关项目和可核验的业务结果。请据此生成岗位定制简历。",
+      context: { fixture_status: "ready" }, expected: { behaviors: ["交付岗位定制简历"], artifacts: [] },
+    },
+  ] });
+  const parsed = JSON.parse(ensureSkillIREvalCoverage(ir, seed));
+  const failure = parsed.evals.find((item) => item.category === "failure_mode" && item.runnable !== false);
+  assert.ok(failure);
+  assert.ok(failure.graders.includes("failure_mode"));
+  assert.ok(failure.expected.must_not.length > 0);
+  assert.match(failure.prompt, /Python|SQL|检索增强生成/);
+});
+
+test("canonical eval compiler never turns a trigger sentence into a fake execution fixture", () => {
+  const ir = compile();
+  const seed = JSON.stringify({ evals: [
+    { id: "trigger-explicit", eval_family: "trigger", category: "trigger_explicit", should_trigger: true, capability_ids: [], prompt: "请使用这个 Skill 帮我完成当前任务，我之后会提供真正需要处理的材料和所有必要输入。" },
+  ] });
+  const parsed = JSON.parse(ensureSkillIREvalCoverage(ir, seed));
+  const generatedCore = parsed.evals.find((item) => item.capability_ids?.includes("core-resume"));
+  assert.equal(generatedCore.runnable, false);
+  assert.equal(generatedCore.context.fixture_status, "missing");
 });
 
 test("canonical eval compiler preserves all execution families when trimming to twenty cases", () => {

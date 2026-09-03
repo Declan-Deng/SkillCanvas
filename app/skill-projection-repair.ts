@@ -1,11 +1,44 @@
-import { projectSkillIRFiles, type SkillIR } from "./skill-ir.ts";
+import { normalizeKnowledgeAssessment, projectSkillIRFiles, type SkillIR } from "./skill-ir.ts";
 import type { PipelineIssue } from "./skill-pipeline-core.ts";
+import { normalizeCapabilityDelta } from "./capability-delta.ts";
 
 type ContractIssue = Pick<PipelineIssue, "type" | "evidence">;
 
 export function isSkillIRProjectionIssue(issue: ContractIssue) {
   return /\[(?:SKILL|MANIFEST|EVAL|TOOL_CONTRACT|STATE|LOOP|OUTPUT|AGENT_METADATA|DOMAIN_PLAYBOOK)_PROJECTION_DRIFT\]/.test(issue.evidence)
     || issue.evidence.includes("Capability Manifest 与 Canonical SkillIR 已漂移，需要重新编译");
+}
+
+export function isCapabilityDeltaContractIssue(issue: ContractIssue) {
+  return issue.type === "NON_DEFENSIBLE_CAPABILITY_DELTA"
+    || /\[NON_DEFENSIBLE_CAPABILITY_DELTA\]/.test(issue.evidence);
+}
+
+/** Migrate an already persisted bundle through the same Capability Delta
+ * boundary used for new builds. Invalid analysis is removed honestly and all
+ * compiler projections are rebuilt; task semantics and authored files stay.
+ */
+export function repairCapabilityDeltaContract(files: Record<string, string>) {
+  const serialized = files["evals/skill-ir.json"];
+  const ir = JSON.parse(serialized || "") as SkillIR;
+  if (ir?.schemaVersion !== "1.0" || ir.compiler !== "skillcanvas") {
+    throw new Error("无法修复 Capability Delta：缺少受支持的 Canonical SkillIR");
+  }
+  const capabilityDelta = normalizeCapabilityDelta(ir.capabilityDelta);
+  const repairedIR: SkillIR = {
+    ...ir,
+    capabilityDelta,
+    knowledgeAssessment: normalizeKnowledgeAssessment(
+      ir.knowledgeAssessment,
+      Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
+      capabilityDelta.skillMustTeach.length > 0,
+      capabilityDelta.skillMustTeach.map((gap) => gap.id),
+    ),
+  };
+  const candidate = projectSkillIRFiles(repairedIR, files);
+  const changedPaths = [...new Set([...Object.keys(files), ...Object.keys(candidate)])]
+    .filter((path) => files[path] !== candidate[path]);
+  return { files: changedPaths.length ? candidate : files, changedPaths };
 }
 
 /** Repair stale projections, NOT the architecture. Do not restore via the

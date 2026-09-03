@@ -5,8 +5,8 @@ import { repairWorkflowPlan } from "./workflow-plan-repair";
 import { interviewCompletionGate } from "./interview-completion";
 import { EVAL_COMPILER_VERSION, providerRepairNeedsUserAction } from "./eval-prompt";
 import { generationClientBudget } from "./generation-request";
-import { isSkillIRProjectionIssue, rebuildSkillIRProjections, contractRepairFailureReason } from "./skill-projection-repair";
-import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases } from "./capability-routing";
+import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract, contractRepairFailureReason } from "./skill-projection-repair";
+import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases, recommendedHostCapabilityIds } from "./capability-routing";
 import { compileKnowledgeBatches, knowledgeClientTimeout, retainKnowledgeFailure } from "./knowledge-compiler";
 import { selectKnowledgeQueries } from "./knowledge-passages";
 import { runBlueprintPlanning, type BlueprintCheckpoint } from "./blueprint-planner";
@@ -101,8 +101,10 @@ import {
   canonicalCapabilityContract,
   capabilityOwnsArtifacts,
   candidateUtility,
+  bindPatchPlanTargetIds,
   constrainPatchPlan,
   estimateDomainValueDensity,
+  contractIssueIdentity,
   makeContractIssues,
   normalizeCapabilityScope,
   normalizePatchPlan,
@@ -116,6 +118,8 @@ import {
   type PipelineIssue,
 } from "./skill-pipeline-core";
 import { classifyBundleIssue, validateBundleContentCoherence, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
+import { demoReplyNeedsUserTurn, normalizePlannedDemoTurns, type PlannedDemoUserTurn } from "./demo-episode";
+import { isCompilerOwnedEvalCoverageIssue, issuesAreCompilerOwnedEvalCoverage } from "./eval-repair-routing";
 import {
   applySkillIRMutations,
   feedbackRequirementMutations,
@@ -347,6 +351,7 @@ type CapabilityItem = {
   optional?: boolean;
   enabled?: boolean;
   recommended?: boolean;
+  selectionSource?: "ai" | "user";
   necessity?: {
     successLift: "high" | "medium" | "low";
     bareModelReliable: boolean;
@@ -529,6 +534,7 @@ type SkillDemo = {
   output: string;
   appliedRules: string[];
   uncertainties: string[];
+  mockTurns: PlannedDemoUserTurn[];
 };
 
 type DemoChatAttachment = {
@@ -545,6 +551,7 @@ type DemoChatMessage = {
   role: "user" | "assistant";
   content: string;
   attachments?: DemoChatAttachment[];
+  source?: "owner" | "mock";
 };
 
 type CapabilityCatalogItem = CapabilityItem & {
@@ -3488,6 +3495,7 @@ function normalizeSkillDemo(value: unknown): SkillDemo | null {
     output: candidate.output.trim().slice(0, 12_000),
     appliedRules: list(candidate.appliedRules, 6),
     uncertainties: list(candidate.uncertainties, 4),
+    mockTurns: normalizePlannedDemoTurns((candidate as SkillDemo).mockTurns),
   };
 }
 
@@ -4054,6 +4062,7 @@ function createOptimizationDemo(report: OptimizationEvidenceReport, caseIds: str
     output: chosen.output,
     appliedRules: [chosen.evidence].filter(Boolean),
     uncertainties: chosen.failureReason ? [chosen.failureReason] : [],
+    mockTurns: [],
   };
 }
 
@@ -4165,6 +4174,14 @@ function canonicalMutationTargetCatalog(files: Record<string, string>) {
       constraints: ir.constraints.map((item) => ({ id: item.id, statement: item.statement, hard: item.hard, provenance: item.provenance, appliesTo: item.appliesTo })),
       domainEvidence: ir.domainEvidence,
       riskBranches: ir.riskBranches,
+      evaluationCases: ir.evaluationPlan.cases.map((item) => ({
+        id: item.id,
+        prompt: item.prompt,
+        eval_family: item.eval_family,
+        capability_ids: item.capability_ids,
+        expected: item.expected,
+        graders: item.graders,
+      })),
     },
     inputAddShape: {
       id: "input-stable-id",
@@ -4210,6 +4227,13 @@ function canonicalMutationTargetCatalogForIssues(files: Record<string, string>, 
   if (!allowedTypes.length) return catalog;
   const uses = (owner: string) => allowedTypes.some((type) => type.startsWith(`${owner}.`));
   const currentValues = catalog.currentValues;
+  const issueEvalCaseIds = [...new Set(issues.flatMap((issue) => issue.evalCaseIds || []))]
+    .filter((id) => catalog.evalCaseIds.includes(id));
+  const issueCapabilityIds = [...new Set(issues.flatMap((issue) => issue.capabilityId ? [issue.capabilityId] : []))]
+    .filter((id) => catalog.capabilityIds.includes(id));
+  const issueOutputIds = currentValues.outputs
+    .filter((output) => output.producerCapabilityIds.some((id) => issueCapabilityIds.includes(id)))
+    .map((output) => output.id);
   const routedCurrentValues = {
     ...(uses("requirement") ? { requirements: currentValues.requirements } : {}),
     ...(uses("task") ? { tasks: currentValues.tasks } : {}),
@@ -4219,9 +4243,16 @@ function canonicalMutationTargetCatalogForIssues(files: Record<string, string>, 
     ...(uses("constraint") ? { constraints: currentValues.constraints } : {}),
     ...(uses("domain-evidence") ? { domainEvidence: currentValues.domainEvidence } : {}),
     ...(uses("risk-branch") ? { riskBranches: currentValues.riskBranches } : {}),
+    ...(uses("eval-source") ? { evaluationCases: currentValues.evaluationCases } : {}),
   };
   return {
     semanticDigest: catalog.semanticDigest,
+    allowedMutationTypes: allowedTypes,
+    evidenceBoundTargets: {
+      ...(issueEvalCaseIds.length ? { evalCaseIds: issueEvalCaseIds } : {}),
+      ...(issueCapabilityIds.length ? { capabilityIds: issueCapabilityIds } : {}),
+      ...(issueOutputIds.length ? { outputIds: issueOutputIds } : {}),
+    },
     currentValues: routedCurrentValues,
     ...(uses("requirement") ? { requirementIds: catalog.requirementIds } : {}),
     ...(uses("task") ? { taskIds: catalog.taskIds } : {}),
@@ -4347,6 +4378,7 @@ function normalizeCapabilityPlan(value: unknown): CapabilityPlan | null {
       optional,
       enabled,
       recommended,
+      ...(["ai", "user"].includes(String(candidate.selectionSource)) ? { selectionSource: candidate.selectionSource as "ai" | "user" } : {}),
     }];
   });
   if (!items.some((item) => item.kind === "llm")) items.unshift({ ...DEFAULT_CAPABILITY_PLAN.items[0], reason: "规划结果遗漏了语义核心，系统已将需要上下文判断的工作明确归还大模型" });
@@ -4496,6 +4528,24 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
       fallback: "脚本不可运行时停止依赖该脚本的批量或确定性步骤，说明缺少的运行条件，并提供可复核的字段、公式和手工处理说明；不得声称已完成计算或文件生成",
     }
     : item);
+  for (const id of recommendedHostCapabilityIds(taskEvidence)) {
+    const catalogItem = CAPABILITY_LIBRARY.find((item) => item.id === id);
+    if (!catalogItem) continue;
+    const index = items.findIndex((item) => item.id === id);
+    if (index >= 0) {
+      if (items[index].selectionSource === "user") continue;
+      items[index] = {
+        ...catalogItem,
+        ...items[index],
+        status: "use-provided",
+        enabled: true,
+        recommended: true,
+        selectionSource: "ai",
+      };
+    } else {
+      items.push({ ...catalogItem, status: "use-provided", enabled: true, recommended: true, selectionSource: "ai" });
+    }
+  }
   const explicitAssetNeed = reusableArtifact || /品牌资产|素材包|logo|字体文件|图片素材|provided asset/i.test(taskEvidence);
   const requestedAssetExtensions = new Set(inferArtifactPatterns(`${answers["output-format"] || ""}；${plan.outputContract.format}`)
     .flatMap((pattern) => pattern.toLowerCase().match(/\.(?:pdf|docx?|pptx?|xlsx?|csv|json|html?|md|png|jpe?g)\b/g) || []));
@@ -5078,6 +5128,7 @@ export default function Home() {
   const [generationNoticeOpen, setGenerationNoticeOpen] = useState(false);
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | "unsupported">("default");
   const notificationTested = useRef(false);
+  const [completionNotice, setCompletionNotice] = useState<{ title: string; body: string } | null>(null);
   const noSkillHarnessCache = useRef(new Map<string, HarnessReport>());
   const noSkillHarnessCacheHydrated = useRef(false);
   const loopStartedAt = useRef(0);
@@ -5333,7 +5384,7 @@ export default function Home() {
         if (typeof saved.selectedFile === "string") setSelectedFile(saved.selectedFile);
         if (Array.isArray(saved.evals)) setEvals(saved.evals as EvalResult[]);
         if (typeof saved.evalRan === "boolean") setEvalRan(saved.evalRan);
-        if (saved.skillDemo && typeof saved.skillDemo === "object") setSkillDemo(saved.skillDemo as SkillDemo);
+        if (saved.skillDemo && typeof saved.skillDemo === "object") setSkillDemo(normalizeSkillDemo(saved.skillDemo));
         if (typeof saved.demoReviewPending === "boolean") setDemoReviewPending(saved.demoReviewPending);
         if (typeof saved.demoExpanded === "boolean") setDemoExpanded(saved.demoExpanded);
         if (typeof saved.personalizationRound === "number") setPersonalizationRound(saved.personalizationRound);
@@ -5651,7 +5702,7 @@ export default function Home() {
     ? feedbackOptions
     : createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0);
   const optionalToolCapabilities = capabilityPlan.items.filter((item) => item.optional && (item.kind === "builtin-tool" || item.kind === "mcp"));
-  const coreCapabilities = capabilityPlan.items.filter((item) => !item.optional || (item.kind !== "builtin-tool" && item.kind !== "mcp"));
+  const adoptedRuntimeCapabilities = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind !== "eval" && item.layer === "runtime");
   const unresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
   const selectedCatalogCapabilityCount = CAPABILITY_LIBRARY.filter((libraryItem) => capabilityPlan.items.some((item) => item.id === libraryItem.id && capabilityIsActive(item))).length;
   const thinkingWords = busyTask ? createContextualThinkingWords({
@@ -5894,7 +5945,12 @@ export default function Home() {
           new Promise<never>((_, reject) => window.setTimeout(() => reject(new Error("service worker activation timed out")), 5_000)),
         ]);
         await registration.showNotification(title, notificationOptions);
-        reportNotificationDelivery("notification_delivery_succeeded", "service-worker");
+        const observed = typeof registration.getNotifications === "function"
+          ? await registration.getNotifications({ tag: notificationOptions.tag })
+          : [];
+        if (typeof registration.getNotifications === "function" && !observed.length) throw new Error("notification was accepted but not observable");
+        if ("setAppBadge" in navigator) await navigator.setAppBadge(1).catch(() => undefined);
+        reportNotificationDelivery("notification_delivery_succeeded", observed.length ? "service-worker-observed" : "service-worker-unverified");
         return true;
       }
     } catch (error) {
@@ -5923,7 +5979,6 @@ export default function Home() {
   }
 
   function notifyGenerationLoopResult(state: GenerationLoopState) {
-    if (!("Notification" in window) || window.Notification.permission !== "granted") return;
     const elapsedSeconds = loopStartedAt.current ? Math.max(1, Math.round((Date.now() - loopStartedAt.current) / 1_000)) : 0;
     const title = state.status === "passed" ? "Skill 优化已完成" : state.status === "stable" ? "Skill 已保留当前最佳版本" : "Skill 优化需要查看";
     const result = state.status === "passed"
@@ -5931,10 +5986,20 @@ export default function Home() {
       : state.status === "stable"
         ? "冻结评测全部通过，但没有候选证明额外提升；已安全保留当前最佳版本。"
       : `${state.stopReason || "Loop 已停止并保留当前最佳版本。"}`;
+    const body = `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220);
+    setCompletionNotice({ title, body });
+    document.title = `● ${title} · SkillCanvas`;
+    if (!("Notification" in window) || window.Notification.permission !== "granted") return;
     void deliverBrowserNotification(title, {
-      body: `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220),
+      body,
       tag: "skillcanvas-generation-loop",
     });
+  }
+
+  function dismissCompletionNotice() {
+    setCompletionNotice(null);
+    document.title = "SkillCanvas — 让 AI 真正懂你";
+    if ("clearAppBadge" in navigator) void navigator.clearAppBadge().catch(() => undefined);
   }
 
   function updateProvider(next: ProviderId) {
@@ -6921,7 +6986,7 @@ export default function Home() {
         setEvalRan(true);
         setDemoExpanded(true);
         setEvals(candidateResults);
-        setFeedbackOptions(createDemoFeedbackFallback(candidateDemo || skillDemo || { title: "", scenario: "", userPrompt: "", output: "", appliedRules: [], uncertainties: [] }, candidateResults, candidateEvidence.failurePatterns));
+        setFeedbackOptions(createDemoFeedbackFallback(candidateDemo || skillDemo || { title: "", scenario: "", userPrompt: "", output: "", appliedRules: [], uncertainties: [], mockTurns: [] }, candidateResults, candidateEvidence.failurePatterns));
         setFeedbackReasons([]);
         setFeedbackCustom("");
         setFeedbackLoopSummary(summary);
@@ -7447,17 +7512,13 @@ export default function Home() {
       })),
     ];
     const uniqueIssues = [...new Map(issues.map((issue) => {
-      const evalClosure = /CAPABILITY_WITHOUT_EVAL|没有绑定可执行\s*Eval|没有映射到任何\s*Eval|没有可执行评测|without.*eval/i.test(`${issue.type} ${issue.evidence}`);
+      const evalClosure = isCompilerOwnedEvalCoverageIssue(issue);
       const key = evalClosure
         ? `eval-closure:${issue.capabilityId || issue.evidence.match(/能力\s+([a-z0-9-]+)/i)?.[1] || issue.type}`
-        : `${issue.type}:${issue.evidence}`;
+        : contractIssueIdentity(issue);
       return [key, issue] as const;
     })).values()];
     return { audit, closure, crossArtifact, issues: deduplicateMissingResourceIssues(uniqueIssues, canonicalIR, files) };
-  }
-
-  function p1IssuesAreCompilerOwnedEvalEdges(issues: PipelineIssue[]) {
-    return issues.length > 0 && issues.every((issue) => /CAPABILITY_WITHOUT_EVAL|没有绑定可执行\s*Eval|没有映射到任何\s*Eval|没有可执行评测|without.*eval/i.test(`${issue.type} ${issue.evidence}`));
   }
 
   async function runP1ContractRepairLoop(input: {
@@ -7487,11 +7548,17 @@ export default function Home() {
     let nestedP0Rounds = 0;
     const rejectedAttempts: string[] = [];
     let projectionRebuildAttempted = false;
+    let evalCoverageRepairAttempted = false;
+    let capabilityDeltaRepairAttempted = false;
     while (validation.executionReady && state.issues.length && rounds < BUILD_REPAIR_MAX_ROUNDS) {
       // A compiler projection cannot be fixed by model-authored file edits.
       // Repair it locally once, even when independent semantic blockers also
       // exist. Never spend the model budget retrying a broken compiler.
-      if (state.issues.some(isSkillIRProjectionIssue)) {
+      // An invalid compiler-owned delta can itself make every projection look
+      // stale. Normalize that source contract first; rebuilding from the bad
+      // serialized IR would faithfully reproduce the defect and make no
+      // progress.
+      if (state.issues.some(isSkillIRProjectionIssue) && !state.issues.some(isCapabilityDeltaContractIssue)) {
         if (projectionRebuildAttempted) {
           rejectedAttempts.push("派生文件重建后仍出现漂移，已停止重复重建；需要检查编译器而非重写用户需求");
           break;
@@ -7522,6 +7589,49 @@ export default function Home() {
           const reason = error instanceof Error ? error.message : "派生文件重建失败";
           rejectedAttempts.push(reason);
           reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "projection-repair", round: 0, accepted: false, reason });
+          break;
+        }
+      }
+      // Capability Delta is compiler-owned design rationale, not a model
+      // mutation surface. Normalize a legacy or stale value locally before
+      // considering any paid semantic repair request.
+      if (state.issues.some(isCapabilityDeltaContractIssue)) {
+        if (capabilityDeltaRepairAttempted) {
+          rejectedAttempts.push("Capability Delta 确定性正规化后仍被同一校验拒绝，已停止模型空转；需要检查编译器与校验器版本一致性");
+          break;
+        }
+        capabilityDeltaRepairAttempted = true;
+        try {
+          const candidate = repairCapabilityDeltaContract(currentFiles);
+          rounds += 1;
+          const candidateValidation = await validateBundle(candidate.files);
+          const candidateState = collectP1ContractState(candidate.files, input.answers, input.generationPlan, candidateValidation);
+          const progress = contractRepairProgress(state.issues, candidateState.issues);
+          const accepted = candidateValidation.executionReady && progress.improved
+            && !candidateState.issues.some(isCapabilityDeltaContractIssue);
+          const reason = accepted
+            ? candidateState.issues.length
+              ? `已确定性移除不可证明的 Capability Delta 并重建投影；剩余 ${candidateState.issues.length} 项独立契约问题`
+              : "已确定性正规化 Capability Delta 并重建投影，无需请求修复模型"
+            : candidateValidation.executionReady
+              ? `Capability Delta 正规化未生效：${progress.reason}`
+              : "Capability Delta 正规化引入基础检查阻塞，已保留修复前文件";
+          reportClientGenerationLoopEvent("generation_loop_candidate", {
+            phase: "contract-repair", round: rounds, accepted, updatedPaths: candidate.changedPaths, reason,
+          });
+          if (!accepted) {
+            rejectedAttempts.push(reason);
+            break;
+          }
+          currentFiles = candidate.files;
+          validation = candidateValidation;
+          state = candidateState;
+          if (!state.issues.length) break;
+          continue;
+        } catch (error) {
+          const reason = error instanceof Error ? error.message : "Capability Delta 确定性修复失败";
+          rejectedAttempts.push(reason);
+          reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "contract-repair", round: rounds, accepted: false, reason });
           break;
         }
       }
@@ -7557,7 +7667,12 @@ export default function Home() {
         if (!validation.executionReady || !state.issues.length) break;
         continue;
       }
-      if (p1IssuesAreCompilerOwnedEvalEdges(state.issues)) {
+      if (issuesAreCompilerOwnedEvalCoverage(state.issues)) {
+        if (evalCoverageRepairAttempted) {
+          rejectedAttempts.push("Canonical Eval Compiler 补齐后仍存在同类覆盖阻塞，已停止重复生成；需要修复评测编译器而不是改写 Skill 语义");
+          break;
+        }
+        evalCoverageRepairAttempted = true;
         if (currentIR) {
           const coveredEvalBank = ensureSkillIREvalCoverage(currentIR, currentFiles["evals/evals.json"] || projectEvalBank(currentIR));
           const coveredIR = bindSkillIREvals(currentIR, coveredEvalBank);
@@ -7566,19 +7681,33 @@ export default function Home() {
             "evals/evals.json": coveredEvalBank,
           }, idea, input.answers, input.sourceText, input.generationPlan, loopPlan, coveredIR);
           rounds += 1;
-          currentFiles = deterministicCandidate;
-          validation = await validateBundle(currentFiles);
-          state = collectP1ContractState(currentFiles, input.answers, input.generationPlan, validation);
+          const candidateValidation = await validateBundle(deterministicCandidate);
+          const candidateState = collectP1ContractState(deterministicCandidate, input.answers, input.generationPlan, candidateValidation);
+          const progress = contractRepairProgress(state.issues, candidateState.issues);
+          const accepted = candidateValidation.executionReady && progress.improved;
+          const reason = accepted
+            ? candidateState.issues.length
+              ? `Canonical Eval Compiler 已补齐评测结构；剩余 ${candidateState.issues.length} 项独立契约问题`
+              : "Canonical Eval Compiler 已确定性补齐失败模式与全部激活能力的聚焦 Eval，无需请求修复模型"
+            : candidateValidation.executionReady
+              ? `Canonical Eval Compiler 补齐未生效：${progress.reason}`
+              : "Canonical Eval Compiler 补齐引入基础检查阻塞，已保留补齐前文件";
           reportClientGenerationLoopEvent("generation_loop_candidate", {
             phase: "contract-repair",
             round: rounds,
-            accepted: validation.executionReady && state.issues.length === 0,
+            accepted,
             updatedPaths: ["evals/skill-ir.json", "evals/evals.json", "evals/capability-manifest.json"],
-            reason: state.issues.length
-              ? `Canonical Eval Compiler 补齐能力映射后仍有 ${state.issues.length} 项契约问题`
-              : "Canonical Eval Compiler 已确定性补齐全部激活能力的可执行 Eval 映射，无需请求修复模型",
+            reason,
           });
-          if (!validation.executionReady || !state.issues.length) break;
+          if (!accepted) {
+            rejectedAttempts.push(reason);
+            break;
+          }
+          currentFiles = deterministicCandidate;
+          validation = candidateValidation;
+          state = candidateState;
+          if (!state.issues.length) break;
+          continue;
         }
       }
       const blockers = state.issues.map((issue) => `${issue.type} · ${issue.files.join("、") || "bundle"} · ${issue.evidence}`);
@@ -8172,6 +8301,7 @@ export default function Home() {
       const requiredDecisionIds = rejectedHistory.flatMap((item) => item.decisionId ? [item.decisionId] : []);
       const attemptedPlanSignatures = new Set<string>();
       let planningStoppedForRepeat = false;
+      let lastPlanningFailure = "";
       for (let planAttempt = 1; planAttempt <= PATCH_PLAN_MAX_ATTEMPTS; planAttempt += 1) {
         const patchRaw = await callAI<unknown>("optimization-patch-plan", {
           ...evidencePayload,
@@ -8188,25 +8318,38 @@ export default function Home() {
         const normalizedPlan = normalizePatchPlan(patchRaw);
         if (!normalizedPlan) {
           const reason = `Planner 第 ${planAttempt} 次没有返回结构完整的 Patch Plan`;
+          lastPlanningFailure = reason;
           rejectedHistory.push({ round, reason, files: [] });
           reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan", round, attempt: planAttempt, accepted: false, reason });
           continue;
         }
+        const targetBinding = bindPatchPlanTargetIds({ plan: normalizedPlan, issues: issuePolicy.selected, files: bestFiles });
+        const boundPlan = targetBinding.plan;
+        if (targetBinding.bindings.length) {
+          reportClientGenerationLoopEvent("generation_loop_candidate", {
+            phase: "canonical-target-binding",
+            round,
+            attempt: planAttempt,
+            accepted: true,
+            reason: `编译器已将 Planner 占位目标绑定到失败证据对应的真实 ID：${targetBinding.bindings.map((item) => `${item.from || "<empty>"}→${item.to}`).join("、")}`,
+          });
+        }
         const planSignature = JSON.stringify({
-          issueIds: [...normalizedPlan.issueIds].sort(),
-          canonicalMutations: normalizedPlan.canonicalMutations,
-          operations: normalizedPlan.operations,
+          issueIds: [...boundPlan.issueIds].sort(),
+          canonicalMutations: boundPlan.canonicalMutations,
+          operations: boundPlan.operations,
         });
         if (attemptedPlanSignatures.has(planSignature)) {
           planningStoppedForRepeat = true;
           const reason = `Planner 第 ${planAttempt} 次重复了已经失败的同一修改面，已提前停止重复计费`;
+          lastPlanningFailure = reason;
           rejectedHistory.push({ round, reason, files: [] });
           reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan-noop", round, attempt: planAttempt, accepted: false, reason });
           break;
         }
         attemptedPlanSignatures.add(planSignature);
         const constrainedPlan = constrainPatchPlan({
-          plan: normalizedPlan,
+          plan: boundPlan,
           files: bestFiles,
           budget: DEFAULT_MUTATION_BUDGET,
           protectedArtifacts: ["evals/skill-ir.json", "evals/capability-manifest.json", ...(bestFiles["references/domain-playbook.md"] ? ["references/domain-playbook.md"] : [])],
@@ -8227,6 +8370,7 @@ export default function Home() {
             preparedPatch = applyPatchPlan(bestFiles, constrainedPlan);
           } catch (error) {
             const reason = `Planner 第 ${planAttempt} 次的修改锚点无法唯一定位：${error instanceof Error ? error.message : "无法应用 Patch"}`;
+            lastPlanningFailure = reason;
             rejectedHistory.push({ round, reason, files: validation.changedPaths });
             reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan", round, attempt: planAttempt, accepted: false, updatedPaths: validation.changedPaths, reason });
             setGenerationLoop((current) => ({ ...current, phase: "patch", stopReason: `第 ${round} 轮：修改锚点不稳定，正在自动重规划（${planAttempt}/${PATCH_PLAN_MAX_ATTEMPTS}）` }));
@@ -8249,6 +8393,7 @@ export default function Home() {
             }
           } catch (error) {
             const reason = `Planner 第 ${planAttempt} 次未通过 Canonical IR 检查：${error instanceof Error ? error.message : "CanonicalMutation 无法应用"}`;
+            lastPlanningFailure = reason;
             rejectedHistory.push({ round, reason, files: validation.changedPaths });
             reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan", round, attempt: planAttempt, accepted: false, updatedPaths: validation.changedPaths, reason });
             setGenerationLoop((current) => ({ ...current, phase: "patch", stopReason: `第 ${round} 轮：Canonical Mutation 无效，正在携带失败证据重规划（${planAttempt}/${PATCH_PLAN_MAX_ATTEMPTS}）` }));
@@ -8258,13 +8403,14 @@ export default function Home() {
           }
           patchPlan = constrainedPlan;
           planValidation = validation;
-          if (constrainedPlan.operations.length < normalizedPlan.operations.length) {
-            reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "impact-narrowed", round, attempt: planAttempt, accepted: true, updatedPaths: validation.changedPaths, reason: `编译器已自动移除保护文件或预算外操作，从 ${normalizedPlan.operations.length} 个操作收窄为 ${constrainedPlan.operations.length} 个` });
+          if (constrainedPlan.operations.length < boundPlan.operations.length) {
+            reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "impact-narrowed", round, attempt: planAttempt, accepted: true, updatedPaths: validation.changedPaths, reason: `编译器已自动移除保护文件或预算外操作，从 ${boundPlan.operations.length} 个操作收窄为 ${constrainedPlan.operations.length} 个` });
           }
           break;
         }
         const errors = validation.errors.length ? validation.errors : ["收窄后没有可执行操作"];
         const reason = `Planner 第 ${planAttempt} 次未通过影响分析：${errors.join("；")}`;
+        lastPlanningFailure = reason;
         rejectedHistory.push({ round, reason, files: validation.changedPaths });
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "replan", round, attempt: planAttempt, accepted: false, updatedPaths: validation.changedPaths, reason });
         setGenerationLoop((current) => ({ ...current, phase: "patch", stopReason: `第 ${round} 轮：Patch Plan 不安全，正在自动缩小并重规划（${planAttempt}/${PATCH_PLAN_MAX_ATTEMPTS}）` }));
@@ -8273,7 +8419,7 @@ export default function Home() {
         rejectedPatches += 1;
         stopReason = planningStoppedForRepeat
           ? "Planner 重复了同一无效修改，已提前停止并保留当前可用版本"
-          : `Planner 已自动重规划 ${PATCH_PLAN_MAX_ATTEMPTS} 次，仍没有落在安全修改面内；已保留当前可用版本`;
+          : `${lastPlanningFailure || `Planner 已自动重规划 ${PATCH_PLAN_MAX_ATTEMPTS} 次，仍没有落在安全修改面内`}；已保留当前可用版本`;
         reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "impact", round, accepted: false, reason: stopReason });
         break;
       }
@@ -9166,7 +9312,7 @@ export default function Home() {
       await durableBuild?.complete("bundle", {
         files: Object.keys(compiledFiles).sort(),
         executionReady: contractRepair.validation.executionReady,
-        contractReady: contractRepair.validation.contractReady,
+        contractReady: contractRepair.passed,
         repairRounds,
       });
 
@@ -9174,7 +9320,7 @@ export default function Home() {
         await durableBuild?.complete("freeze", {
           revision: skillBundleRevision(compiledFiles),
           executionReady: contractRepair.validation.executionReady,
-          contractReady: contractRepair.validation.contractReady,
+          contractReady: contractRepair.passed,
         });
         try {
           const goalLoopResult = await runOptimizationLoop(compiledFiles, generationPlan);
@@ -9466,6 +9612,7 @@ export default function Home() {
       items: current.items.map((candidate) => candidate.id === item.id ? {
         ...candidate,
         enabled: !capabilityIsActive(candidate),
+        selectionSource: "user",
         status: candidate.status === "not-needed"
           ? candidate.kind === "mcp" ? "requires-setup" : "use-provided"
           : candidate.status,
@@ -9483,6 +9630,7 @@ export default function Home() {
           items: current.items.map((item) => item.id === libraryItem.id ? {
             ...item,
             enabled: !capabilityIsActive(item),
+            selectionSource: "user",
             status: capabilityIsActive(item)
               ? item.status
               : item.kind === "mcp" ? "requires-setup" : "use-provided",
@@ -9490,7 +9638,7 @@ export default function Home() {
         };
       }
       const capability: CapabilityItem = libraryItem;
-      return { ...current, items: [...current.items, { ...capability, enabled: true }] };
+      return { ...current, items: [...current.items, { ...capability, enabled: true, selectionSource: "user" }] };
     });
     if (libraryItem.kind === "mcp" && libraryItem.connection?.server) {
       setMcpDrafts((current) => ({ ...current, [libraryItem.id]: current[libraryItem.id] || libraryItem.connection?.server || "" }));
@@ -9572,6 +9720,44 @@ export default function Home() {
     setDemoChatAttachments((current) => current.filter((item) => item.id !== id));
   }
 
+  async function runAutomaticDemoTurns(demo: SkillDemo, candidateFiles: Record<string, string>, candidateCapabilityPlan: CapabilityPlan) {
+    const conversation: DemoChatMessage[] = [];
+    let latestReply = demo.output;
+    for (let index = 0; index < demo.mockTurns.length; index += 1) {
+      if (!demoReplyNeedsUserTurn(latestReply)) break;
+      const planned = demo.mockTurns[index];
+      const sequence = index + 1;
+      const userMessage: DemoChatMessage = {
+        id: `mock-user-${demoRunCount + 1}-${sequence}`,
+        role: "user",
+        source: "mock",
+        content: planned.message,
+      };
+      const nextConversation = [...conversation, userMessage];
+      const result = await callAI<{ reply?: unknown }>("demo-chat", {
+        idea,
+        sourceText: contextBundle,
+        answers: interviewEvidence,
+        capabilityPlan: candidateCapabilityPlan,
+        loopPlan,
+        skill: candidateFiles,
+        demo,
+        conversation: nextConversation,
+        message: planned.message,
+      });
+      const reply = typeof result.reply === "string" ? result.reply.trim().slice(0, 12_000) : "";
+      if (!reply) throw new Error(`自动续跑第 ${sequence} 轮没有返回完整回复`);
+      conversation.push(userMessage, {
+        id: `mock-assistant-${demoRunCount + 1}-${sequence}`,
+        role: "assistant",
+        source: "mock",
+        content: reply,
+      });
+      latestReply = reply;
+    }
+    return conversation;
+  }
+
   async function sendDemoChatMessage() {
     const message = demoChatInput.trim();
     const attachments = demoChatAttachments;
@@ -9586,6 +9772,7 @@ export default function Home() {
     const userMessage: DemoChatMessage = {
       id: `user-${demoRunCount}-${sequence}`,
       role: "user",
+      source: "owner",
       content: visibleMessage.slice(0, 3_000),
       attachments: attachments.length ? attachments : undefined,
     };
@@ -9687,6 +9874,7 @@ export default function Home() {
 
   async function runDemoAndReview(candidateFiles: Record<string, string>, previousDemo: SkillDemo | null, feedback: string[], phaseOffset = 0, savedDemo: SkillDemo | null = null, candidateCapabilityPlan: CapabilityPlan = capabilityPlan, persistCheckpoint = true) {
     let demo = savedDemo;
+    let episodeConversation: DemoChatMessage[] = savedDemo ? demoConversation : [];
     if (!demo) {
       setBusyPhaseIndex(phaseOffset);
       let trial = await callAI<{ demo?: unknown }>("demo", {
@@ -9738,7 +9926,16 @@ export default function Home() {
       }
     }
 
-    setBusyPhaseIndex(phaseOffset + 1);
+    if (!episodeConversation.length && demo.mockTurns.length && demoReplyNeedsUserTurn(demo.output)) {
+      setBusyPhaseIndex(phaseOffset + 1);
+      episodeConversation = await runAutomaticDemoTurns(demo, candidateFiles, candidateCapabilityPlan);
+      if (persistCheckpoint) {
+        setDemoConversation(episodeConversation);
+        setDemoChatSequence(episodeConversation.filter((item) => item.role === "user").length);
+      }
+    }
+
+    setBusyPhaseIndex(phaseOffset + 2);
     const review = await callAI<{ results?: EvalResult[]; feedbackOptions?: unknown }>("evaluate", {
       idea,
       sourceText: contextBundle,
@@ -9746,15 +9943,21 @@ export default function Home() {
       loopPlan,
       skill: candidateFiles,
       demo,
+      conversationEvidence: episodeConversation,
     });
-    setBusyPhaseIndex(phaseOffset + 2);
+    setBusyPhaseIndex(phaseOffset + 3);
     const normalized = normalizeEvalResults(review.results, candidateFiles, demoAnswers);
     if (normalized.length !== 5) throw new Error("AI 没有完成五项 Demo 对照评估");
     const fallback = createDemoFeedbackFallback(demo, normalized, createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0));
     const hasVisibleMismatch = normalized.some((item) => item.coverage !== "not-covered" && item.score < 90 && !/无实质缺陷|完全符合|准确|流程正确|本轮未覆盖|不构成缺陷/i.test(item.issue || ""));
     const options = hasVisibleMismatch ? normalizeFeedbackOptions(review.feedbackOptions, fallback) : [];
-    if (persistCheckpoint) setDemoReviewPending(false);
-    return { demo, results: normalized, feedbackOptions: options };
+    if (persistCheckpoint) {
+      const completedReplies = episodeConversation.filter((item) => item.role === "assistant");
+      setDemoConversationScoredTurns(completedReplies.length);
+      setDemoConversationScoredReplyId(completedReplies.at(-1)?.id || "");
+      setDemoReviewPending(false);
+    }
+    return { demo, conversation: episodeConversation, results: normalized, feedbackOptions: options };
   }
 
   async function runEvaluation() {
@@ -9772,6 +9975,10 @@ export default function Home() {
       setBusyPhaseIndex(3);
       setSkillDemo(reviewed.demo);
       setDemoExpanded(true);
+      setDemoConversation(reviewed.conversation);
+      setDemoChatSequence(reviewed.conversation.filter((item) => item.role === "user").length);
+      setDemoConversationScoredTurns(reviewed.conversation.filter((item) => item.role === "assistant").length);
+      setDemoConversationScoredReplyId([...reviewed.conversation].reverse().find((item) => item.role === "assistant")?.id || "");
       setEvals(reviewed.results);
       setFeedbackOptions(reviewed.feedbackOptions);
       setFeedbackReasons([]);
@@ -9784,7 +9991,8 @@ export default function Home() {
       setOptimizationSession(null);
       markComplete("evaluate");
       setRetryAction(null);
-      setToast("Demo 已生成，具体不足已根据本次结果列出");
+      const automaticTurns = reviewed.conversation.filter((item) => item.role === "assistant").length;
+      setToast(automaticTurns ? `Demo 已自动续跑 ${automaticTurns} 轮，并按完整对话评分` : "Demo 已生成，具体不足已根据本次结果列出");
     } catch (error) {
       if (!hadResult || demoReviewPending) setEvalRan(false);
       setToast(`${error instanceof Error ? error.message : "Skill Demo 试跑失败"}${skillDemo && demoReviewPending ? "；Demo 已保存，只需继续评估" : ""}`);
@@ -10187,11 +10395,11 @@ export default function Home() {
       setSkillDemo(reviewed.demo);
       setDemoRunCount((current) => current + 1);
       setDemoExpanded(true);
-      setDemoConversation([]);
-      setDemoChatSequence(0);
+      setDemoConversation(reviewed.conversation);
+      setDemoChatSequence(reviewed.conversation.filter((item) => item.role === "user").length);
       setDemoChatInput("");
-      setDemoConversationScoredTurns(0);
-      setDemoConversationScoredReplyId("");
+      setDemoConversationScoredTurns(reviewed.conversation.filter((item) => item.role === "assistant").length);
+      setDemoConversationScoredReplyId([...reviewed.conversation].reverse().find((item) => item.role === "assistant")?.id || "");
       setDemoChatError("");
       setDemoReviewPending(false);
       setEvals(reviewed.results);
@@ -10202,7 +10410,8 @@ export default function Home() {
       setFeedbackCustom("");
       setFeedbackSaved(true);
       setRetryAction(null);
-      setToast("新一轮 Demo 已完成，请直接比较结果是否更像你");
+      const automaticTurns = reviewed.conversation.filter((item) => item.role === "assistant").length;
+      setToast(automaticTurns ? `新 Demo 已自动续跑 ${automaticTurns} 轮，请比较完整过程` : "新一轮 Demo 已完成，请直接比较结果是否更像你");
     } catch (error) {
       const message = error instanceof Error ? error.message : "下一轮优化失败";
       setFeedbackSaved(false);
@@ -10389,6 +10598,7 @@ export default function Home() {
     const latestCompletedReplyId = [...demoConversation].reverse().find((message) => message.role === "assistant")?.id || "";
     const conversationScoreIsFresh = Boolean(latestCompletedReplyId) && demoConversationScoredReplyId === latestCompletedReplyId;
     const hasNewConversationEvidence = Boolean(latestCompletedReplyId) && !conversationScoreIsFresh;
+    const automaticTurns = demoConversation.filter((message) => message.role === "assistant" && message.source === "mock").length;
     return (
       <section className={`skill-demo-card ${pendingReview ? "review-pending" : ""}`}>
         <div className="skill-demo-head">
@@ -10407,7 +10617,7 @@ export default function Home() {
         </div>
         <div className="demo-initial-transcript">
           <div className="demo-message user initial-turn">
-            <span>你</span>
+            <span>模拟</span>
             <div className="demo-message-body">
               <small>本次输入</small>
               <p>{skillDemo.userPrompt}</p>
@@ -10429,10 +10639,10 @@ export default function Home() {
           </div>
         </details>
         <div className="demo-conversation">
-          <div className="demo-conversation-heading"><div><strong>继续对话</strong><small>补充材料或修改意见，AI 会基于当前结果继续处理。</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，评分生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
+          <div className="demo-conversation-heading"><div><strong>{automaticTurns ? `已自动续跑 ${automaticTurns} 轮` : "继续对话"}</strong><small>{automaticTurns ? "系统模拟了必要的材料补充；你仍可在下面接着追问或纠正。" : "补充材料或修改意见，AI 会基于当前结果继续处理。"}</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，评分生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
           {demoConversation.length > 0 && (
             <div className="demo-message-list" aria-live="polite">
-              {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? "你" : "AI"}</span><div className="demo-message-body"><p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
+              {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? message.source === "mock" ? "模拟" : "你" : "AI"}</span><div className="demo-message-body">{message.role === "user" && message.source === "mock" && <small>自动补充的测试输入</small>}<p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
               {demoChatBusy && <div className="demo-message assistant pending"><span>AI</span><div className="demo-message-body"><p><i /><i /><i /></p><small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，回复生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small></div></div>}
             </div>
           )}
@@ -10853,8 +11063,17 @@ export default function Home() {
               <section className="capability-plan-card">
                 <section className="tool-ability-picker">
                   <div className="tool-ability-heading">
-                    <div><span>AI 工具建议</span></div>
-                    <small>{optionalToolCapabilities.length ? `${optionalToolCapabilities.filter(capabilityIsActive).length} / ${optionalToolCapabilities.length} 已添加` : `${coreCapabilities.filter(capabilityIsActive).length} 项核心能力已采用`}</small>
+                    <div><span>能力选型结果</span><h4>完成这个任务实际会用到什么</h4><p>只采用会改变输入读取、任务判断或真实交付的能力；每项都必须有触发条件、可观察产出和不可用时的降级方式。</p></div>
+                    <small>{adoptedRuntimeCapabilities.length} 项运行能力已采用</small>
+                  </div>
+                  <div className="adopted-capability-grid" aria-label="已采用的运行能力">
+                    {adoptedRuntimeCapabilities.map((item) => (
+                      <article key={item.id}>
+                        <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
+                        <div><strong>{item.name}</strong><p>{item.reason}</p><small>何时用：{item.activationCondition || item.routingCondition}</small></div>
+                        <em>{item.recommended ? "AI 自动添加" : item.kind === "builtin-tool" || item.kind === "mcp" ? "你已添加" : "核心任务"}</em>
+                      </article>
+                    ))}
                   </div>
                   {optionalToolCapabilities.length ? (
                     <div className="tool-ability-grid">
@@ -11543,6 +11762,7 @@ export default function Home() {
           </div>
       )}
 
+      {completionNotice && <div className="completion-browser-fallback" role="alert"><span>✓</span><p><strong>{completionNotice.title}</strong><small>{completionNotice.body}</small></p><button type="button" onClick={dismissCompletionNotice} aria-label="关闭完成提醒">×</button></div>}
       {toast && <div className="toast" role="status">{toast}</div>}
     </main>
   );

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases } from "../app/capability-routing.ts";
+import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases, recommendedHostCapabilityIds } from "../app/capability-routing.ts";
+import { bindWorkflowCapabilities } from "../app/workflow-dag.ts";
 import { applyWorkflowStepPatch, inspectWorkflowPlan, repairWorkflowPlan } from "../app/workflow-plan-repair.ts";
 
 const tool = (id, purpose) => ({ id, kind: "builtin-tool", path: "integrations/tool-contracts.json", name: id,
@@ -10,6 +11,24 @@ const tool = (id, purpose) => ({ id, kind: "builtin-tool", path: "integrations/t
 const catalog = [tool("host-document-reading", "Read supplied documents"), tool("host-web-search", "Search source evidence")];
 const node = (id, requires, produces, role, capabilityIds) => ({ id, requires, produces, role, capabilityIds,
   input: requires.join(", "), output: produces.join(", "), action: id, when: "When needed", fallback: "Stop dependent work", mutates: [] });
+
+test("host recommendations follow task I/O rather than a hard-coded Skill name", () => {
+  assert.deepEqual(recommendedHostCapabilityIds("根据这份 JD 和简历 PDF 定制内容并交付 Word 文档"), ["host-document-reading"]);
+  assert.deepEqual(recommendedHostCapabilityIds("读取 XLSX 数据表，计算价格并分析截图"), ["host-spreadsheet-analysis", "host-image-understanding"]);
+  assert.deepEqual(recommendedHostCapabilityIds("运行测试检查 GitHub PR，并联网核验最新依赖价格"), ["host-shell-code", "host-git-workflow", "host-web-search"]);
+  assert.deepEqual(recommendedHostCapabilityIds("写一段普通介绍文案"), []);
+});
+
+test("an operation whose removed owner left it empty inherits its real semantic graph owner", () => {
+  const core = { id: "resume-reasoning", kind: "llm", name: "Task reasoning", input: "source", output: "draft", fallback: "Ask" };
+  const steps = [
+    node("draft", ["$request"], ["draft"], "transform", [core.id]),
+    node("check-keywords-draft", ["draft"], ["checked"], "validate", ["excluded-checker"]),
+    { ...node("deliver", ["checked"], ["$output"], "deliver", [core.id]), delivers: ["checked"] },
+  ];
+  const result = bindWorkflowCapabilities(steps, [core]);
+  assert.deepEqual(result.find((step) => step.id === "check-keywords-draft")?.capabilityIds, [core.id]);
+});
 
 test("host aliases converge without merging MCP connections or overriding disabled selections", () => {
   const alias = tool("builtin-document-reading", "Read task material");

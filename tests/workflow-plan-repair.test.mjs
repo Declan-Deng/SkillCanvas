@@ -295,16 +295,19 @@ test("bad proposals cannot delete work, replace good dependencies with $request,
   }
 });
 
-test("ownerless steps survive to repair, and disabled capability ids cannot re-enter", async () => {
+test("ownerless steps inherit a real semantic owner, and disabled capability ids cannot re-enter", async () => {
   const { context, repaired } = fixture();
   context.workflowSteps[0].capabilityIds = [];
-  assert.ok(inspectWorkflowPlan(context).issues.some((issue) => issue.includes("extract-resume 缺少有效")));
+  const inspected = inspectWorkflowPlan(context);
+  assert.ok(!inspected.issues.some((issue) => issue.includes("extract-resume 缺少有效")));
+  assert.ok(inspected.steps.find((step) => step.id === "extract-resume").capabilityIds.includes("core"));
   const result = await repairWorkflowPlan(context, async (request) => {
-    assert.ok(request.workflowSteps.some((step) => step.id === "extract-resume"));
+    assert.ok(request.workflowSteps.find((step) => step.id === "extract-resume").capabilityIds.includes("core"));
     return { workflowSteps: repaired };
   });
   assert.equal(result.attempts, 1);
-  assert.equal(inspectWorkflowPlan({ ...context, workflowSteps: repaired.map((step) => ({ ...step, capabilityIds: ["disabled-tool"] })) }).valid, false);
+  const withoutDisabled = inspectWorkflowPlan({ ...context, workflowSteps: repaired.map((step) => ({ ...step, capabilityIds: ["disabled-tool"] })) });
+  assert.ok(withoutDisabled.steps.every((step) => !step.capabilityIds.includes("disabled-tool")));
 });
 
 test("invalid cyclic edges can be corrected without deleting the steps or their artifacts", async () => {

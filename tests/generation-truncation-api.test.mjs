@@ -56,3 +56,25 @@ test("provider account failures return an actionable notice and a non-retryable 
     assert.equal(providerRepairNeedsUserAction(Object.assign(new Error(payload.error), { code: payload.code })), true);
   }
 });
+
+test("Demo API retries a clarification-only result until it includes a runnable mock turn", async (t) => {
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls += 1;
+    const demo = calls === 1
+      ? { title: "缺少岗位信息", scenario: "测试必要追问", userPrompt: "请根据简略 JD 定制简历", output: "开始之前请补充具体职责和硬技能要求。", appliedRules: ["先补必要输入"], uncertainties: ["职责未知"] }
+      : { title: "缺少岗位信息", scenario: "测试必要追问", userPrompt: "请根据简略 JD 定制简历", output: "开始之前请补充具体职责和硬技能要求。", appliedRules: ["先补必要输入"], uncertainties: ["职责未知"], mockTurns: [{ message: "职责包括产品规划和跨部门协作；硬技能要求 Python、SQL。", purpose: "补齐职责和硬技能" }] };
+    return Response.json({ choices: [{ message: { content: JSON.stringify({ demo }) }, finish_reason: "stop" }], usage: { prompt_tokens: 100, completion_tokens: 80 } });
+  });
+  const { default: worker } = await import("../dist/server/index.js");
+  const response = await worker.fetch(new Request("http://localhost/api/ai", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ mode: "demo", provider: "compatible", model: "test-model", baseUrl: "https://demo-episode.test/v1", apiKey: "test-only-not-a-real-credential", idea: "根据 JD 定制简历" }),
+  }), { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } }, { waitUntil() {}, passThroughOnException() {} });
+  const payload = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(payload));
+  assert.equal(calls, 2);
+  const content = JSON.parse(payload.content);
+  assert.equal(content.demo.mockTurns.length, 1);
+  assert.match(content.demo.mockTurns[0].message, /Python、SQL/);
+});

@@ -6,6 +6,7 @@ import { EVAL_COMPILER_VERSION, providerRepairNeedsUserAction } from "../app/eva
 import { validateBundleContentCoherence } from "../app/bundle-validator.ts";
 import * as evidence from "../app/evidence-gates.ts";
 import { normalizeDiscoveryPreview } from "../app/discovery-preview.ts";
+import { normalizePlannedDemoTurns } from "../app/demo-episode.ts";
 import { completedNumericDecisionFixture, confirmedCorrectionEvalEvidence, productiveCheckpointRequested } from "../app/workflow-compiler.ts";
 import { compileSkillIR, bindSkillIREvals, ensureSkillIREvalCoverage, projectEvalBank, reconcileSkillIRContentPermission, reconcileSkillIRActionPermissions, reconcileSkillIRInputResolutions, reconcileSkillIRSourceEvidence } from "../app/skill-ir.ts";
 import { reconcileRuntimeInputResources } from "../app/bundle-resource-repair.ts";
@@ -19,6 +20,7 @@ assert.equal(functions.length, wanted.length);
 const dependencies = {
   ...evidence, EVAL_COMPILER_VERSION, completedNumericDecisionFixture, confirmedCorrectionEvalEvidence, productiveCheckpointRequested,
   reconcileSkillIRContentPermission, reconcileSkillIRActionPermissions, reconcileSkillIRInputResolutions, reconcileSkillIRSourceEvidence, reconcileRuntimeInputResources,
+  normalizePlannedDemoTurns,
   // These UI policy helpers are orthogonal to fixture construction; keep a
   // simple text-only plan. Prompt construction and Canonical projection run.
   reconcileCapabilityPlanContentPermission: (plan) => plan,

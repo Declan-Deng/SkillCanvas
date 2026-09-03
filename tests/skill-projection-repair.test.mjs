@@ -5,11 +5,14 @@ import {
   normalizeKnowledgeAssessment, projectCapabilityManifest, projectDomainPlaybook,
   projectOutputReference, projectSkillIRFiles, projectToolContracts, skillIRDigest,
 } from "../app/skill-ir.ts";
-import { isSkillIRProjectionIssue, rebuildSkillIRProjections } from "../app/skill-projection-repair.ts";
+import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract } from "../app/skill-projection-repair.ts";
+import { validateBundleContentCoherence } from "../app/bundle-validator.ts";
 import { knowledgeClaimFingerprint, knowledgeSupportChecks } from "../app/knowledge-evidence.ts";
 import { validateImplementationFiles, COMPILER_OWNED_SEMANTIC_PATHS } from "../app/canonical-mutations.ts";
 import { capabilities, workflow } from "./fixtures/blueprint.mjs";
 import { capabilityCatalog } from "./fixtures/capability-catalog.mjs";
+import { auditCapabilityClosure } from "../app/generation-loop-core.ts";
+import { auditCrossArtifactConsistency } from "../app/skill-pipeline-core.ts";
 
 function fixture(selected = []) {
   const plan = structuredClone(capabilities.capabilityPlan);
@@ -70,6 +73,10 @@ test("every catalog capability and the full selection survive serialization and 
     }
     const original = structuredClone(ir);
     const files = projectSkillIRFiles(ir);
+    const missingEval = auditCapabilityClosure(files).issues.filter((issue) => issue.type === "missing-eval");
+    assert.deepEqual(missingEval, [], `all selected capabilities need focused evals: ${selected.map((item) => item.id).join(", ")}`);
+    const crossArtifactMissingEval = auditCrossArtifactConsistency(files).issues.filter((issue) => issue.type === "CAPABILITY_WITHOUT_EVAL");
+    assert.deepEqual(crossArtifactMissingEval, [], `cross-artifact audit needs focused evals: ${selected.map((item) => item.id).join(", ")}`);
     assert.deepEqual(driftIssues(files), [], selected.map((item) => item.id).join(", "));
     const restored = JSON.parse(files["evals/skill-ir.json"]);
     assert.equal(skillIRDigest(ir), skillIRDigest(restored));
@@ -124,6 +131,44 @@ test("reprojection does not repair away genuine DAG or knowledge defects", () =>
   assert.ok(remaining.some((issue) => issue.includes("$missing_real_input")));
   assert.ok(remaining.some((issue) => issue.includes("KNOWLEDGE_EVIDENCE_UNVERIFIED")));
   assert.equal(repaired.files["evals/skill-ir.json"], files["evals/skill-ir.json"]);
+});
+
+test("invalid Capability Delta is repaired locally and all projections converge", () => {
+  const ir = fixture();
+  const files = projectSkillIRFiles(ir);
+  const persisted = JSON.parse(files["evals/skill-ir.json"]);
+  persisted.capabilityDelta = {
+    status: "ready",
+    summary: "已识别能力差值",
+    bareModelCan: ["读取材料"],
+    skillMustTeach: [{
+      id: "ordinary-workflow",
+      taskDecision: "读取输入并输出结果",
+      bareModelBehavior: "裸模型可以读取输入",
+      requiredSkillBehavior: "读取输入并输出结果",
+      whySkillIsNeeded: "确保结果完整",
+      researchQuestions: ["有哪些通用最佳实践"],
+    }],
+    excludedGenericKnowledge: [],
+    researchFocus: ["有哪些通用最佳实践"],
+  };
+  persisted.knowledgeAssessment = {
+    status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [],
+  };
+  files["evals/skill-ir.json"] = JSON.stringify(persisted, null, 2);
+
+  const before = validateBundleContentCoherence(files);
+  assert.equal(before.some((issue) => isCapabilityDeltaContractIssue({ type: issue.code, evidence: issue.message })), true);
+
+  const repaired = repairCapabilityDeltaContract(files);
+  const restored = JSON.parse(repaired.files["evals/skill-ir.json"]);
+  assert.ok(repaired.changedPaths.includes("evals/skill-ir.json"));
+  assert.equal(restored.capabilityDelta.status, "insufficient");
+  assert.deepEqual(restored.capabilityDelta.skillMustTeach, []);
+  assert.deepEqual(restored.capabilityDelta.researchFocus, []);
+  assert.equal(validateBundleContentCoherence(repaired.files).some((issue) => issue.code === "NON_DEFENSIBLE_CAPABILITY_DELTA"), false);
+  assert.deepEqual(driftIssues(repaired.files), []);
+  assert.deepEqual(repairCapabilityDeltaContract(repaired.files).changedPaths, []);
 });
 
 test("malformed or unknown canonical IR is never replaced with guessed defaults", () => {

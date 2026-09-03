@@ -3,14 +3,17 @@ import test from "node:test";
 import { readFile } from "node:fs/promises";
 import ts from "typescript";
 import * as canonical from "../app/canonical-mutations.ts";
-import { compileSkillIR, auditSkillIRFiles, projectSkillIRFiles, bindSkillIREvals, ensureSkillIREvalCoverage, skillIRDigest } from "../app/skill-ir.ts";
-import { isSkillIRProjectionIssue, rebuildSkillIRProjections, contractRepairFailureReason } from "../app/skill-projection-repair.ts";
+import { compileSkillIR, auditSkillIRFiles, projectEvalBank, projectSkillIRFiles, bindSkillIREvals, ensureSkillIREvalCoverage, skillIRDigest } from "../app/skill-ir.ts";
+import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract, contractRepairFailureReason } from "../app/skill-projection-repair.ts";
+import { validateBundleContentCoherence } from "../app/bundle-validator.ts";
 import { compileWorkflowDag } from "../app/workflow-dag.ts";
 import { validateImplementationFiles, applySkillIRMutations, validateCanonicalSkillIR } from "../app/canonical-mutations.ts";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "../app/bundle-resource-repair.ts";
 import { auditCapabilityClosure } from "../app/generation-loop-core.ts";
+import { auditCrossArtifactConsistency } from "../app/skill-pipeline-core.ts";
 import { capabilities, workflow } from "./fixtures/blueprint.mjs";
 import { providerRepairNeedsUserAction } from "../app/eval-prompt.ts";
+import { issuesAreCompilerOwnedEvalCoverage } from "../app/eval-repair-routing.ts";
 
 function fixture(inputName = "合同 PDF", path = "references/contract.pdf") {
   const plan = structuredClone(capabilities.capabilityPlan);
@@ -32,7 +35,7 @@ function fixture(inputName = "合同 PDF", path = "references/contract.pdf") {
 }
 
 function project(ir) {
-  const bank = ensureSkillIREvalCoverage(ir, "");
+  const bank = ensureSkillIREvalCoverage(ir, projectEvalBank(ir));
   const bound = bindSkillIREvals(ir, bank);
   return { ir: bound, files: projectSkillIRFiles(bound) };
 }
@@ -187,7 +190,32 @@ async function runRepairScenario(responses, options = {}) {
   assert.equal(functions.length, 2);
   const code = ts.transpileModule(functions.join("\n"), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
   const { ir } = fixture("合同 PDF", "references/check-rules.md");
-  const initial = project(ir).files;
+  let initial = project(ir).files;
+  if (options.evalCoverage) {
+    const restored = canonical.parseCanonicalSkillIR(initial);
+    const seed = JSON.stringify({ evals: [
+      { id: "trigger-explicit", eval_family: "trigger", category: "trigger_explicit", should_trigger: true, capability_ids: [], prompt: "请使用这个 Skill 检查我提供的合同文档，并交付一份可以逐项核对的检查报告。" },
+      { id: "trigger-implicit", eval_family: "trigger", category: "trigger_implicit", should_trigger: true, capability_ids: [], prompt: "文档和检查目标都已经提供，请沿用确认过的规则继续处理并给出可检查结果。" },
+      { id: "trigger-context", eval_family: "trigger", category: "trigger_context", should_trigger: true, capability_ids: [], prompt: "继续检查下一份新文档，保持检查目标，但不要沿用上一份文档中的具体事实。" },
+      { id: "trigger-negative", eval_family: "trigger", category: "trigger_negative", should_trigger: false, capability_ids: [], prompt: "只解释合同检查一般关注哪些问题，不要读取、修改或检查我提供的任何文档。" },
+      {
+        id: "core-document-check", eval_family: "capability", category: "core_capability", should_trigger: true,
+        capability_ids: ["core"], graders: ["core_capability"], runnable: true,
+        prompt: "合同约定交付日期为九月十五日，逾期每日按合同金额千分之一承担责任。请核对条款并交付带事实边界的检查报告。",
+        context: { fixture_status: "ready" }, expected: { behaviors: ["交付合同检查报告"], artifacts: [] },
+      },
+    ] });
+    const goodBank = ensureSkillIREvalCoverage(restored, seed);
+    const goodIR = bindSkillIREvals(restored, goodBank);
+    const badCases = goodIR.evaluationPlan.cases
+      .filter((item) => item.category !== "failure_mode")
+      .map((item) => Array.isArray(item.capability_ids) && item.capability_ids.includes("document-reader")
+        ? { ...item, capability_ids: item.capability_ids.filter((id) => id !== "document-reader") }
+        : item);
+    const badBank = JSON.stringify({ version: "2.7", evals: badCases });
+    const badIR = bindSkillIREvals(goodIR, badBank);
+    initial = projectSkillIRFiles(badIR);
+  }
   if (options.referencePresent) initial["references/check-rules.md"] = "# 检查规则\n保留原始证据。";
   if (options.drift) {
     const manifest = JSON.parse(initial["evals/capability-manifest.json"]);
@@ -195,22 +223,53 @@ async function runRepairScenario(responses, options = {}) {
     initial["evals/capability-manifest.json"] = JSON.stringify(manifest);
     initial["references/output-contract.md"] += "\nStale projection";
   }
+  if (options.invalidCapabilityDelta) {
+    const persisted = JSON.parse(initial["evals/skill-ir.json"]);
+    persisted.capabilityDelta = {
+      status: "ready", summary: "已识别能力差值", bareModelCan: ["读取输入"],
+      skillMustTeach: [{
+        id: "ordinary-workflow", taskDecision: "读取输入并输出结果",
+        bareModelBehavior: "裸模型可以读取输入", requiredSkillBehavior: "读取输入并输出结果",
+        whySkillIsNeeded: "确保结果完整", researchQuestions: ["有哪些通用最佳实践"],
+      }],
+      excludedGenericKnowledge: [], researchFocus: ["有哪些通用最佳实践"],
+    };
+    initial["evals/skill-ir.json"] = JSON.stringify(persisted, null, 2);
+  }
   const events = [], calls = [];
-  const collect = (files) => ({ audit: { warnings: [] }, closure: {}, crossArtifact: {}, issues: [
-    ...missingBundleResources(canonical.parseCanonicalSkillIR(files), files)
-      .map((item) => issue("MISSING_IMPLEMENTATION", `能力 ${item.capabilityId} 的实现文件不存在：${item.path}`, [item.path], item.capabilityId)),
-    ...auditSkillIRFiles(files).map((evidence) => issue("SKILL_IR_CLOSURE", evidence, ["evals/skill-ir.json"])).filter(isSkillIRProjectionIssue),
-  ] });
+  const collect = (files) => {
+    const coverageIssues = options.evalCoverage ? [
+      ...(!JSON.parse(files["evals/evals.json"]).evals.some((item) => item.category === "failure_mode")
+        ? [issue("LEGACY_CONTRACT_BLOCKER", "评测未同时覆盖触发边界、领域核心能力和真实失败模式")]
+        : []),
+      ...auditCrossArtifactConsistency(files).issues.filter((item) => item.type === "CAPABILITY_WITHOUT_EVAL"),
+    ] : [];
+    return { audit: { warnings: [] }, closure: {}, crossArtifact: {}, issues: [
+      ...validateBundleContentCoherence(files)
+        .filter((item) => item.code === "NON_DEFENSIBLE_CAPABILITY_DELTA")
+        .map((item) => issue(item.code, item.message, [item.path])),
+      ...missingBundleResources(canonical.parseCanonicalSkillIR(files), files)
+        .map((item) => issue("MISSING_IMPLEMENTATION", `能力 ${item.capabilityId} 的实现文件不存在：${item.path}`, [item.path], item.capabilityId)),
+      ...auditSkillIRFiles(files).map((evidence) => issue("SKILL_IR_CLOSURE", evidence, ["evals/skill-ir.json"])).filter(isSkillIRProjectionIssue),
+      ...coverageIssues,
+    ] };
+  };
   const validate = (files) => ({ executionReady: !(options.rebuildIntroducesP0 && files !== initial), contractReady: collect(files).issues.length === 0 });
   const deps = {
     ...canonical, reconcileRuntimeInputResources, missingBundleResources, contractRepairProgress, providerRepairNeedsUserAction,
-    isSkillIRProjectionIssue, contractRepairFailureReason,
+    bindSkillIREvals, ensureSkillIREvalCoverage, projectEvalBank,
+    isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, contractRepairFailureReason,
+    repairCapabilityDeltaContract,
     rebuildSkillIRProjections: options.noopRebuild ? (files) => ({ files, changedPaths: [] }) : rebuildSkillIRProjections,
     idea: "检查文档", loopPlan: workflow.loopPlan, BUILD_REPAIR_MAX_ROUNDS: 2,
     ensureCanonicalBundledResources: (value) => value,
-    finalizeSkillFiles: (files, _idea, _answers, _source, _plan, _loop, value) => ({ ...files, ...project(value).files }),
+    finalizeSkillFiles: (files, _idea, _answers, _source, _plan, _loop, value) => {
+      const bank = ensureSkillIREvalCoverage(value, files["evals/evals.json"] || projectEvalBank(value));
+      const bound = bindSkillIREvals(value, bank);
+      return { ...files, ...projectSkillIRFiles(bound) };
+    },
     validateBundle: async (files) => validate(files), collectP1ContractState: collect,
-    p1IssuesAreCompilerOwnedEvalEdges: () => false,
+    issuesAreCompilerOwnedEvalCoverage,
     isSafeSkillFilePath: (path) => !path.includes(".."),
     allowedP1MutationTypes: () => ["identity.update", "capability.update"], canonicalMutationTargetCatalog: () => ({}),
     setBuildLoop: () => {}, setGenerationLoop: () => {}, setFiles: (files) => events.push({ event: "preserved-files", files }),
@@ -236,6 +295,25 @@ test("production P1 repairs projection drift without a model call or consuming s
   assert.equal(run.result.files["evals/skill-ir.json"], run.initial["evals/skill-ir.json"]);
   assert.equal(run.result.files["references/check-rules.md"], run.initial["references/check-rules.md"]);
   assert.ok(run.events.some((event) => event.phase === "projection-repair" && event.accepted));
+});
+
+test("production P1 closes missing failure coverage and a focused capability edge without a model call", async () => {
+  const run = await runRepairScenario([], { evalCoverage: true, referencePresent: true });
+  assert.equal(run.result.passed, true, run.result.failureReason);
+  assert.equal(run.result.rounds, 1);
+  assert.equal(run.calls.length, 0);
+  assert.ok(run.events.some((event) => event.event === "generation_loop_candidate" && event.accepted === true));
+});
+
+test("production P1 repairs an invalid Capability Delta without any model call", async () => {
+  const run = await runRepairScenario([], { invalidCapabilityDelta: true, referencePresent: true });
+  assert.equal(run.result.passed, true, run.result.failureReason);
+  assert.equal(run.result.rounds, 1);
+  assert.equal(run.calls.length, 0);
+  const restored = JSON.parse(run.result.files["evals/skill-ir.json"]);
+  assert.equal(restored.capabilityDelta.status, "insufficient");
+  assert.deepEqual(restored.capabilityDelta.skillMustTeach, []);
+  assert.ok(run.events.some((event) => event.event === "generation_loop_candidate" && event.accepted === true));
 });
 
 test("production P1 removes projection blockers before asking the model about a real missing reference", async () => {

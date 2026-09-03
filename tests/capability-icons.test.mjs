@@ -25,7 +25,9 @@ test("capability choices and section headings render icons, and blueprint contro
   assert.match(page, /<strong className="capability-library-title"><img src="\/icons\/tabler\/plug.svg"[^>]*\/>添加能力<\/strong>/);
   assert.doesNotMatch(page, /宿主 Tools 与外部 MCP 分开选择/);
   assert.match(page, /blueprintExpanded \? "收起蓝图" : "展开蓝图"/);
-  assert.equal((page.match(/<img src=\{capabilityIconPath\(item.id, item.kind\)\}/g) || []).length, 2);
+  // Picker, selected-capability summary, and runtime adoption summary all use
+  // the same catalog icon rather than falling back to text initials.
+  assert.equal((page.match(/<img src=\{capabilityIconPath\(item.id, item.kind\)\}/g) || []).length, 3);
   assert.doesNotMatch(page, /<span className="capability-icon">\{CAPABILITY_KIND_META\[item.kind\].icon\}/);
   assert.match(page, /CAPABILITY_CATEGORY_ICONS\[category\]/);
 });

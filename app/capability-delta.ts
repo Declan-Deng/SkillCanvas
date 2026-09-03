@@ -80,15 +80,18 @@ export function normalizeCapabilityDelta(value: unknown): CapabilityDelta {
       researchQuestions: list(candidate.researchQuestions, 8, 260),
     }];
   }).slice(0, 12);
-  const researchFocus = Array.from(new Set([
+  // Research is downstream of a defensible gap. Keeping model-authored focus
+  // after every gap was rejected used to let generic workflow prose leak back
+  // into the knowledge compiler and made an invalid delta look "ready" again.
+  const researchFocus = gaps.length ? Array.from(new Set([
     ...list(raw.researchFocus, 12, 260),
     ...gaps.flatMap((gap) => gap.researchQuestions),
-  ])).slice(0, 16);
+  ])).slice(0, 16) : [];
   return {
     status: gaps.length ? "ready" : "insufficient",
-    summary: clean(raw.summary, gaps.length
-      ? `已识别 ${gaps.length} 项裸模型与目标 Skill 之间的行为差值`
-      : "尚未识别出可证明的能力差值；不会用通用最佳实践填充 Skill。", 620),
+    summary: gaps.length
+      ? clean(raw.summary, `已识别 ${gaps.length} 项裸模型与目标 Skill 之间的行为差值`, 620)
+      : "尚未识别出可证明的能力差值；不会用通用最佳实践填充 Skill。",
     bareModelCan: list(raw.bareModelCan, 12, 260),
     skillMustTeach: gaps,
     excludedGenericKnowledge: list(raw.excludedGenericKnowledge, 12, 260),

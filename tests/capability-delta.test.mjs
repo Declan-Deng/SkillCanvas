@@ -50,3 +50,23 @@ test("capability delta rejects a workflow restatement that adds no decision rule
   assert.equal(delta.status, "ready");
   assert.deepEqual(delta.skillMustTeach.map((item) => item.id), ["source-boundary"]);
 });
+
+test("rejected gaps cannot retain a misleading ready summary or research scope", () => {
+  const delta = normalizeCapabilityDelta({
+    status: "ready",
+    summary: "已经找到关键差值",
+    researchFocus: ["搜索更多通用最佳实践"],
+    skillMustTeach: [{
+      id: "ordinary-workflow",
+      taskDecision: "读取输入并输出结果",
+      bareModelBehavior: "裸模型可以读取输入",
+      requiredSkillBehavior: "读取输入并输出结果",
+      whySkillIsNeeded: "确保结果完整",
+    }],
+  });
+
+  assert.equal(delta.status, "insufficient");
+  assert.deepEqual(delta.skillMustTeach, []);
+  assert.deepEqual(delta.researchFocus, []);
+  assert.match(delta.summary, /尚未识别出可证明的能力差值/);
+});

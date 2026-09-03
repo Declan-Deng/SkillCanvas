@@ -2,7 +2,7 @@ import { auditUserEvidencePolarity, bindSkillIREvals, normalizeKnowledgeAssessme
 import { requirementEvidence } from "./user-evidence.ts";
 import { bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, normalizeWorkflowDagSteps, WORKFLOW_TERMINALS } from "./workflow-dag.ts";
 import { hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
-import { EMPTY_CAPABILITY_DELTA } from "./capability-delta.ts";
+import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta } from "./capability-delta.ts";
 import { reconcileRuntimeInputResources, hasRuntimeInputBinding } from "./bundle-resource-repair.ts";
 
 export type CanonicalMutation =
@@ -165,6 +165,7 @@ function replaceById<T extends object>(items: T[], idKey: keyof T, id: string, c
 
 function reconcileDerivedContracts(ir: SkillIR) {
   const next = reconcileSkillIRUserEvidence(structuredClone(ir));
+  next.capabilityDelta = normalizeCapabilityDelta(next.capabilityDelta);
   const taskIdsByCapability = new Map<string, string[]>();
   next.tasks.forEach((task) => task.capabilityIds.forEach((capabilityId) => {
     taskIdsByCapability.set(capabilityId, [...(taskIdsByCapability.get(capabilityId) || []), task.id]);
@@ -397,14 +398,15 @@ export function semanticSkillIRDigest(value: SkillIR | Record<string, string>) {
 export function parseCanonicalSkillIR(files: Record<string, string>) {
   try {
     const parsed = JSON.parse(files["evals/skill-ir.json"] || "") as SkillIR;
+    const capabilityDelta = normalizeCapabilityDelta(parsed.capabilityDelta || EMPTY_CAPABILITY_DELTA);
     return reconcileSkillIRUserEvidence({
       ...parsed,
-      capabilityDelta: parsed.capabilityDelta || EMPTY_CAPABILITY_DELTA,
+      capabilityDelta,
       knowledgeAssessment: normalizeKnowledgeAssessment(
         parsed.knowledgeAssessment,
         Array.isArray(parsed.domainEvidence) ? parsed.domainEvidence : [],
-        Boolean(parsed.capabilityDelta?.skillMustTeach?.length),
-        parsed.capabilityDelta?.skillMustTeach?.map((gap) => gap.id) || [],
+        capabilityDelta.skillMustTeach.length > 0,
+        capabilityDelta.skillMustTeach.map((gap) => gap.id),
       ),
       runtimeContract: { ...parsed.runtimeContract, workflow: normalizeWorkflowDagSteps(parsed.runtimeContract?.workflow) },
     });

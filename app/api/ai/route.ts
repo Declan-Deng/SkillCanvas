@@ -8,6 +8,7 @@ import { IncompleteCompletionStreamError, readCompletionResponse } from "../../a
 import { persistDiagnostic, readServerCredentials, tenantContext } from "../../server-data";
 import { checkRequestRate } from "../../request-guard";
 import { demoScoringPolicyPrompt, qualityScoringPolicyPrompt } from "../../gate-outcome";
+import { demoReplyNeedsUserTurn, normalizePlannedDemoTurns } from "../../demo-episode";
 import { normalizeCanonicalMutations, isRepairImplementationPath } from "../../canonical-mutations";
 import { diagnoseModelJsonFailure, normalizeModelJsonContent } from "../../model-json";
 import { annotateInterviewEvidence, USER_EVIDENCE_PROMPT } from "../../user-evidence";
@@ -809,13 +810,14 @@ Eval failure attribution is binding:
 - missing_decision_rule: modify only domain-evidence.*.
 - missing_exception: modify only risk-branch.*.
 - missing_tool_knowledge: modify only capability.update for the attributed tool capability.
-- missing_verification: modify only output.update or eval-source.*.
+- missing_verification: modify only output.update, eval-source.add, or eval-source.update; never delete a failing Eval.
 - instruction_conflict: modify only requirement.update/remove or constraint.update/remove.
 - Each typed Issue Object includes allowedMutationTypes. Obey it exactly. Never respond to a typed Eval failure with whole-Skill regeneration or an implementation-file operation.
 
 Rules:
 - Obey the supplied mutation budget exactly. Do not add a capability after the Build Loop freezes the architecture. All semantic changes MUST be CanonicalMutation objects. File operations are reserved for scripts/** and assets/** implementation bytes; never patch a compiler-owned projection.
 - Every update/remove mutation MUST use an exact ID from the supplied Canonical target catalog. Never invent a target ID.
+- Treat evidenceBoundTargets as an exact compiler binding, not an example. When it contains one ID for an owner, every update mutation for that owner MUST use that ID verbatim; labels such as output-primary, eval-source-1, default, current, or new are invalid placeholders.
 - input.add MUST provide the complete input object, including id, concept, name, required, source, availableAtBuild, missingBehavior, and resolution {mode, authority, allowedSources, markProvisional, reversibleOnly, stopCondition}. If evidence cannot determine that contract, update an existing input or return a narrower mutation instead.
 - Never include an operation for a compiler-protected artifact. If a rejected attempt exceeded the budget or touched a protected artifact, return a smaller replacement plan in the current attempt instead of repeating the rejected mutation surface.
 - When any selected issue is P0, include only P0 issueIds, repair only the failing static artifact, and request only a static regression. Do not perform semantic, research, wording, or capability optimization in that plan.
@@ -858,13 +860,16 @@ Rules:
     return {
       system: `You are running one forward test of a generated Codex Agent Skill for its owner. Produce a concrete task and then perform it by following the supplied Skill bundle. This is a visible product demonstration, not a static file audit.
 
-Return valid JSON only with this shape: {"demo":{"title":"short Chinese title","scenario":"why this is a representative real-use situation","userPrompt":"the exact realistic user request used for this trial","output":"the complete result the user would actually receive","appliedRules":["3-6 observable choices made because of this Skill"],"uncertainties":["0-4 things the Skill could not safely decide or complete"]}}.
+Return valid JSON only with this shape: {"demo":{"title":"short Chinese title","scenario":"why this is a representative real-use situation","userPrompt":"the exact realistic user request used for this trial","output":"the complete result the user would actually receive on turn one","appliedRules":["3-6 observable choices made because of this Skill"],"uncertainties":["0-4 things the Skill could not safely decide or complete"],"mockTurns":[{"message":"an exact plausible next user reply that answers the output's blocking question","purpose":"what missing input or checkpoint this supplies"}]}}.
 
 Rules:
 - First derive one representative task from the confirmed goal, workflow, desired output, success criteria, failure patterns, and available materials. Do not create a generic meta-question about the Skill.
 - Then execute that task according to the current Skill. The output must be the actual user-facing deliverable or the exact clarification behavior required by the Skill, not a plan for producing it and not an explanation of SKILL.md.
 - Make the trial input self-contained enough for the owner to verify the output. If no real uploaded material is supplied, include the synthetic rows, numbers, text, or constraints directly in userPrompt; never say “数据在附件里” or claim an attachment exists. If real material is supplied, identify the supplied test excerpt without exposing direct identifiers.
 - Every input or confirmation that the Skill marks as required must be visibly present in userPrompt with an explicit test value. Otherwise the Demo output must stop at the required clarification; it may not silently choose the missing value. Never list a confirmation in appliedRules unless the userPrompt visibly contains that confirmation or the output visibly asks for it.
+- When the turn-one output asks for necessary information or confirmation, include one or two mockTurns that directly answer it so the runner can continue the same Episode. The first mock turn should answer all questions that can naturally be answered together; use a second only when the workflow genuinely has a later checkpoint. When the output is already a complete result and asks no blocking question, return an empty mockTurns array.
+- mockTurns are visible synthetic test inputs, not facts about the real owner. Use ordinary, internally consistent values; never claim a file was uploaded, an external lookup occurred, or the owner approved a real-world action. Put any needed test material directly in message.
+- Do not use mockTurns to praise the result, influence the evaluator, change the task, or bypass a safety boundary. Each turn must make the preceding clarification answerable and let the Skill reveal its real multi-turn behavior.
 - For formulas, rankings, conversions, or scripts, use small concrete inputs whose expected result can be independently checked. The Demo output must be consistent with those visible inputs and must not claim that an unexecuted script or hidden file was run.
 - Make the task demanding enough to reveal personal fit: include at least one realistic ambiguity, prioritization choice, or format decision that the Skill must handle.
 - Use uploaded material when it is relevant and available. Never repeat direct identifiers, credentials, or unnecessary private details.
@@ -1362,6 +1367,28 @@ export async function POST(request: Request) {
                   continue;
                 }
                 return Response.json({ error: "模型连续两次没有返回可执行的修复结构；当前 Bundle 已保留", requestId }, { status: 502 });
+              }
+            }
+            if (body.mode === "demo") {
+              try {
+                const payload = JSON.parse(responseContent) as { demo?: Record<string, unknown> };
+                const demo = payload.demo;
+                if (!demo || typeof demo.userPrompt !== "string" || typeof demo.output !== "string" || !demo.userPrompt.trim() || !demo.output.trim()) {
+                  throw new Error("Demo 缺少输入或首轮输出");
+                }
+                const mockTurns = normalizePlannedDemoTurns(demo.mockTurns);
+                if (demoReplyNeedsUserTurn(demo.output) && !mockTurns.length) {
+                  throw new Error("首轮正在等待输入，但没有提供可执行的模拟用户补充");
+                }
+                payload.demo = { ...demo, mockTurns };
+                responseContent = JSON.stringify(payload);
+              } catch (error) {
+                writeAiDiagnostic("warn", { event: "ai_demo_episode_invalid", requestId, mode: body.mode, attempt, reason: error instanceof Error ? error.message : "Demo Episode 不完整" }, tenant.tenantId);
+                if (attempt === 1) {
+                  retryReason = "incomplete-demo-episode";
+                  continue;
+                }
+                return Response.json({ error: "模型连续两次没有完成可续跑的 Demo Episode；当前 Skill 已保留，请重试本步骤", requestId }, { status: 502 });
               }
             }
             writeAiDiagnostic("info", {

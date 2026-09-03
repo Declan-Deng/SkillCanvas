@@ -5,12 +5,14 @@ import {
   auditOpenSkillQuality,
   FAILURE_ATTRIBUTION_MUTATIONS,
   applyPatchPlan,
+  bindPatchPlanTargetIds,
   attributeEvalFailure,
   auditCrossArtifactConsistency,
   capabilityOwnsArtifacts,
   caseProvidesCapabilityEvidence,
   candidateUtility,
   constrainPatchPlan,
+  contractIssueIdentity,
   estimateDomainValueDensity,
   focusOptimizationIssues,
   inferEvalFamily,
@@ -22,6 +24,13 @@ import {
   validatePatchPlan,
 } from "../app/skill-pipeline-core.ts";
 
+test("structured and legacy wrappers deduplicate to one contract issue", () => {
+  const message = "Capability Delta 第 1 项只是普通工作流复述、字段不完整，或没有说明具体失败与新增决策";
+  const structured = { type: "P1_CONTRACT_BLOCKER", evidence: `[NON_DEFENSIBLE_CAPABILITY_DELTA] ${message}` };
+  const legacy = { type: "LEGACY_CONTRACT_BLOCKER", evidence: `[NON_DEFENSIBLE_CAPABILITY_DELTA] ${message}` };
+  assert.equal(contractIssueIdentity(structured), contractIssueIdentity(legacy));
+});
+
 test("Eval failures are attributed to one bounded Canonical SkillIR owner", () => {
   assert.equal(attributeEvalFailure("缺少用于选择候选方案的判断规则").type, "missing_decision_rule");
   assert.equal(attributeEvalFailure("空值和异常输入没有例外分支").type, "missing_exception");
@@ -32,6 +41,7 @@ test("Eval failures are attributed to one bounded Canonical SkillIR owner", () =
   assert.equal(attributeEvalFailure("执行只返回分析步骤，没有产生任何可检查输出", "integration").type, "missing_verification");
   assert.equal(attributeEvalFailure("integration 分支拒绝交付，但不存在工具调用问题", "integration").type, "missing_verification");
   assert.deepEqual(FAILURE_ATTRIBUTION_MUTATIONS.missing_exception, ["risk-branch.add", "risk-branch.update", "risk-branch.remove"]);
+  assert.deepEqual(FAILURE_ATTRIBUTION_MUTATIONS.missing_verification, ["output.update", "eval-source.add", "eval-source.update"]);
 });
 
 test("attributed Eval failures reject whole-Skill or cross-owner patches", () => {
@@ -118,6 +128,76 @@ test("decision rules learned from Eval retain provenance instead of becoming mod
   assert.equal(validatePatchPlan({ plan: withEvidence, issues: [issue], files: {}, capabilities: [] }).valid, true);
 });
 
+test("planner placeholder IDs bind to the exact failed Eval and output owner", () => {
+  const files = {
+    "evals/skill-ir.json": JSON.stringify({
+      requirements: [], tasks: [], inputs: [], constraints: [], knowledgeRequirements: [], domainEvidence: [], riskBranches: [],
+      capabilities: [{ id: "resume-writer" }],
+      outputs: [{ id: "tailored-resume", producerCapabilityIds: ["resume-writer"] }],
+      evaluationPlan: { cases: [{ id: "resume-missing-keywords", prompt: "tailor this resume" }] },
+    }),
+  };
+  const issue = {
+    id: "eval-missing-verification-resume",
+    priority: "P1",
+    type: "EVAL_MISSING_VERIFICATION",
+    source: "eval",
+    evidence: "最终简历没有通过关键词核对",
+    files: [],
+    capabilityId: "resume-writer",
+    failureType: "missing_verification",
+    allowedMutationTypes: FAILURE_ATTRIBUTION_MUTATIONS.missing_verification,
+    evalCaseIds: ["resume-missing-keywords"],
+  };
+  const plan = normalizePatchPlan({
+    strategy: "repair_eval",
+    issueIds: [issue.id],
+    impact: { scope: "task-specific", regressionFamilies: ["capability"] },
+    canonicalMutations: [
+      { type: "eval-source.update", caseId: "eval-source-1", changes: { graders: ["core_capability", "output_contract"] } },
+      { type: "output.update", outputId: "output-primary", changes: { validation: ["核对关键词覆盖"] } },
+    ],
+    operations: [],
+  });
+  assert.ok(plan);
+  const bound = bindPatchPlanTargetIds({ plan, issues: [issue], files });
+  assert.equal(bound.plan.canonicalMutations[0].caseId, "resume-missing-keywords");
+  assert.equal(bound.plan.canonicalMutations[1].outputId, "tailored-resume");
+  assert.deepEqual(bound.bindings.map((item) => [item.from, item.to]), [
+    ["eval-source-1", "resume-missing-keywords"],
+    ["output-primary", "tailored-resume"],
+  ]);
+});
+
+test("placeholder binding never redirects destructive or ambiguous mutations", () => {
+  const files = {
+    "evals/skill-ir.json": JSON.stringify({
+      requirements: [], tasks: [], capabilities: [], inputs: [], constraints: [], knowledgeRequirements: [], domainEvidence: [], riskBranches: [],
+      outputs: [{ id: "output-a", producerCapabilityIds: [] }, { id: "output-b", producerCapabilityIds: [] }],
+      evaluationPlan: { cases: [{ id: "case-a" }, { id: "case-b" }] },
+    }),
+  };
+  const issue = { id: "ambiguous", priority: "P1", type: "OUTPUT_GAP", source: "eval", evidence: "unknown", files: [] };
+  const plan = normalizePatchPlan({
+    strategy: "repair_eval",
+    issueIds: [issue.id],
+    impact: { scope: "task-specific", regressionFamilies: ["capability"] },
+    canonicalMutations: [
+      { type: "output.update", outputId: "output-primary", changes: { validation: ["check"] } },
+      { type: "eval-source.remove", caseId: "eval-source-1" },
+    ],
+    operations: [],
+  });
+  assert.ok(plan);
+  const bound = bindPatchPlanTargetIds({ plan, issues: [issue], files });
+  assert.equal(bound.plan.canonicalMutations[0].outputId, "output-primary");
+  assert.equal(bound.plan.canonicalMutations[1].caseId, "eval-source-1");
+  assert.equal(bound.bindings.length, 0);
+  const validation = validatePatchPlan({ plan: bound.plan, issues: [issue], files, capabilities: [] });
+  assert.equal(validation.valid, false);
+  assert.match(validation.errors.join("；"), /output-primary.*不存在|eval-source-1.*不存在/);
+});
+
 test("tool failures can only update the attributed capability", () => {
   const issue = {
     id: "eval-tool-receipt",
@@ -184,6 +264,7 @@ test("semantic LLM content does not impersonate a real file producer", () => {
   assert.equal(capabilityOwnsArtifacts({ id: "pdf-reader", kind: "builtin-tool", output: "带页码的结构化内容", routingCondition: "用户上传 PDF 文档时" }), false);
   assert.equal(capabilityOwnsArtifacts({ id: "data-check", kind: "script", output: "校验报告和 Markdown 表格", affects: ["output-contract"] }), false);
   assert.equal(capabilityOwnsArtifacts({ id: "web-search", kind: "builtin-tool", output: "搜索结果", affects: ["output-contract"] }), false);
+  assert.equal(capabilityOwnsArtifacts({ id: "host-shell-code", kind: "builtin-tool", output: "退出状态、标准输出、测试结果或生成文件", affects: ["tool-routing"] }), false);
   assert.equal(capabilityOwnsArtifacts({ id: "csv-template", kind: "asset", output: "CSV 模板", affects: ["artifact-output"] }), false);
 });
 

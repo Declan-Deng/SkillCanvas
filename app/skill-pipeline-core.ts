@@ -17,7 +17,9 @@ export const FAILURE_ATTRIBUTION_MUTATIONS: Record<EvalFailureType, string[]> = 
   missing_decision_rule: ["domain-evidence.add", "domain-evidence.update", "domain-evidence.remove"],
   missing_exception: ["risk-branch.add", "risk-branch.update", "risk-branch.remove"],
   missing_tool_knowledge: ["capability.update"],
-  missing_verification: ["output.update", "eval-source.add", "eval-source.update", "eval-source.remove"],
+  // A failed verification may be strengthened or its observable output
+  // contract repaired. Deleting the failing Eval would only hide evidence.
+  missing_verification: ["output.update", "eval-source.add", "eval-source.update"],
   instruction_conflict: ["requirement.update", "requirement.remove", "constraint.update", "constraint.remove"],
 };
 
@@ -145,6 +147,13 @@ export type PatchPlan = {
   impact: PatchImpact;
 };
 
+export type PatchTargetBinding = {
+  mutationIndex: number;
+  type: CanonicalMutation["type"];
+  from: string;
+  to: string;
+};
+
 export type CrossArtifactReport = {
   passed: boolean;
   issues: PipelineIssue[];
@@ -208,6 +217,14 @@ export function makeContractIssues(messages: string[]): PipelineIssue[] {
     evidence: message,
     files: [],
   }));
+}
+
+/** Stable identity across the structured validator adapter and the legacy
+ * audit wrapper. Both may report the same detector code with different outer
+ * issue types; one defect must remain one repair target. */
+export function contractIssueIdentity(issue: Pick<PipelineIssue, "type" | "evidence">) {
+  const embeddedCode = issue.evidence.match(/^\[([A-Z0-9_]+)\]\s*/)?.[1];
+  return `${embeddedCode || issue.type}:${issue.evidence.replace(/^\[[A-Z0-9_]+\]\s*/, "")}`;
 }
 
 export function selectHighestPriorityIssues(issues: PipelineIssue[]) {
@@ -300,9 +317,12 @@ export function capabilityOwnsArtifacts(item: ScopedCapability) {
   // bundled asset is an input resource, not the owner of a newly delivered
   // artifact. Ownership must be declared explicitly or expressed as a real
   // create/write/export action.
-  const explicitOwnership = list(item.affects).some((entry) => /^(?:artifact-output|file-output)$/i.test(entry.trim()));
-  const producesFile = /(?:create|write|export|save|generate|render|创建|写入|导出|保存|生成|渲染).{0,32}(?:artifact|file|pdf|docx?|pptx?|xlsx?|csv|json|html|markdown|图片|图像|文件|产物)|(?:artifact|file|pdf|docx?|pptx?|xlsx?|csv|json|html|markdown|图片|图像|文件|产物).{0,32}(?:create|write|export|save|generate|render|创建|写入|导出|保存|生成|渲染)/i.test(item.output || "");
-  return explicitOwnership || producesFile;
+  // Catalog descriptions often list several possible observations, such as
+  // "stdout, test result, or generated file". That wording is not an active
+  // file-delivery contract. The artifact compiler sets this effect only when
+  // the current task really requires a file, so ownership must use the
+  // canonical effect instead of guessing from prose.
+  return list(item.affects).some((entry) => /^(?:artifact-output|file-output)$/i.test(entry.trim()));
 }
 
 /** Close an explicit file-delivery contract with a real runtime owner.
@@ -522,6 +542,106 @@ export function normalizePatchPlan(value: unknown): PatchPlan | null {
   };
 }
 
+/** Bind placeholder update targets to compiler-owned IDs when failure
+ * evidence leaves exactly one safe target. Models often invent plausible IDs
+ * such as `output-primary` or `eval-source-1`; retrying the same model cannot
+ * make that mapping safer than the canonical graph already can.
+ *
+ * Only non-destructive updates are redirected, and only when unambiguous.
+ * Additions retain their supplied IDs and removals are never redirected. */
+export function bindPatchPlanTargetIds(input: {
+  plan: PatchPlan;
+  issues: PipelineIssue[];
+  files: Record<string, string>;
+}) {
+  const ir = parseJson<{
+    requirements?: Array<{ id?: string }>;
+    tasks?: Array<{ id?: string }>;
+    capabilities?: Array<{ id?: string }>;
+    inputs?: Array<{ id?: string }>;
+    outputs?: Array<{ id?: string; producerCapabilityIds?: string[] }>;
+    constraints?: Array<{ id?: string }>;
+    knowledgeRequirements?: Array<{ id?: string }>;
+    domainEvidence?: Array<{ id?: string }>;
+    riskBranches?: Array<{ id?: string }>;
+    evaluationPlan?: { cases?: Array<{ id?: string }> };
+  }>(input.files["evals/skill-ir.json"]);
+  if (!ir) return { plan: input.plan, bindings: [] as PatchTargetBinding[] };
+
+  const selectedIssues = input.plan.issueIds.flatMap((id) => input.issues.find((issue) => issue.id === id) || []);
+  const unique = (values: Array<string | undefined>) => [...new Set(values.filter((value): value is string => Boolean(value?.trim())).map((value) => value.trim()))];
+  const ids = {
+    requirement: unique((ir.requirements || []).map((item) => item.id)),
+    task: unique((ir.tasks || []).map((item) => item.id)),
+    capability: unique((ir.capabilities || []).map((item) => item.id)),
+    input: unique((ir.inputs || []).map((item) => item.id)),
+    output: unique((ir.outputs || []).map((item) => item.id)),
+    constraint: unique((ir.constraints || []).map((item) => item.id)),
+    knowledge: unique((ir.knowledgeRequirements || []).map((item) => item.id)),
+    "domain-evidence": unique((ir.domainEvidence || []).map((item) => item.id)),
+    "risk-branch": unique((ir.riskBranches || []).map((item) => item.id)),
+    "eval-source": unique((ir.evaluationPlan?.cases || []).map((item) => item.id)),
+  } as const;
+  const issueEvalIds = unique(selectedIssues.flatMap((issue) => issue.evalCaseIds || [])).filter((id) => ids["eval-source"].includes(id));
+  const issueCapabilityIds = unique(selectedIssues.map((issue) => issue.capabilityId)).filter((id) => ids.capability.includes(id));
+  const issueOutputIds = unique((ir.outputs || [])
+    .filter((output) => (output.producerCapabilityIds || []).some((id) => issueCapabilityIds.includes(id)))
+    .map((output) => output.id));
+  const bindings: PatchTargetBinding[] = [];
+
+  const bind = (mutation: CanonicalMutation, index: number): CanonicalMutation => {
+    if (!mutation.type.endsWith(".update")) return mutation;
+    const owner = mutation.type.slice(0, -".update".length) as keyof typeof ids;
+    if (!(owner in ids)) return mutation;
+    const idKey = ({
+      requirement: "requirementId",
+      task: "taskId",
+      capability: "capabilityId",
+      input: "inputId",
+      output: "outputId",
+      constraint: "constraintId",
+      knowledge: "knowledgeId",
+      "domain-evidence": "evidenceId",
+      "risk-branch": "branchId",
+      "eval-source": "caseId",
+    } as const)[owner];
+    const current = String((mutation as unknown as Record<string, unknown>)[idKey] || "");
+    const validIds = ids[owner] as readonly string[];
+    if (validIds.includes(current)) return mutation;
+    const evidenceTargets = owner === "eval-source"
+      ? issueEvalIds
+      : owner === "capability"
+        ? issueCapabilityIds
+        : owner === "output"
+          ? issueOutputIds
+          : [];
+    const candidates = evidenceTargets.length === 1 ? evidenceTargets : validIds.length === 1 ? [...validIds] : [];
+    if (candidates.length !== 1) return mutation;
+    const to = candidates[0];
+    bindings.push({ mutationIndex: index, type: mutation.type, from: current, to });
+    return { ...mutation, [idKey]: to } as CanonicalMutation;
+  };
+
+  return {
+    plan: { ...input.plan, canonicalMutations: input.plan.canonicalMutations.map(bind) },
+    bindings,
+  };
+}
+
+function canonicalMutationTarget(mutation: CanonicalMutation): { owner: string; id: string } | null {
+  if (mutation.type === "requirement.update" || mutation.type === "requirement.remove") return { owner: "requirement", id: mutation.requirementId };
+  if (mutation.type === "task.update" || mutation.type === "task.remove") return { owner: "task", id: mutation.taskId };
+  if (mutation.type === "capability.update" || mutation.type === "capability.remove") return { owner: "capability", id: mutation.capabilityId };
+  if (mutation.type === "input.update" || mutation.type === "input.remove") return { owner: "input", id: mutation.inputId };
+  if (mutation.type === "output.update" || mutation.type === "output.remove") return { owner: "output", id: mutation.outputId };
+  if (mutation.type === "constraint.update" || mutation.type === "constraint.remove") return { owner: "constraint", id: mutation.constraintId };
+  if (mutation.type === "knowledge.update" || mutation.type === "knowledge.remove") return { owner: "knowledge", id: mutation.knowledgeId };
+  if (mutation.type === "domain-evidence.update" || mutation.type === "domain-evidence.remove") return { owner: "domain-evidence", id: mutation.evidenceId };
+  if (mutation.type === "risk-branch.update" || mutation.type === "risk-branch.remove") return { owner: "risk-branch", id: mutation.branchId };
+  if (mutation.type === "eval-source.update" || mutation.type === "eval-source.remove") return { owner: "eval-source", id: mutation.caseId };
+  return null;
+}
+
 export function validatePatchPlan(input: {
   plan: PatchPlan;
   issues: PipelineIssue[];
@@ -558,6 +678,36 @@ export function validatePatchPlan(input: {
       && toolCapabilityIds.length > 0
       && !toolCapabilityIds.includes(mutation.capabilityId));
     if (wrongToolTarget) errors.push(`工具知识失败只能修改被归因的能力：${toolCapabilityIds.join("、")}`);
+  }
+  const ir = parseJson<{
+    requirements?: Array<{ id?: string }>;
+    tasks?: Array<{ id?: string }>;
+    capabilities?: Array<{ id?: string }>;
+    inputs?: Array<{ id?: string }>;
+    outputs?: Array<{ id?: string }>;
+    constraints?: Array<{ id?: string }>;
+    knowledgeRequirements?: Array<{ id?: string }>;
+    domainEvidence?: Array<{ id?: string }>;
+    riskBranches?: Array<{ id?: string }>;
+    evaluationPlan?: { cases?: Array<{ id?: string }> };
+  }>(input.files["evals/skill-ir.json"]);
+  if (ir) {
+    const targets: Record<string, Set<string>> = {
+      requirement: new Set((ir.requirements || []).map((item) => String(item.id || "")).filter(Boolean)),
+      task: new Set((ir.tasks || []).map((item) => String(item.id || "")).filter(Boolean)),
+      capability: new Set((ir.capabilities || []).map((item) => String(item.id || "")).filter(Boolean)),
+      input: new Set((ir.inputs || []).map((item) => String(item.id || "")).filter(Boolean)),
+      output: new Set((ir.outputs || []).map((item) => String(item.id || "")).filter(Boolean)),
+      constraint: new Set((ir.constraints || []).map((item) => String(item.id || "")).filter(Boolean)),
+      knowledge: new Set((ir.knowledgeRequirements || []).map((item) => String(item.id || "")).filter(Boolean)),
+      "domain-evidence": new Set((ir.domainEvidence || []).map((item) => String(item.id || "")).filter(Boolean)),
+      "risk-branch": new Set((ir.riskBranches || []).map((item) => String(item.id || "")).filter(Boolean)),
+      "eval-source": new Set((ir.evaluationPlan?.cases || []).map((item) => String(item.id || "")).filter(Boolean)),
+    };
+    input.plan.canonicalMutations.forEach((mutation) => {
+      const target = canonicalMutationTarget(mutation);
+      if (target && !targets[target.owner]?.has(target.id)) errors.push(`${mutation.type} 目标 ${target.id || "<empty>"} 不存在于当前 Canonical SkillIR`);
+    });
   }
   const changedPaths = new Set(input.plan.operations.map((item) => item.path));
   const newFiles = input.plan.operations.filter((item) => item.action === "create" && !(item.path in input.files));

@@ -139,8 +139,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /validation\.issues\.filter\(\(issue\) => issue\.priority === "P0"\)/);
   assert.match(page, /async function runP1ContractRepairLoop\(/);
   assert.match(page, /category: "P1_CONTRACT_BLOCKER"/);
-  assert.match(page, /p1IssuesAreCompilerOwnedEvalEdges/);
-  assert.match(page, /Canonical Eval Compiler 已确定性补齐全部激活能力的可执行 Eval 映射/);
+  assert.match(page, /issuesAreCompilerOwnedEvalCoverage/);
+  assert.match(page, /Canonical Eval Compiler 已确定性补齐失败模式与全部激活能力的聚焦 Eval/);
   assert.match(page, /reconcileCapabilityPlanWithCanonicalIR/);
   assert.match(page, /optimization-waiting-note/);
   assert.match(page, /if \(!initialContractRepair\.passed \|\| !bestBundleValidation\.contractReady \|\| staticPolicy\.priority === "P1"\)/);
@@ -217,6 +217,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /icon:\s*"\/skillcanvas-notification-icon\.png"/);
   assert.match(page, /navigator\.serviceWorker\.register\("\/notification-sw\.js"/);
   assert.match(page, /notification_delivery_failed/);
+  assert.match(page, /registration\.getNotifications/);
+  assert.match(page, /completion-browser-fallback/);
+  assert.match(page, /document\.title = `● \$\{title\} · SkillCanvas`/);
   assert.match(page, /SkillCanvas 通知已开启/);
   assert.match(page, /compilerClosedArtifactContract/);
   assert.match(page, /reconcileArtifactOutputContract/);
@@ -252,7 +255,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /AI 正在修复发布前问题/);
   assert.doesNotMatch(page, /文件发布检查已通过|还有少量不会阻止下载的提醒/);
   assert.match(page, /bundleAudit.blockers.length > 0 && <div className="finding-card">/);
-  assert.match(page, /AI 工具建议/);
+  assert.match(page, /能力选型结果/);
   assert.match(page, /目标、子目标与循环/);
   assert.match(page, /AI 已推荐并采用一条可执行流程/);
   assert.match(page, /推荐工作流：目标、子目标与循环/);
@@ -308,6 +311,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /renotify:\s*true/);
   assert.match(page, /notifyGenerationLoopResult\(state\)/);
   assert.match(page, /完成后通过浏览器通知你/);
+  assert.match(page, /项运行能力已采用/);
+  assert.match(page, /adoptedRuntimeCapabilities\.map/);
+  assert.match(page, /完成这个任务实际会用到什么/);
   assert.match(page, /runIsolatedEvalHarness/);
   assert.match(page, /三用例执行未完成，仅拆分当前小批次/);
   assert.match(page, /const executionChunkSize = containsEpisodes \? 1 : shouldChunkExecution \? 3 : input\.cases\.length/);
@@ -342,6 +348,11 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /function enterEvaluation\(\)/);
   assert.match(page, /onClick=\{enterEvaluation\}/);
   assert.match(page, /function sendDemoChatMessage\(\)/);
+  assert.match(page, /function runAutomaticDemoTurns\(/);
+  assert.match(page, /demoReplyNeedsUserTurn\(latestReply\)/);
+  assert.match(page, /conversationEvidence: episodeConversation/);
+  assert.match(page, /已自动续跑/);
+  assert.match(page, /自动补充的测试输入/);
   assert.match(page, /function handleDemoChatFiles\(/);
   assert.match(page, /function reevaluateDemoConversation\(/);
   assert.match(page, /更新评分/);
@@ -358,6 +369,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /继续试用这个 Skill/);
   assert.match(route, /mode === "demo-chat"/);
   assert.match(route, /continuing the same visible trial/);
+  assert.match(route, /"mockTurns"/);
+  assert.match(route, /one or two mockTurns/);
   assert.match(route, /Multi-turn conversation evidence/);
   assert.match(route, /A file attached during the conversation is user-provided material/);
   assert.match(page, /const CAPABILITY_LIBRARY/);

@@ -6,7 +6,7 @@ import {
   normalizeAnswerEvidence,
   type ContentPermission,
 } from "./evidence-gates.ts";
-import { EMPTY_CAPABILITY_DELTA, type CapabilityDelta } from "./capability-delta.ts";
+import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta.ts";
 import { EVAL_COMPILER_VERSION } from "./eval-prompt.ts";
 import { hostEvidenceAdapter } from "./host-evidence-adapters.ts";
 import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
@@ -1010,7 +1010,10 @@ export function compileSkillIR(input: {
 }): SkillIR {
   const contentPermission = resolveContentPermission(input.answers);
   const domainEvidence = Array.isArray(input.domainEvidence) ? input.domainEvidence : [];
-  const capabilityDelta = input.capabilityDelta || EMPTY_CAPABILITY_DELTA;
+  // Capability Delta is model-authored analysis but compiler-owned state.
+  // Normalize at the IR boundary as well as at the API call site so restored
+  // sessions and alternate callers cannot persist a gap the validator rejects.
+  const capabilityDelta = normalizeCapabilityDelta(input.capabilityDelta || EMPTY_CAPABILITY_DELTA);
   const knowledgeAssessment = normalizeKnowledgeAssessment(input.knowledgeAssessment, domainEvidence, capabilityDelta.skillMustTeach.length > 0, capabilityDelta.skillMustTeach.map((gap) => gap.id));
   const capabilities: SkillIRCapability[] = input.plan.items.filter(activeCapability).map((item) => {
     const necessity = item.necessity ? { ...item.necessity, reason: item.reason || item.deterministicAdvantage || "由资源必要性分析决定" } : fallbackNecessity(item);
@@ -1513,7 +1516,10 @@ export function bindSkillIREvals(ir: SkillIR, evalText: string): SkillIR {
     };
   });
   const caseIdsFor = (capabilityId: string) => cases
-    .filter((item) => evalCaseIsRunnable(item) && Array.isArray(item.capability_ids) && item.capability_ids.includes(capabilityId))
+    .filter((item) => {
+      const capability = ir.capabilities.find((candidate) => candidate.id === capabilityId);
+      return capability ? evalCaseCoversCapability(item, capability) : false;
+    })
     .map((item) => String(item.id || ""))
     .filter(Boolean);
   const capabilities = ir.capabilities.map((item) => ({ ...item, evalCaseIds: caseIdsFor(item.id) }));
@@ -1548,10 +1554,22 @@ function evalCaseCoversCapability(testCase: Record<string, unknown>, capability:
   if (!evalCaseIsRunnable(testCase)) return false;
   const capabilityIds = Array.isArray(testCase.capability_ids) ? testCase.capability_ids.map(String) : [];
   if (!capabilityIds.includes(capability.id) || testCase.eval_family !== capabilityEvalFamily(capability)) return false;
+  const expected = testCase.expected && typeof testCase.expected === "object" && !Array.isArray(testCase.expected)
+    ? testCase.expected as Record<string, unknown>
+    : {};
+  const behaviors = Array.isArray(expected.behaviors) ? expected.behaviors.filter(Boolean) : [];
+  const artifacts = Array.isArray(expected.artifacts) ? expected.artifacts.filter(Boolean) : [];
+  if (!behaviors.length && !artifacts.length) return false;
   const graders = Array.isArray(testCase.graders) ? testCase.graders.map(String) : [];
   if (capability.kind === "reference") return graders.includes("grounding");
   if (["builtin-tool", "mcp", "asset"].includes(capability.kind)) {
-    return graders.some((grader) => ["integration", "tool_grounding", "artifact_checker"].includes(grader));
+    if (!graders.some((grader) => ["integration", "tool_grounding", "artifact_checker"].includes(grader))) return false;
+    const context = testCase.context && typeof testCase.context === "object" && !Array.isArray(testCase.context)
+      ? testCase.context as Record<string, unknown>
+      : {};
+    if (["conditional", "optional"].includes(capability.scope)
+      && !Object.keys(context).some((key) => /activ|tool|integration|routing|scope/i.test(key))) return false;
+    return true;
   }
   return graders.some((grader) => ["core_capability", "failure_mode", "loop_control"].includes(grader));
 }
@@ -1676,6 +1694,59 @@ function canonicalFamilyControlEvalCase(
   };
 }
 
+function canonicalFailureModeEvalCase(
+  ir: SkillIR,
+  contractDigest: string,
+  exemplar?: Record<string, unknown>,
+) {
+  const exemplarPrompt = typeof exemplar?.prompt === "string" && exemplar.prompt.trim().length >= 40
+    ? exemplar.prompt.trim()
+    : "";
+  const exemplarContext = exemplar?.context && typeof exemplar.context === "object" && !Array.isArray(exemplar.context)
+    ? exemplar.context as Record<string, unknown>
+    : {};
+  const exemplarExpected = exemplar?.expected && typeof exemplar.expected === "object" && !Array.isArray(exemplar.expected)
+    ? exemplar.expected as Record<string, unknown>
+    : {};
+  const exemplarBehaviors = Array.isArray(exemplarExpected.behaviors)
+    ? exemplarExpected.behaviors.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : [];
+  const exemplarMustNot = Array.isArray(exemplarExpected.must_not)
+    ? exemplarExpected.must_not.filter((item): item is string => typeof item === "string" && Boolean(item.trim()))
+    : [];
+  const primaryCapability = ir.capabilities.find((item) => item.kind === "llm" && item.necessity.decision !== "exclude")
+    || ir.capabilities.find((item) => item.kind === "script" && item.necessity.decision !== "exclude");
+  const failure = ir.evaluationPlan.failureModes.find(Boolean)
+    || ir.riskBranches.map((item) => item.condition || item.action).find(Boolean)
+    || ir.requirements.find((item) => item.polarity === "negative")?.statement
+    || `遗漏“${ir.identity.intent}”任务中已经确认的关键要求`;
+  return {
+    id: "failure-mode-canonical",
+    eval_family: "capability",
+    category: "failure_mode",
+    should_trigger: true,
+    prompt: exemplarPrompt
+      ? `${exemplarPrompt}\n\n隔离回归条件：当前输出容易出现“${failure}”。请避免该失败，同时完成上述真实任务并交付可观察结果。`
+      : `请执行“${ir.identity.intent}”的真实任务，并避免“${failure}”。本用例尚未附带实际任务材料，不能据此声称执行质量已经通过。`,
+    context: {
+      ...exemplarContext,
+      fixture_status: exemplarPrompt ? "ready" : "missing",
+      canonical_eval_compiler: true,
+      injected_failure_mode: failure,
+    },
+    capability_ids: primaryCapability ? [primaryCapability.id] : [],
+    expected: {
+      ...exemplarExpected,
+      behaviors: [...new Set([...exemplarBehaviors, "识别并避免指定失败模式", "完成仍可安全完成的核心任务并交付可观察结果"])],
+      must_not: [...new Set([...exemplarMustNot, failure, "用空泛拒绝代替仍可完成的任务部分"])],
+      artifacts: Array.isArray(exemplarExpected.artifacts) ? exemplarExpected.artifacts : [],
+    },
+    graders: ["failure_mode", "core_capability"],
+    runnable: Boolean(exemplarPrompt),
+    ...(contractDigest ? { contract_digest: contractDigest } : {}),
+  };
+}
+
 /**
  * Canonical SkillIR owns capability coverage. A restored UI capability plan can
  * be older than the frozen bundle, so repair missing Eval edges here instead of
@@ -1696,10 +1767,13 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
     && item.should_trigger === true
     && item.eval_family !== "trigger"
     && typeof item.prompt === "string"
-    && item.prompt.trim().length >= 40)
-    || cases.find((item) => evalCaseIsRunnable(item) && item.should_trigger === true && typeof item.prompt === "string" && item.prompt.trim().length >= 40);
+    && item.prompt.trim().length >= 40);
   const missing = capabilities.filter((capability) => !cases.some((testCase) => evalCaseCoversCapability(testCase, capability)));
   missing.forEach((capability, index) => cases.push(canonicalCapabilityEvalCase(ir, [capability], index, contractDigest, representativeFixture)));
+
+  if (!cases.some((item) => item.category === "failure_mode" && evalCaseIsRunnable(item))) {
+    cases.push(canonicalFailureModeEvalCase(ir, contractDigest, representativeFixture));
+  }
 
   // Restored legacy SkillIRs can already have lost a whole Eval family. Close
   // that compiler-owned contract deterministically instead of asking a repair
@@ -1715,6 +1789,9 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
     const match = cases.find((item) => item.eval_family === "trigger" && item.category === category);
     return match ? [match] : [];
   });
+  const failureAnchor = cases.find((item) => item.category === "failure_mode" && evalCaseIsRunnable(item))
+    || cases.find((item) => item.category === "failure_mode");
+  const failureAnchors = failureAnchor ? [failureAnchor] : [];
   let coverageCases = capabilities.flatMap((capability) => {
     const match = cases.find((testCase) => evalCaseCoversCapability(testCase, capability));
     return match ? [match] : [];
@@ -1733,7 +1810,7 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
     const match = cases.find((item) => item.eval_family === family && evalCaseIsRunnable(item));
     return match ? [match] : [];
   });
-  const coverageBudget = Math.max(1, 20 - essentialTriggers.length - familyAnchors.length);
+  const coverageBudget = Math.max(1, 20 - essentialTriggers.length - failureAnchors.length - familyAnchors.length);
   if (coverageCases.length > coverageBudget) {
     const grouped = new Map<string, SkillIRCapability[][]>();
     capabilities.forEach((capability) => {
@@ -1752,8 +1829,8 @@ export function ensureSkillIREvalCoverage(ir: SkillIR, evalText: string) {
     coverageCases = [...grouped.values()].flat().map((group, index) => canonicalCapabilityEvalCase(ir, group, index, contractDigest, representativeFixture));
   }
 
-  const essentialIds = new Set([...essentialTriggers, ...familyAnchors, ...coverageCases].map((item) => String(item.id || "")));
-  const selectedCases = [...essentialTriggers, ...familyAnchors, ...coverageCases, ...cases.filter((item) => !essentialIds.has(String(item.id || "")))]
+  const essentialIds = new Set([...essentialTriggers, ...failureAnchors, ...familyAnchors, ...coverageCases].map((item) => String(item.id || "")));
+  const selectedCases = [...essentialTriggers, ...failureAnchors, ...familyAnchors, ...coverageCases, ...cases.filter((item) => !essentialIds.has(String(item.id || "")))]
     .filter((item, index, list) => list.findIndex((candidate) => String(candidate.id || "") === String(item.id || "")) === index)
     .slice(0, 20)
     .map((item) => contractDigest && typeof item.contract_digest !== "string" ? { ...item, contract_digest: contractDigest } : item);
@@ -1807,7 +1884,21 @@ export function skillIRDigest(ir: SkillIR) {
  * from the persisted shape, never from a subtly different in-memory object.
  * Caller-owned implementations and source evidence are left untouched. */
 export function projectSkillIRFiles(ir: SkillIR, files: Record<string, string> = {}): Record<string, string> {
-  const persistedIR = JSON.parse(JSON.stringify(ir)) as SkillIR;
+  // The freeze boundary must persist exactly the contract accepted by the
+  // validator. This is intentionally deterministic: never ask a repair model
+  // to edit compiler-owned Capability Delta rationale.
+  const normalizedDelta = normalizeCapabilityDelta(ir.capabilityDelta);
+  const normalizedIR: SkillIR = {
+    ...ir,
+    capabilityDelta: normalizedDelta,
+    knowledgeAssessment: normalizeKnowledgeAssessment(
+      ir.knowledgeAssessment,
+      Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
+      normalizedDelta.skillMustTeach.length > 0,
+      normalizedDelta.skillMustTeach.map((gap) => gap.id),
+    ),
+  };
+  const persistedIR = JSON.parse(JSON.stringify(normalizedIR)) as SkillIR;
   const projections: Record<string, string> = {
     "evals/capability-manifest.json": JSON.stringify(projectCapabilityManifest(persistedIR), null, 2),
     "evals/evals.json": projectEvalBank(persistedIR),
