@@ -127,6 +127,8 @@ evals/skill-ir.json
 - `domain_inferred`：领域推断，需要较弱规则强度。
 - `generator_default`：生成器默认值，不能自动成为硬约束。
 
+证据编译还会保留正向要求、负向示例、普通材料与明确授权的原始语义。反例只能生成禁止行为和失败断言，不能被改写成执行建议，也不能证明用户授权了其中的行为。
+
 `app/evidence-gates.ts` 还会建立 Information Dependency：每个输出字段需要什么来源、当前是否可用、是否允许生成、缺失时应该追问、标注、跳过还是继续。用户明确允许润色、补写或自由创作时，该权限会同时进入 SkillIR、Runtime、Domain Playbook、Eval 和 Grader；验证器不能再额外塞入一条相反的“禁止生成”默认规则。
 
 ## 专业知识 Workflow
@@ -229,7 +231,7 @@ Build Loop 负责从确认后的蓝图生成并冻结初始 Bundle：
 
 Capability Delta 先删除裸模型已经能稳定完成的通用理解、改写与规划，只保留会改变运行决策、失败恢复、边界处理或验收方式的能力差值。Domain Knowledge 随后只围绕这些差值采集四类证据：Decision Rules、Failure Modes、Edge Cases、Verification Methods。任一必需类别没有证据时，Skill 会被明确标记为知识不足，不会用泛化“最佳实践”补齐篇幅。
 
-运行 Workflow 不是文字步骤列表。每个 Step 必须声明 `requires[] / produces[] / mutates[]`；编译器根据产物依赖执行拓扑排序，并在 Bundle 生成前拦截未满足依赖、重复 Producer 和循环依赖。
+运行 Workflow 不是文字步骤列表。每个 Step 必须声明 `requires[] / produces[] / mutates[]`；编译器根据产物依赖执行拓扑排序，并在 Bundle 生成前拦截未满足依赖、重复 Producer 和循环依赖。多项宿主能力与 MCP 使用同一套通用接线规则：能力输出必须进入真实消费者，只有明确交付步骤能产生完成状态，等待输入或审批不能冒充交付。
 
 Build Gate 把“检测方式”和“问题级别”分开：确定性检查不等于 P0。
 
@@ -260,7 +262,7 @@ P1 处理可确定性发现的语义契约问题，例如：
 
 ## Optimization Loop：有证据才替换当前版本
 
-Optimization Loop 不再修改用户 Goal，也不接受“模型觉得更好”这种自评。它在冻结契约上执行十个节点：
+Optimization Loop 不再修改用户 Goal，也不接受“模型觉得更好”这种自评。它在冻结契约上执行十个逻辑节点：
 
 ```text
 冻结评测
@@ -274,6 +276,8 @@ Optimization Loop 不再修改用户 Goal，也不接受“模型觉得更好”
   → 保留任务
   → 精简冗余
 ```
+
+实际模型执行不会把 Eval Bank 中每个相似用例都单独跑一遍。编译器会把它们压缩为少量端到端多轮 Episode：默认运行 1 个诊断 Episode 和 2 个 held-out Episode，每个场景先执行一次；只有结果接近接受门槛时才为同一冻结场景补跑第二次。无 Skill 基线按模型、接口地址和冻结任务契约缓存，避免重复消耗 Token。逻辑节点仍然完整，但不会为每项能力机械复制一组近似对话。
 
 ## Durable Workflow Runtime
 
@@ -302,14 +306,14 @@ held-out-split → baseline → execute → grade → diagnose
 
 ### 1. 生成真实 Eval Bank
 
-单个 Skill 生成约 10–20 个自包含用例，覆盖四个 Family：
+单个 Skill 会编译约 10–20 个契约用例，随后组合成最多 3 个端到端多轮 Episode 执行，覆盖四个 Family：
 
 - Trigger：显式触发、隐式触发、带上下文触发和相邻 Hard Negative。
 - Capability：核心任务、重要分支和失败恢复。
 - Grounding：资料使用、权限、未知信息和状态边界。
 - Integration：激活的 Tool、MCP、Script、Asset 与 Artifact 行为。
 
-Eval 会按 Capability 分层切分为 `train / selection / test`。每个激活能力至少进入一个 held-out Case，防止稀疏的文件或工具能力在抽样时被漏掉。
+Eval 会按 Capability 分层切分为 `train / selection / test`。每个激活能力至少进入一个 held-out Case，防止稀疏的文件或工具能力在抽样时被漏掉；执行阶段再把同一任务轨迹上的能力断言合并进一个 Episode。
 
 ### 2. 执行与评分上下文隔离
 
@@ -375,7 +379,7 @@ Optimization 与 Demo 个性化都走同一条 `Canonical Mutation → Validate 
 
 ## Demo 与个性化 Loop
 
-正式 Eval 结束后，系统选择一个代表性任务生成用户可见 Demo。用户可以继续对话，也可以选择“哪里还不够懂你”。反馈会先转成新的 Requirement、Input、Constraint、Capability 或 State Mutation，再生成下一版 Demo。
+正式 Eval 结束后，系统选择一个代表性任务生成用户可见 Demo。需要材料交接或补充输入的任务可以自动模拟最多两轮具体用户回复，而不是把一次模型回答当作完整任务；用户也可以继续真实对话，或选择“哪里还不够懂你”。反馈会先转成新的 Requirement、Input、Constraint、Capability 或 State Mutation，再生成下一版 Demo。
 
 个性化候选必须重新通过既有回归任务，避免“更像用户”却悄悄破坏已经验证的触发、工具或输出能力。只有通过后才原子提交到当前 Bundle。
 
@@ -463,7 +467,7 @@ pnpm dev
 
 第一次本地启动会在被 Git 忽略的 `.wrangler/skillcanvas-vault-key` 生成凭据加密密钥。D1 数据、加密凭据和诊断日志保存在项目本地 Wrangler 状态中。
 
-进入页面后，在模型设置中选择 DeepSeek、OpenAI 或 OpenAI-Compatible 接口并保存 API Key。联网知识研究为可选能力，可连接 Firecrawl 或自部署 SearXNG。
+本地开发默认使用 BYOK：在模型设置中选择 DeepSeek、OpenAI 或 OpenAI-Compatible 接口并保存 API Key；联网知识研究可连接 Firecrawl 或自部署 SearXNG。公开部署也支持平台托管模式，由服务端 Secret 提供模型与检索凭据，访客无需填写 Key，浏览器只会收到“服务已配置”的状态。
 
 浏览器通知只在用户点击“确认理解并生成 Skill”后请求授权；允许后，长时间 Build/Optimization 完成、暂停或失败时自动通知，不影响未授权用户继续生成。
 
@@ -474,6 +478,13 @@ pnpm dev
 | `SKILLCANVAS_CREDENTIAL_SECRET` | 生产必需 | AES-GCM 凭据加密主密钥；本地缺省时自动生成项目级随机密钥 |
 | `SKILLCANVAS_MODEL_PRICING_JSON` | 可选 | 按模型配置输入/输出 Token 成本估算 |
 | `SKILLCANVAS_SANDBOX_PORT` | 可选 | 本地 Sandbox 端口，默认 `4318` |
+| `SKILLCANVAS_SHARED_PROVIDER` | 托管模式必需 | 平台统一提供的模型服务，例如 `deepseek` |
+| `SKILLCANVAS_SHARED_MODEL` | 托管模式必需 | 平台统一使用的模型 ID |
+| `SKILLCANVAS_SHARED_BASE_URL` | 托管模式必需 | 模型服务 API 地址 |
+| `SKILLCANVAS_SHARED_API_KEY` | 托管模式必需、Secret | 仅供服务端代理调用的模型凭据 |
+| `SKILLCANVAS_SHARED_RESEARCH_PROVIDER` | 可选 | 平台统一提供的研究服务，例如 `firecrawl` |
+| `SKILLCANVAS_SHARED_RESEARCH_BASE_URL` | 可选 | 研究服务 API 地址 |
+| `SKILLCANVAS_SHARED_RESEARCH_API_KEY` | 使用 Firecrawl 时必需、Secret | 仅供服务端检索代理调用的凭据 |
 
 成本配置示例，单价为 USD / 1M tokens：
 
@@ -486,11 +497,15 @@ pnpm dev
 }
 ```
 
-模型 API Key、Firecrawl Key 和 SearXNG 地址通过页面设置保存，不应写入源码或提交到 Git。
+本地 BYOK 凭据通过页面设置加密保存；公开部署的共享凭据通过托管平台 Secret 注入。两种方式都不应把模型或 Firecrawl Key 写入源码、浏览器存储或 Git。
+
+## 在线部署
+
+当前公开版本部署在 OpenAI Sites/Cloudflare Worker 运行环境，D1、运行变量和 Secret 由托管平台绑定，不依赖开发者电脑持续在线。`.openai/hosting.json` 只保存站点项目与逻辑资源绑定，不保存任何 API Key。共享服务上线前应分别执行一次真实模型请求和真实网页检索，不能只检查变量是否存在。
 
 ## 安全与可观测性
 
-- API Key 不写入 `localStorage`、生成的 Skill、Prompt 日志或仓库。
+- API Key 不写入 `localStorage`、生成的 Skill、Prompt 日志或仓库；共享凭据也不会返回给浏览器。
 - 凭据经 AES-GCM 加密后写入 D1；浏览器只保留 HttpOnly 会话标识。
 - AI、联网研究、凭据和前端日志接口都有请求频率限制。
 - 诊断记录 Mode、耗时、状态、Request ID、Token 与可选成本，不记录 Prompt、上传文件正文、模型完整输出或 Key。
@@ -518,12 +533,12 @@ pnpm test:workflow-runtime
 pnpm test:mcp-runtime
 ```
 
-`pnpm test` 会先执行生产构建，再运行 `tests/*.test.mjs`。测试覆盖 SkillIR 投影、Bundle Gate、Knowledge Compiler、Eval 分层、Sandbox、Decision Ledger、Personalization、Workflow State 和发布契约。
+`pnpm test` 会先执行生产构建，再运行 `tests/*.test.mjs`。当前测试集包含 514 项，覆盖 SkillIR 投影、Bundle Gate、Knowledge Compiler、Eval 分层、多能力 DAG、分阶段 Blueprint 修复、Sandbox、Decision Ledger、Personalization、Workflow State 和发布契约。
 
 ## 当前技术债务
 
 - `app/page.tsx` 仍承担部分 Build/Optimization 业务处理器。Durable Workflow Kernel 与 API 已落地，下一阶段是把现有节点处理器逐个迁到服务端 Worker，而不是重新设计一套状态语义。
-- 生产多租户需要接入正式身份系统、稳定 D1/R2 资源、租户级预算和更细的成本告警。
+- 公开版本已经使用托管 Worker、D1 与服务端 Secret；继续开放给更多用户前仍需补充正式身份、租户级预算、共享 API 额度保护和更细的成本告警。
 - MCP Runtime 已有通用 Streamable HTTP Adapter；OAuth 动态注册、第三方 Server 白名单、租户级 Egress Policy 和 Eval Harness 自动调用仍需继续补齐。
 - Eval 能降低回归风险，但不能证明 Skill 在所有真实任务中都优于通用模型；前端会保留样本量、波动和证据强度。
 
