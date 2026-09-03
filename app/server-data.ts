@@ -10,6 +10,13 @@ type RuntimeEnv = {
   DB?: Database;
   SKILLCANVAS_CREDENTIAL_SECRET?: string;
   SKILLCANVAS_MODEL_PRICING_JSON?: string;
+  SKILLCANVAS_SHARED_PROVIDER?: string;
+  SKILLCANVAS_SHARED_MODEL?: string;
+  SKILLCANVAS_SHARED_BASE_URL?: string;
+  SKILLCANVAS_SHARED_API_KEY?: string;
+  SKILLCANVAS_SHARED_RESEARCH_PROVIDER?: string;
+  SKILLCANVAS_SHARED_RESEARCH_API_KEY?: string;
+  SKILLCANVAS_SHARED_RESEARCH_BASE_URL?: string;
 };
 
 export type ServerCredentialConfig = {
@@ -20,6 +27,12 @@ export type ServerCredentialConfig = {
   researchProvider: "disabled" | "firecrawl" | "searxng";
   researchApiKey: string;
   researchBaseUrl: string;
+};
+
+export type ServerCredentialState = {
+  config: ServerCredentialConfig | null;
+  managed: boolean;
+  researchManaged: boolean;
 };
 
 declare global {
@@ -216,12 +229,48 @@ export async function saveServerCredentials(tenantId: string, value: ServerCrede
     .bind(tenantId, encrypted, new Date().toISOString()).run();
 }
 
-export async function readServerCredentials(tenantId: string) {
+export function sharedServerCredentialsFromEnv(source: RuntimeEnv): ServerCredentialConfig | null {
+  const apiKey = source.SKILLCANVAS_SHARED_API_KEY?.trim() || "";
+  if (apiKey.length < 9) return null;
+  const requestedProvider = source.SKILLCANVAS_SHARED_PROVIDER?.trim().toLowerCase();
+  const provider: ServerCredentialConfig["provider"] = requestedProvider === "openai" || requestedProvider === "compatible"
+    ? requestedProvider
+    : "deepseek";
+  const researchApiKey = source.SKILLCANVAS_SHARED_RESEARCH_API_KEY?.trim() || "";
+  const requestedResearchProvider = source.SKILLCANVAS_SHARED_RESEARCH_PROVIDER?.trim().toLowerCase();
+  const researchProvider: ServerCredentialConfig["researchProvider"] = requestedResearchProvider === "searxng"
+    ? "searxng"
+    : requestedResearchProvider === "firecrawl" && researchApiKey.length >= 8
+      ? "firecrawl"
+      : "disabled";
+  return {
+    provider,
+    model: source.SKILLCANVAS_SHARED_MODEL?.trim().slice(0, 120) || (provider === "deepseek" ? "deepseek-chat" : ""),
+    baseUrl: source.SKILLCANVAS_SHARED_BASE_URL?.trim().slice(0, 500) || (provider === "deepseek" ? "https://api.deepseek.com" : ""),
+    apiKey: apiKey.slice(0, 512),
+    researchProvider,
+    researchApiKey: researchProvider === "firecrawl" ? researchApiKey.slice(0, 512) : "",
+    researchBaseUrl: source.SKILLCANVAS_SHARED_RESEARCH_BASE_URL?.trim().slice(0, 500)
+      || (researchProvider === "firecrawl" ? "https://api.firecrawl.dev" : ""),
+  };
+}
+
+export async function readServerCredentialState(tenantId: string): Promise<ServerCredentialState> {
+  const shared = sharedServerCredentialsFromEnv(runtime());
+  if (shared) return { config: shared, managed: true, researchManaged: shared.researchProvider !== "disabled" };
   const db = runtime().DB;
-  if (!db) return open<ServerCredentialConfig>((globalThis.__skillCanvasCredentialFallback ||= new Map()).get(tenantId) || "");
+  if (!db) {
+    const config = await open<ServerCredentialConfig>((globalThis.__skillCanvasCredentialFallback ||= new Map()).get(tenantId) || "");
+    return { config, managed: false, researchManaged: false };
+  }
   await ensureTables(db);
   const row = await db.prepare("SELECT encrypted_payload FROM skillcanvas_credential_vault WHERE tenant_id = ?").bind(tenantId).first<{ encrypted_payload?: string }>();
-  return open<ServerCredentialConfig>(row?.encrypted_payload || "");
+  const config = await open<ServerCredentialConfig>(row?.encrypted_payload || "");
+  return { config, managed: false, researchManaged: false };
+}
+
+export async function readServerCredentials(tenantId: string) {
+  return (await readServerCredentialState(tenantId)).config;
 }
 
 function mcpConnectionKey(tenantId: string, connectionId: string) {

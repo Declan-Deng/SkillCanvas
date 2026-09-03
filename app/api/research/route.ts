@@ -1,6 +1,6 @@
 import { dedupeResearchSources, htmlToEvidenceText, parseFirecrawlResults, parseSearxngResults, safeResearchUrl } from "../../research-core";
 import type { ResearchProviderId, RetrievedKnowledgeSource } from "../../knowledge-research";
-import { readServerCredentials, tenantContext } from "../../server-data";
+import { readServerCredentialState, tenantContext } from "../../server-data";
 import { checkRequestRate } from "../../request-guard";
 
 type RequestBody = {
@@ -119,16 +119,17 @@ export async function POST(request: Request) {
     const rate = checkRequestRate(`${tenant.tenantId}:research`, 12);
     if (!rate.allowed) return Response.json({ error: `检索请求过于频繁，请 ${rate.retryAfterSeconds} 秒后重试` }, { status: 429, headers: { "Retry-After": String(rate.retryAfterSeconds) } });
     const body = await request.json() as RequestBody;
-    const stored = await readServerCredentials(tenant.tenantId);
-    const provider = body.provider || stored?.researchProvider || "disabled";
+    const credentialState = await readServerCredentialState(tenant.tenantId);
+    const stored = credentialState.config;
+    const provider = credentialState.researchManaged ? stored?.researchProvider || "disabled" : body.provider || stored?.researchProvider || "disabled";
     if (!(["firecrawl", "searxng"] as ResearchProviderId[]).includes(provider)) return Response.json({ error: "尚未配置可用的专业知识联网服务" }, { status: 400 });
     const queries = body.action === "test" ? ["Firecrawl search documentation"] : Array.isArray(body.queries)
       ? Array.from(new Set(body.queries.filter((item): item is string => typeof item === "string").map((item) => item.replace(/\s+/g, " ").trim().slice(0, 180)).filter(Boolean))).slice(0, 4)
       : [];
     if (!queries.length) return Response.json({ error: "没有可执行的专业知识检索问题" }, { status: 400 });
-    const baseUrl = researchBase(provider, typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl : stored?.researchBaseUrl || "");
+    const baseUrl = researchBase(provider, credentialState.researchManaged ? stored?.researchBaseUrl || "" : typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl : stored?.researchBaseUrl || "");
     const sources = provider === "firecrawl"
-      ? await searchFirecrawl(baseUrl, typeof body.apiKey === "string" && body.apiKey.trim() ? body.apiKey : stored?.researchApiKey || "", queries, body.action === "test" ? 1 : 5)
+      ? await searchFirecrawl(baseUrl, credentialState.researchManaged ? stored?.researchApiKey || "" : typeof body.apiKey === "string" && body.apiKey.trim() ? body.apiKey : stored?.researchApiKey || "", queries, body.action === "test" ? 1 : 5)
       : await searchSearxng(baseUrl, queries);
     if (!sources.length) return Response.json({ error: "联网服务没有返回可用于编译专业知识的正文证据" }, { status: 502 });
     return Response.json(body.action === "test" ? { ok: true, sourceCount: sources.length } : { sources });

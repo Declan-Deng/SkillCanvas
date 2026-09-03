@@ -5,7 +5,7 @@ import { providerAccountFailure } from "../../eval-prompt";
 import { canonicalBuildContext, generationAttemptBudget } from "../../generation-request";
 import { knowledgeAttemptTimeout } from "../../knowledge-compiler";
 import { IncompleteCompletionStreamError, readCompletionResponse } from "../../ai-stream";
-import { persistDiagnostic, readServerCredentials, tenantContext } from "../../server-data";
+import { persistDiagnostic, readServerCredentialState, tenantContext } from "../../server-data";
 import { checkRequestRate } from "../../request-guard";
 import { demoScoringPolicyPrompt, qualityScoringPolicyPrompt } from "../../gate-outcome";
 import { demoReplyNeedsUserTurn, normalizePlannedDemoTurns } from "../../demo-episode";
@@ -1061,16 +1061,17 @@ export async function POST(request: Request) {
     const body = await request.json() as RequestBody;
     if (!body.mode || !MODES.has(body.mode)) return Response.json({ error: "不支持的 AI 任务" }, { status: 400 });
     modeForLog = body.mode;
-    const stored = await readServerCredentials(tenant.tenantId);
-    const provider = body.provider || stored?.provider;
+    const credentialState = await readServerCredentialState(tenant.tenantId);
+    const stored = credentialState.config;
+    const provider = credentialState.managed ? stored?.provider : body.provider || stored?.provider;
     if (!provider || !PROVIDERS.has(provider)) return Response.json({ error: "不支持的模型服务" }, { status: 400 });
-    const suppliedApiKey = typeof body.apiKey === "string" ? body.apiKey.trim() : "";
+    const suppliedApiKey = credentialState.managed ? "" : typeof body.apiKey === "string" ? body.apiKey.trim() : "";
     const apiKey = suppliedApiKey || (stored?.provider === provider ? stored.apiKey : "");
-    const model = typeof body.model === "string" && body.model.trim() ? body.model.trim().slice(0, 120) : stored?.model || "";
+    const model = credentialState.managed ? stored?.model || "" : typeof body.model === "string" && body.model.trim() ? body.model.trim().slice(0, 120) : stored?.model || "";
     if (apiKey.length < 9 || apiKey.length > 512) return Response.json({ error: "请输入有效的 API Key" }, { status: 400 });
     if (!model && body.mode !== "models") return Response.json({ error: "请输入模型名称" }, { status: 400 });
 
-    const baseUrl = resolveBaseUrl(provider, typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl.trim() : stored?.baseUrl || "");
+    const baseUrl = resolveBaseUrl(provider, credentialState.managed ? stored?.baseUrl || "" : typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl.trim() : stored?.baseUrl || "");
     if (body.mode === "models") {
       const controller = new AbortController();
       const timeout = setTimeout(() => controller.abort(), 20_000);

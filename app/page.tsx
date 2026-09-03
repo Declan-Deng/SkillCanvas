@@ -5139,9 +5139,11 @@ export default function Home() {
   const [baseUrl, setBaseUrl] = useState(PROVIDERS.deepseek.baseUrl);
   const [apiKey, setApiKey] = useState("");
   const [credentialStored, setCredentialStored] = useState(false);
+  const [credentialManaged, setCredentialManaged] = useState(false);
   const [researchProvider, setResearchProvider] = useState<ResearchProviderId>("disabled");
   const [researchApiKey, setResearchApiKey] = useState("");
   const [researchCredentialStored, setResearchCredentialStored] = useState(false);
+  const [researchCredentialManaged, setResearchCredentialManaged] = useState(false);
   const [researchBaseUrl, setResearchBaseUrl] = useState("");
   const [researchProbe, setResearchProbe] = useState<{ status: "idle" | "testing" | "ok" | "error"; message: string }>({ status: "idle", message: "检索连接与模型连接需要分别测试" });
   const researchProbeController = useRef<AbortController | null>(null);
@@ -5240,6 +5242,8 @@ export default function Home() {
         const result = await response.json() as {
           configured?: boolean;
           researchConfigured?: boolean;
+          managed?: boolean;
+          researchManaged?: boolean;
           config?: Partial<{ provider: ProviderId; model: string; baseUrl: string; researchProvider: ResearchProviderId; researchBaseUrl: string }> | null;
         };
         if (result.config) {
@@ -5251,6 +5255,8 @@ export default function Home() {
         }
         setCredentialStored(Boolean(result.configured));
         setResearchCredentialStored(Boolean(result.researchConfigured));
+        setCredentialManaged(Boolean(result.managed));
+        setResearchCredentialManaged(Boolean(result.researchManaged));
         if (result.configured) setApiKey("");
         if (result.researchConfigured) setResearchApiKey("");
       } catch {
@@ -10715,7 +10721,7 @@ export default function Home() {
         <div className="topbar-actions">
           <button className={`model-button ${connectionState === "ok" ? "connected" : hasApiKey ? "configured" : ""}`} onClick={openSettings}>
             <span className="provider-mark"><ProviderLogo id={provider} /></span>
-            <span>{hasApiKey ? model : "连接模型"}</span>
+            <span>{credentialManaged ? `平台 AI · ${model}` : hasApiKey ? model : "连接模型"}</span>
             <span className="chevron">⌄</span>
           </button>
         </div>
@@ -11538,7 +11544,23 @@ export default function Home() {
       {settingsOpen && (
         <div className={`modal-backdrop ${settingsClosing ? "closing" : ""}`} role="presentation" onPointerDown={(event) => { if (event.currentTarget === event.target) closeSettings(); }}>
           <section className="settings-modal" aria-modal="true" role="dialog" aria-labelledby="model-settings-title">
-            <div className="modal-head"><div><span className="stage-kicker">BYOK · Bring your own key</span><h2 id="model-settings-title">连接你的 AI 模型</h2></div><button className="close-button" aria-label="关闭模型设置" onClick={closeSettings}>×</button></div>
+            <div className="modal-head"><div><span className="stage-kicker">{credentialManaged ? "MANAGED SERVICE" : "BYOK · Bring your own key"}</span><h2 id="model-settings-title">{credentialManaged ? "平台服务已就绪" : "连接你的 AI 模型"}</h2></div><button className="close-button" aria-label="关闭模型设置" onClick={closeSettings}>×</button></div>
+            {credentialManaged ? (
+              <div className="managed-service-panel">
+                <div className="privacy-banner"><span>✓</span><p><strong>无需填写任何 API Key</strong><small>{researchCredentialManaged ? "DeepSeek 与 Firecrawl 均由平台在服务器端提供。" : "DeepSeek 由平台在服务器端提供。"}密钥不会发送到浏览器，也不会写入生成的 Skill 或日志。</small></p></div>
+                <div className="managed-service-status">
+                  <div><span>AI 模型</span><strong>{PROVIDERS[provider].name} · {model}</strong><em>可用</em></div>
+                  <div><span>公开网页检索</span><strong>{researchCredentialManaged ? RESEARCH_PROVIDERS[researchProvider].name : "未启用"}</strong><em className={researchCredentialManaged ? "" : "muted"}>{researchCredentialManaged ? "可用" : "未启用"}</em></div>
+                </div>
+                <div className="modal-footer">
+                  <button className="secondary-button" onClick={testConnection} disabled={connectionState === "testing"}>{connectionState === "testing" ? "正在测试 AI…" : "测试 AI 服务"}</button>
+                  {researchCredentialManaged && <button className="secondary-button" onClick={() => void testResearchConnection()} disabled={researchProbe.status === "testing"}>{researchProbe.status === "testing" ? "正在测试检索…" : "测试网页检索"}</button>}
+                  <span className={`connection-result ${connectionState}`}>{connectionState === "ok" ? "✓ AI 服务连接成功" : connectionState === "error" ? "AI 服务暂时不可用" : "访客可直接使用，无需自行配置"}</span>
+                  <button className="primary-button" onClick={closeSettings}>完成</button>
+                </div>
+                {researchProbe.message && researchProbe.status !== "idle" && <span role="status" className={`connection-result ${researchProbe.status}`}>{researchProbe.message}</span>}
+              </div>
+            ) : <>
             <div className="privacy-banner"><span>⌁</span><p><strong>Key 不再写入浏览器存储</strong><small>保存后会按当前会话隔离并加密存放在服务端凭据库；页面、日志和生成的 Skill 都拿不到明文。可随时在下方清除。</small></p></div>
             <div className="provider-options">
               {(Object.keys(PROVIDERS) as ProviderId[]).map((id) => <button key={id} aria-pressed={provider === id} className={provider === id ? "selected" : ""} onClick={() => updateProvider(id)}><span><ProviderLogo id={id} /></span><strong>{PROVIDERS[id].name}</strong><i>{provider === id ? "●" : ""}</i></button>)}
@@ -11609,6 +11631,7 @@ export default function Home() {
               <span className={`connection-result ${connectionState}`}>{connectionState === "ok" ? "✓ 连接成功" : connectionState === "error" ? "连接失败，请检查配置" : hasApiKey ? "测试可选，首次请求会自动验证" : "不填 Key 可以保存设置，但不能开始 AI 生成"}</span>
               <button className="primary-button" onClick={() => void saveModelSettings()}>保存设置</button>
             </div>
+            </>}
           </section>
         </div>
       )}
