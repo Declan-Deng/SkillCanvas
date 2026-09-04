@@ -5621,16 +5621,6 @@ export default function Home() {
       : busyElapsed < 25
         ? `${activeAiMode ? AI_MODE_LABELS[activeAiMode] || activeAiMode : "模型任务"}正在返回真实结果；当前回答会一直保留。`
         : "流程仍在处理，已完成的步骤会保留；上方显示本次流程累计耗时，不代表当前请求超时或正在重试。";
-  const busyTokenUsageStatus = busyTokenUsage.pendingPromptTokens > 0
-    ? `输入约 ${formatAiTokens(busyTokenUsage.promptTokens)} · 输出生成中`
-    : busyTokenUsage.requests > 0
-      ? `${formatAiTokens(busyTokenUsage.promptTokens)} 输入 · ${formatAiTokens(busyTokenUsage.completionTokens)} 输出`
-      : "本地检查，不调用模型";
-  const busyTokenUsageHint = busyTokenUsage.pendingPromptTokens > 0
-    ? "当前为输入预估，模型返回后会自动校准"
-    : busyTokenUsage.estimated
-      ? "部分请求未返回 usage，已按文本长度估算"
-      : "已按模型返回的 usage 统计";
   const modelChoices = Array.from(new Set([
     ...PROVIDERS[provider].models.map((item) => item.id),
     ...availableModels,
@@ -10760,7 +10750,10 @@ export default function Home() {
           )}
           {step === "brief" && (
             <div className="stage-content brief-stage">
-              <h1><span className="headline-line">AI 不懂你</span><br /><span className="brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</span> 来帮你</h1>
+              <div className="brief-hero">
+                <h1><span className="headline-line">AI 不懂你</span><br /><span className="brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</span> 来帮你</h1>
+                <img className="brief-hero-illustration" src="/skillcanvas-hero-helper-emoji.png" width="1254" height="1254" alt="" aria-hidden="true" />
+              </div>
 
               <div className="idea-composer">
                 <textarea
@@ -10904,7 +10897,7 @@ export default function Home() {
               <div className="round-transition" key={`interview-round-${interviewRoundIndex}`}>
                 <div className="round-heading">
                   <div><h3>{INTERVIEW_ROUND_META[interviewRoundIndex].title}</h3></div>
-                  <strong>{currentAnsweredCount}/{questions.length}<small>本轮已回答</small></strong>
+                  <strong>{currentAnsweredCount}/{questions.length}<small>AI 已帮你选择</small></strong>
                 </div>
                 <div className="question-list">
                 {questions.map((question, index) => {
@@ -11750,19 +11743,6 @@ export default function Home() {
             <div className={`busy-execution-status ${busyExecutionKind}`} key={`${busyStage}-${busyExecutionKind}-${busyExecutionNote}`}>
               <span>{busyExecutionLabel}</span>
               <p>{busyExecutionNote}</p>
-            </div>
-            <div className="ai-progress-token-usage" aria-live="polite">
-              <div>
-                <span>本次加载 Token</span>
-                <strong>{formatAiTokens(busyTokenUsage.totalTokens)}</strong>
-                <small>{busyTokenUsageStatus}</small>
-              </div>
-              <div>
-                <span>请求次数</span>
-                <strong>{busyTokenUsage.requests}</strong>
-                <small>{busyTokenUsageHint}</small>
-              </div>
-              <em>会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)} tokens</em>
             </div>
             <div className={`thinking-warp ${busyTask} ${busyExecutionKind}`} aria-hidden="true">
               <span className="warp-core">AI</span>
