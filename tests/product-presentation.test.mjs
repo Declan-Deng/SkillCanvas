@@ -69,8 +69,10 @@ test("interview heading uses the transparent pen and final note is below the fou
 });
 
 test("blueprint uses sky dashed sheets and capability selection has one surface", () => {
-  assert.match(css, /\.blueprint-card\s*\{[^}]*--blueprint-dash: #83bfe3;[^}]*border: 0;/);
-  assert.match(css, /\.blueprint-card::before\s*\{[\s\S]*?12px[\s\S]*?1\.4px/);
+  assert.match(page, /className="blueprint-frame"/);
+  assert.match(css, /\.blueprint-card\s*\{[^}]*border: 0;/);
+  assert.doesNotMatch(css, /\.blueprint-card::before/);
+  assert.match(css, /\.blueprint-frame::before\s*\{[\s\S]*?12px[\s\S]*?1\.4px/);
   assert.doesNotMatch(page, /className="capability-plan-card"/);
   assert.match(page, /<section className="tool-ability-picker">/);
 });

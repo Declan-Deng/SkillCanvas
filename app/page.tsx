@@ -11111,28 +11111,30 @@ export default function Home() {
                   <i aria-hidden="true">⌄</i>
                 </button>
               </div>
-              <div
-                className={`blueprint-grid ${blueprintExpanded ? "is-expanded" : "is-stacked"}`}
-                id="blueprint-sections"
-                ref={blueprintGridRef}
-              >
-                {blueprint.map((section) => (
-                  <article className={`blueprint-card ${section.status}`} key={section.id}>
-                    <div className="blueprint-top">
-                      <div className="blueprint-title">
-                        <span className="module-letter">{section.index}</span>
-                        <h3>{section.title}</h3>
+              <div className="blueprint-frame">
+                <div
+                  className={`blueprint-grid ${blueprintExpanded ? "is-expanded" : "is-stacked"}`}
+                  id="blueprint-sections"
+                  ref={blueprintGridRef}
+                >
+                  {blueprint.map((section) => (
+                    <article className={`blueprint-card ${section.status}`} key={section.id}>
+                      <div className="blueprint-top">
+                        <div className="blueprint-title">
+                          <span className="module-letter">{section.index}</span>
+                          <h3>{section.title}</h3>
+                        </div>
+                        {section.status !== "ready" && <span className={`module-status ${section.status}`}>建议确认</span>}
                       </div>
-                      {section.status !== "ready" && <span className={`module-status ${section.status}`}>建议确认</span>}
-                    </div>
-                    <textarea
-                      value={section.content}
-                      tabIndex={blueprintExpanded ? 0 : -1}
-                      onChange={(event) => setBlueprint((current) => current.map((item) => item.id === section.id ? { ...item, content: event.target.value } : item))}
-                      aria-label={`${section.title}内容`}
-                    />
-                  </article>
-                ))}
+                      <textarea
+                        value={section.content}
+                        tabIndex={blueprintExpanded ? 0 : -1}
+                        onChange={(event) => setBlueprint((current) => current.map((item) => item.id === section.id ? { ...item, content: event.target.value } : item))}
+                        aria-label={`${section.title}内容`}
+                      />
+                    </article>
+                  ))}
+                </div>
               </div>
               <section className={`loop-plan-card ${loopPlan.mode}`}>
                 <div className="loop-plan-heading">
