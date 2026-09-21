@@ -5571,18 +5571,11 @@ export default function Home() {
   const requirementCoverage = summarizeRequirementCoverage(interviewEvidence);
   const coveredDimensions = requirementCoverage.covered;
   const uncertainDimensions = requirementCoverage.uncertain;
-  const coveredDimensionCount = requirementCoverage.coveredCount;
-  const uncertainDimensionCount = requirementCoverage.uncertainCount;
   const ideaReady = idea.trim().length >= 2;
   const interviewReady = questions.length > 0 && currentAnsweredCount === questions.length;
   const isFinalInterviewRound = interviewRoundIndex === INTERVIEW_ROUND_META.length - 1;
   const interviewCompletion = interviewCompletionGate({ rounds: interviewRounds, origins: interviewRoundOrigins, answers,
     currentRoundIndex: interviewRoundIndex, highestRoundReached, expectedQuestionCounts: INTERVIEW_ROUND_META.map((round) => round.dimensions.length) });
-  const completeness = Math.min(100, Math.round(
-    (ideaReady ? 15 : 0)
-    + ((coveredDimensionCount - uncertainDimensionCount * 0.55) / REQUIREMENT_DIMENSIONS.length) * 85
-    + Math.min(10, (sourceNames.length + contextFilledCount) * 2.5),
-  ));
   const hasApiKey = apiKey.trim().length > 8 || credentialStored;
   const hasRealModel = hasApiKey;
   const researchReady = researchProvider === "firecrawl"
@@ -5706,6 +5699,8 @@ export default function Home() {
     : createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0);
   const optionalToolCapabilities = capabilityPlan.items.filter((item) => item.optional && (item.kind === "builtin-tool" || item.kind === "mcp"));
   const adoptedRuntimeCapabilities = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind !== "eval" && item.layer === "runtime");
+  const coreRuntimeCapabilities = adoptedRuntimeCapabilities.filter((item) => !item.optional);
+  const adoptedOptionalCapabilityCount = optionalToolCapabilities.filter(capabilityIsActive).length;
   const unresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
   const selectedCatalogCapabilityCount = CAPABILITY_LIBRARY.filter((libraryItem) => capabilityPlan.items.some((item) => item.id === libraryItem.id && capabilityIsActive(item))).length;
   const activeSkillName = stripYamlQuotes(files["SKILL.md"]?.match(/^name:\s*([^\n]+)$/m)?.[1] || "") || "generated-skill";
@@ -10938,7 +10933,6 @@ export default function Home() {
                 </div>
                 <div className="interview-heading-aside">
                   <img className="interview-heading-pen" src="/skillcanvas-note-pen.png" width="1254" height="1254" alt="" aria-hidden="true" />
-                  <div className="completeness-badge"><strong>{completeness}%</strong><span>需求完整度</span></div>
                 </div>
               </div>
 
@@ -11056,7 +11050,7 @@ export default function Home() {
                 <section className="final-note-card" aria-labelledby="final-note-title">
                   <span className="final-note-tape" aria-hidden="true" />
                   <div className="final-note-copy">
-                    <span className="final-note-kicker">可选补充</span>
+                    <span className="final-note-kicker">可选</span>
                     <h3 id="final-note-title">还有什么想说的吗</h3>
                     <p>可以补充你的背景，你不喜欢的，或者选项里面不完整的内容，或者任何你想写的</p>
                   </div>
@@ -11143,11 +11137,8 @@ export default function Home() {
               <section className={`loop-plan-card ${loopPlan.mode}`}>
                 <div className="loop-plan-heading">
                   <div>
-                    <span className="stage-kicker">AI 已推荐并采用一条可执行流程</span>
                     <h3>推荐工作流：目标、子目标与循环</h3>
-                    <p>{loopPlan.reason}</p>
                   </div>
-                  <span className="status-pill">✓ 已采用 · {loopPlan.label} · 最多 {loopPlan.maxRounds} 回合</span>
                 </div>
                 <div className="loop-goal">
                   <span>总目标</span>
@@ -11207,48 +11198,51 @@ export default function Home() {
                   </div>
                 </div>
               </section>
-              <section className="capability-plan-card">
-                <section className="tool-ability-picker">
+              <section className="tool-ability-picker">
                   <div className="tool-ability-heading">
                     <div><span>能力选型结果</span><h4>完成这个任务实际会用到什么</h4><p>只采用会改变输入读取、任务判断或真实交付的能力；每项都必须有触发条件、可观察产出和不可用时的降级方式。</p></div>
                     <small>{adoptedRuntimeCapabilities.length} 项运行能力已采用</small>
                   </div>
+                  <div className="capability-group-heading"><strong>核心能力</strong><span>直接决定任务结果</span></div>
                   <div className="adopted-capability-grid" aria-label="已采用的运行能力">
-                    {adoptedRuntimeCapabilities.map((item) => (
-                      <article key={item.id}>
+                    {coreRuntimeCapabilities.map((item) => (
+                      <article className={`kind-${item.kind}`} key={item.id}>
                         <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
                         <div><strong>{item.name}</strong><p>{item.reason}</p><small>何时用：{item.activationCondition || item.routingCondition}</small></div>
-                        <em>{item.recommended ? "AI 自动添加" : item.kind === "builtin-tool" || item.kind === "mcp" ? "你已添加" : "核心任务"}</em>
+                        <em>{item.kind === "llm" ? "核心推理" : CAPABILITY_KIND_META[item.kind].label}</em>
                       </article>
                     ))}
                   </div>
                   {optionalToolCapabilities.length ? (
-                    <div className="tool-ability-grid">
-                      {optionalToolCapabilities.map((item) => {
-                        const active = capabilityIsActive(item);
-                        return (
-                          <article className={`tool-ability-card ${active ? "selected" : ""}`} key={item.id}>
-                            <button type="button" className="tool-ability-toggle" aria-pressed={active} onClick={() => toggleOptionalCapability(item)}>
-                              <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
-                              <span className="tool-ability-copy"><small>{CAPABILITY_KIND_META[item.kind].label}{item.recommended ? " · AI 推荐" : " · 可选"}</small><strong>{item.name}</strong><em>{item.reason}</em></span>
-                              <span className="tool-toggle-state">{active ? "✓ 已添加" : "+ 添加能力"}</span>
-                            </button>
-                            {active && <div className="capability-contract"><span>何时用：{item.routingCondition}</span><span>输入：{item.input || "由当前任务提供"}</span><span>产出：{item.output || "可验证结果"}</span></div>}
-                            {active && item.kind === "mcp" && item.status === "requires-setup" && (
-                              <div className="mcp-setup-panel">
-                                <div><strong>确认目标 Agent 中的连接</strong><p>只有安装并授权后才会写成可调用；否则取消添加即可，不会留下发布待办。</p></div>
-                                <label><span>MCP Server 名称</span><input value={mcpDrafts[item.id] || ""} onChange={(event) => setMcpDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder={item.connection?.server || "例如：Notion MCP、GitHub MCP"} /></label>
-                                {!!item.connection?.tools.length && <small>预计使用：{item.connection.tools.join("、")}</small>}
-                                <div className="mcp-setup-actions"><button onClick={() => confirmMcpCapability(item)}>我已安装并授权</button><button onClick={() => chooseMcpFallback(item)}>取消添加</button></div>
-                              </div>
-                            )}
-                            {active && item.kind === "mcp" && item.status === "use-provided" && item.connection?.verified && (
-                              <div className="mcp-confirmed"><span>✓</span><div><strong>已确认 {item.connection.server}</strong><small>会生成调用契约、运行前检查和不可用时的替代路径。</small></div><button onClick={() => editMcpCapability(item)}>修改</button></div>
-                            )}
-                          </article>
-                        );
-                      })}
-                    </div>
+                    <section className="capability-option-section">
+                      <div className="capability-group-heading"><strong>工具与外部连接</strong><span>{adoptedOptionalCapabilityCount ? `已启用 ${adoptedOptionalCapabilityCount} 项` : "按需启用"}</span></div>
+                      <div className="tool-ability-grid">
+                        {optionalToolCapabilities.map((item) => {
+                          const active = capabilityIsActive(item);
+                          return (
+                            <article className={`tool-ability-card kind-${item.kind} ${active ? "selected" : ""}`} key={item.id}>
+                              <button type="button" className="tool-ability-toggle" aria-pressed={active} onClick={() => toggleOptionalCapability(item)}>
+                                <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
+                                <span className="tool-ability-copy"><small>{CAPABILITY_KIND_META[item.kind].label}{item.recommended ? " · AI 推荐" : " · 可选"}</small><strong>{item.name}</strong><em>{item.reason}</em></span>
+                                <span className="tool-toggle-state">{active ? "✓ 已添加" : "+ 添加能力"}</span>
+                              </button>
+                              {active && <div className="capability-contract"><span>何时用：{item.routingCondition}</span><span>输入：{item.input || "由当前任务提供"}</span><span>产出：{item.output || "可验证结果"}</span></div>}
+                              {active && item.kind === "mcp" && item.status === "requires-setup" && (
+                                <div className="mcp-setup-panel">
+                                  <div><strong>确认目标 Agent 中的连接</strong><p>只有安装并授权后才会写成可调用；否则取消添加即可，不会留下发布待办。</p></div>
+                                  <label><span>MCP Server 名称</span><input value={mcpDrafts[item.id] || ""} onChange={(event) => setMcpDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder={item.connection?.server || "例如：Notion MCP、GitHub MCP"} /></label>
+                                  {!!item.connection?.tools.length && <small>预计使用：{item.connection.tools.join("、")}</small>}
+                                  <div className="mcp-setup-actions"><button onClick={() => confirmMcpCapability(item)}>我已安装并授权</button><button onClick={() => chooseMcpFallback(item)}>取消添加</button></div>
+                                </div>
+                              )}
+                              {active && item.kind === "mcp" && item.status === "use-provided" && item.connection?.verified && (
+                                <div className="mcp-confirmed"><span>✓</span><div><strong>已确认 {item.connection.server}</strong><small>会生成调用契约、运行前检查和不可用时的替代路径。</small></div><button onClick={() => editMcpCapability(item)}>修改</button></div>
+                              )}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </section>
                   ) : <div className="tool-ability-empty"><strong>本次无需额外安装</strong><span>AI 已把完成任务必需的能力放进核心流程，没有为了显得“专业”而机械添加 MCP。你仍可从下面的能力库自行扩展。</span></div>}
                   <div className="capability-library-control">
                     <div><span>完整能力库</span><strong className="capability-library-title"><img src="/icons/tabler/plug.svg" alt="" aria-hidden="true" />添加能力</strong><p>宿主能力来自 Codex、Claude Code 等 Agent；MCP 是另行安装和授权的外部连接。Skill 只声明何时调用，不能凭空安装能力。</p></div>
@@ -11287,7 +11281,6 @@ export default function Home() {
                       </details>
                     </div>
                   )}
-                </section>
               </section>
               <div className="stage-footer">
                 <button className="secondary-button" onClick={() => setStep("interview")}>继续让 AI 了解我</button>

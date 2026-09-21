@@ -55,13 +55,43 @@ test("interview heading uses the transparent pen and final note is below the fou
   assert.equal(pen.subarray(1, 4).toString(), "PNG");
   assert.equal(pen[25], 6, "pen stays transparent");
   assert.match(page, /className="interview-heading-pen" src="\/skillcanvas-note-pen\.png"/);
+  assert.doesNotMatch(page, /completeness-badge|需求完整度/);
+  assert.match(css, /\.interview-heading-pen\s*\{[^}]*height: 80px;[^}]*width: 80px;/);
   const questionListEnd = page.indexOf("{isFinalInterviewRound && (\n                <section className=\"final-note-card\"");
   const footer = page.indexOf('<div className="stage-footer">', questionListEnd);
   assert.ok(questionListEnd > page.indexOf('<div className="question-list">'));
   assert.ok(footer > questionListEnd);
   assert.match(page, /还有什么想说的吗/);
+  assert.match(page, /className="final-note-kicker">可选<\/span>/);
   assert.match(page, /handleContextSources\(event, "background"\)/);
   assert.match(css, /\.final-note-card\s*\{[\s\S]*?#fff3b8;/);
+  assert.match(css, /\.final-note-copy\s*\{[^}]*align-content: start;/);
+});
+
+test("blueprint uses sky dashed sheets and capability selection has one surface", () => {
+  assert.match(css, /\.blueprint-card\s*\{[^}]*--blueprint-dash: #83bfe3;[^}]*border: 0;/);
+  assert.match(css, /\.blueprint-card::before\s*\{[\s\S]*?12px[\s\S]*?1\.4px/);
+  assert.doesNotMatch(page, /className="capability-plan-card"/);
+  assert.match(page, /<section className="tool-ability-picker">/);
+});
+
+test("workflow recommendation keeps the decision and removes redundant explanation", () => {
+  assert.doesNotMatch(page, /AI 已推荐并采用一条可执行流程/);
+  assert.doesNotMatch(page, /<p>\{loopPlan\.reason\}<\/p>/);
+  assert.doesNotMatch(page, /✓ 已采用 · \{loopPlan\.label\}/);
+  assert.match(page, /推荐工作流：目标、子目标与循环/);
+  assert.match(css, /\.loop-plan-card\s*\{[^}]*background: transparent;[^}]*border: 0;/);
+  assert.match(css, /\.workflow-editor\s*\{[^}]*background: #17211f;/);
+  assert.match(css, /\.workflow-step-card\s*\{[^}]*height: 230px;/);
+});
+
+test("capability picker separates core work from optional tools without duplicates", () => {
+  assert.match(page, /const coreRuntimeCapabilities = adoptedRuntimeCapabilities\.filter\(\(item\) => !item\.optional\)/);
+  assert.match(page, /<strong>核心能力<\/strong><span>直接决定任务结果<\/span>/);
+  assert.match(page, /<strong>工具与外部连接<\/strong>/);
+  assert.match(page, /className=\{`tool-ability-card kind-\$\{item\.kind\}/);
+  assert.match(css, /\.tool-ability-card\.kind-builtin-tool \.capability-icon/);
+  assert.match(css, /\.tool-ability-card\.kind-mcp\s*\{/);
 });
 
 test("question cards use restrained hover feedback and distinctive aligned labels", () => {

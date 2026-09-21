@@ -1375,31 +1375,10 @@ h3 {
 
 .interview-heading-pen {
   display: block;
-  height: 132px;
+  height: 80px;
   object-fit: contain;
   transform: rotate(7deg);
-  width: 132px;
-}
-
-.completeness-badge {
-  align-items: flex-end;
-  background: var(--ink);
-  border-radius: 14px 14px 14px 4px;
-  color: white;
-  display: flex;
-  flex-direction: column;
-  min-width: 104px;
-  padding: 13px 15px;
-}
-
-.completeness-badge strong {
-  font-size: 24px;
-  letter-spacing: -0.05em;
-}
-
-.completeness-badge span {
-  color: #b8c3c0;
-  font-size: 9px;
+  width: 80px;
 }
 
 .discovery-preview-card {
@@ -2734,7 +2713,7 @@ h3 {
 }
 
 .final-note-copy {
-  align-content: center;
+  align-content: start;
   display: grid;
   gap: 7px;
   min-width: 0;
@@ -2971,8 +2950,9 @@ h3 {
 }
 
 .blueprint-card {
+  --blueprint-dash: #83bfe3;
   background: var(--paper);
-  border: 1px solid var(--line);
+  border: 0;
   border-radius: 15px;
   display: flex;
   flex-direction: column;
@@ -2981,6 +2961,19 @@ h3 {
   position: relative;
   transform-origin: center top;
   transition: border-color 160ms ease, box-shadow 220ms ease, transform 260ms var(--ease-in-out);
+}
+
+.blueprint-card::before {
+  background:
+    repeating-linear-gradient(90deg, var(--blueprint-dash) 0 12px, transparent 12px 20px) top left / 100% 1.4px no-repeat,
+    repeating-linear-gradient(90deg, var(--blueprint-dash) 0 12px, transparent 12px 20px) bottom left / 100% 1.4px no-repeat,
+    repeating-linear-gradient(180deg, var(--blueprint-dash) 0 12px, transparent 12px 20px) top left / 1.4px 100% no-repeat,
+    repeating-linear-gradient(180deg, var(--blueprint-dash) 0 12px, transparent 12px 20px) top right / 1.4px 100% no-repeat;
+  border-radius: inherit;
+  content: "";
+  inset: 0;
+  pointer-events: none;
+  position: absolute;
 }
 
 .blueprint-grid.is-stacked .blueprint-card {
@@ -3018,7 +3011,7 @@ h3 {
 }
 
 .blueprint-card.attention {
-  border-color: var(--line);
+  --blueprint-dash: #69add7;
   box-shadow:
     0 0 26px rgba(242, 190, 78, 0.26),
     0 14px 38px rgba(217, 158, 39, 0.11),
@@ -3111,18 +3104,17 @@ h3 {
 }
 
 .loop-plan-card {
-  background: #17211f;
-  border: 1px solid #263531;
-  border-radius: 18px;
-  color: #f8fbf9;
-  margin-top: 22px;
-  overflow: hidden;
-  padding: 22px;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  color: var(--ink);
+  margin-top: 30px;
+  overflow: visible;
+  padding: 0;
 }
 
 .loop-plan-card.turn-based {
-  background: #211e19;
-  border-color: #3b3328;
+  background: transparent;
 }
 
 .loop-plan-heading {
@@ -3137,9 +3129,10 @@ h3 {
 }
 
 .loop-plan-heading h3 {
-  color: white;
-  font-size: 24px;
-  margin: 5px 0 7px;
+  color: var(--ink);
+  font-size: 26px;
+  letter-spacing: -0.035em;
+  margin: 0;
 }
 
 .loop-plan-heading p {
@@ -3149,20 +3142,15 @@ h3 {
   max-width: 760px;
 }
 
-.loop-plan-heading .status-pill {
-  background: rgba(255, 255, 255, 0.08);
-  border-color: rgba(255, 255, 255, 0.14);
-  color: #d7e4df;
-}
-
 .loop-goal {
-  background: rgba(255, 255, 255, 0.065);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 13px;
+  background: #edf5f1;
+  border: 1px solid #d2e2dc;
+  border-left: 4px solid var(--green);
+  border-radius: 12px;
   display: grid;
   gap: 6px;
-  margin-top: 18px;
-  padding: 15px 16px;
+  margin-top: 16px;
+  padding: 15px 18px;
 }
 
 .loop-goal > span,
@@ -3175,6 +3163,7 @@ h3 {
 }
 
 .loop-goal strong {
+  color: var(--ink);
   font-size: 14px;
   line-height: 1.55;
 }
@@ -3186,11 +3175,12 @@ h3 {
 }
 
 .workflow-editor {
-  background: rgba(255, 255, 255, 0.045);
-  border: 1px solid rgba(255, 255, 255, 0.1);
-  border-radius: 13px;
-  margin-top: 12px;
-  padding: 15px 14px 14px;
+  background: #17211f;
+  border: 1px solid #263531;
+  border-radius: 16px;
+  box-shadow: 0 16px 36px rgba(21, 40, 35, 0.12);
+  margin-top: 14px;
+  padding: 18px 16px 16px;
 }
 
 .workflow-editor-heading {
@@ -3225,11 +3215,13 @@ h3 {
 }
 
 .workflow-editor-flow {
-  align-items: stretch;
+  align-items: flex-start;
   display: flex;
+  gap: 0;
   min-width: 0;
   overflow-x: auto;
-  padding: 2px 0 7px;
+  padding: 4px 0 10px;
+  scroll-snap-type: x proximity;
   scrollbar-color: rgba(127, 195, 177, 0.35) transparent;
   scrollbar-width: thin;
 }
@@ -3240,11 +3232,12 @@ h3 {
   border-radius: 12px;
   color: var(--ink);
   display: grid;
-  flex: 0 0 210px;
+  flex: 0 0 240px;
   gap: 7px;
-  min-height: 142px;
-  padding: 13px;
+  height: 230px;
+  padding: 14px;
   position: relative;
+  scroll-snap-align: start;
   transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
 }
 
@@ -3275,8 +3268,12 @@ h3 {
 }
 
 .workflow-step-card > strong {
+  display: -webkit-box;
   font-size: 11px;
   line-height: 1.45;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
 }
 
 .workflow-step-card > p {
@@ -3284,12 +3281,19 @@ h3 {
   font-size: 9px;
   line-height: 1.45;
   margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .workflow-step-card > small {
   color: #68736f;
+  display: -webkit-box;
   font-size: 8px;
   line-height: 1.45;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
 }
 
 .workflow-step-actions {
@@ -3464,17 +3468,19 @@ h3 {
 
 .loop-columns {
   display: grid;
-  gap: 12px;
+  gap: 16px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin-top: 12px;
+  margin-top: 16px;
 }
 
 .loop-subgoals,
 .loop-gates {
   background: #fbfaf7;
+  border: 1px solid var(--line);
   border-radius: 13px;
+  box-shadow: 0 12px 30px rgba(31, 48, 44, 0.07);
   color: var(--ink);
-  padding: 14px;
+  padding: 16px;
 }
 
 .loop-section-title {
@@ -3600,14 +3606,6 @@ h3 {
   font-size: 9.5px;
   line-height: 1.55;
   margin: 0;
-}
-
-.capability-plan-card {
-  background: #f7f4ed;
-  border: 1px solid var(--line-strong);
-  border-radius: 18px;
-  margin-top: 22px;
-  padding: 22px;
 }
 
 .capability-plan-heading {
@@ -3775,7 +3773,7 @@ h3 {
   background: #f7f5ef;
   border: 1px solid var(--line);
   border-radius: 15px;
-  margin-top: 16px;
+  margin-top: 22px;
   padding: 16px;
 }
 
@@ -3814,11 +3812,28 @@ h3 {
   white-space: nowrap;
 }
 
+.capability-group-heading {
+  align-items: baseline;
+  display: flex;
+  gap: 9px;
+  margin-top: 18px;
+}
+
+.capability-group-heading strong {
+  color: var(--ink);
+  font-size: 10px;
+}
+
+.capability-group-heading span {
+  color: var(--muted);
+  font-size: 8px;
+}
+
 .adopted-capability-grid {
   display: grid;
   gap: 9px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin-top: 13px;
+  margin-top: 8px;
 }
 
 .adopted-capability-grid article {
@@ -3830,6 +3845,19 @@ h3 {
   gap: 10px;
   grid-template-columns: 34px minmax(0, 1fr) auto;
   padding: 12px;
+}
+
+.adopted-capability-grid article.kind-llm {
+  border-left: 3px solid #318b73;
+}
+
+.adopted-capability-grid article.kind-script {
+  border-left: 3px solid #5e91b5;
+}
+
+.adopted-capability-grid article.kind-reference,
+.adopted-capability-grid article.kind-asset {
+  border-left: 3px solid #d3a54b;
 }
 
 .adopted-capability-grid article > div {
@@ -3866,24 +3894,54 @@ h3 {
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  margin-top: 13px;
+  margin-top: 8px;
+}
+
+.capability-option-section {
+  border-top: 1px solid var(--line);
+  margin-top: 17px;
+  padding-top: 1px;
 }
 
 .tool-ability-card {
   background: var(--paper);
-  border: 1px solid transparent;
+  border: 1px solid #ded9ce;
   border-radius: 13px;
   overflow: hidden;
   transition: border-color 160ms ease, box-shadow 180ms var(--ease-out), transform 140ms var(--ease-out);
 }
 
 .tool-ability-card.selected {
-  background: linear-gradient(145deg, rgba(255, 255, 255, 0.98), rgba(235, 247, 242, 0.92));
-  border-color: rgba(91, 172, 145, 0.16);
-  box-shadow:
-    0 0 28px rgba(46, 154, 121, 0.2),
-    0 14px 34px rgba(24, 126, 96, 0.1),
-    inset 0 1px 0 rgba(255, 255, 255, 0.82);
+  background: #eef7f3;
+  border-color: #afd1c4;
+  box-shadow: 0 9px 22px rgba(34, 98, 80, 0.09);
+}
+
+.tool-ability-card.kind-builtin-tool .capability-icon {
+  background: #245f79;
+}
+
+.tool-ability-card.kind-builtin-tool .tool-ability-copy small {
+  color: #245f79;
+}
+
+.tool-ability-card.kind-mcp {
+  background: #fffaf0;
+  border-color: #e5cc96;
+}
+
+.tool-ability-card.kind-mcp.selected {
+  background: #fff4d9;
+  border-color: #d6ad57;
+  box-shadow: 0 9px 22px rgba(133, 94, 25, 0.1);
+}
+
+.tool-ability-card.kind-mcp .capability-icon {
+  background: #8a641e;
+}
+
+.tool-ability-card.kind-mcp .tool-ability-copy small {
+  color: #8a641e;
 }
 
 .tool-ability-card:has(.tool-ability-toggle:active) {
@@ -10532,14 +10590,18 @@ h3 {
     border-color: var(--line-strong);
   }
 
-  .round-navigator button:not(:disabled):hover,
-  .blueprint-grid:not(.is-stacked) .blueprint-card:not(.attention):hover {
+  .round-navigator button:not(:disabled):hover {
     border-color: var(--line-strong);
     box-shadow: 0 7px 22px rgba(28, 38, 36, 0.055);
   }
 
+  .blueprint-grid:not(.is-stacked) .blueprint-card:not(.attention):hover {
+    --blueprint-dash: #66abd4;
+    box-shadow: 0 7px 22px rgba(28, 38, 36, 0.055);
+  }
+
   .blueprint-grid:not(.is-stacked) .blueprint-card.attention:hover {
-    border-color: var(--line);
+    --blueprint-dash: #579bc6;
     box-shadow:
       0 0 32px rgba(242, 190, 78, 0.34),
       0 16px 42px rgba(217, 158, 39, 0.14),
@@ -10947,13 +11009,13 @@ h3 {
 
   .interview-heading-aside {
     align-items: center;
-    justify-content: space-between;
+    justify-content: flex-end;
     width: 100%;
   }
 
   .interview-heading-pen {
-    height: 82px;
-    width: 82px;
+    height: 50px;
+    width: 50px;
   }
 
   .discovery-preview-card {
@@ -11269,7 +11331,7 @@ h3 {
   }
 
   .loop-plan-card {
-    padding: 16px;
+    padding: 0;
   }
 
   .workflow-editor-heading {
@@ -11291,17 +11353,8 @@ h3 {
     display: block;
   }
 
-  .loop-plan-heading .status-pill {
-    display: inline-block;
-    margin-top: 12px;
-  }
-
   .loop-protocol {
     grid-template-columns: 1fr;
-  }
-
-  .capability-plan-card {
-    padding: 16px;
   }
 
   .capability-plan-heading {

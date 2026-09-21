@@ -122,7 +122,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /loop-continue-on-observed-gap/);
   assert.match(page, /loop-stop-or-human-checkpoint/);
   assert.match(page, /Quality gates are acceptance checks/);
-  assert.match(page, /最多 \{loopPlan\.maxRounds\} 回合/);
+  assert.doesNotMatch(page, /最多 \{loopPlan\.maxRounds\} 回合/);
   assert.match(page, /DEFAULT_CAPABILITY_PLAN/);
   assert.match(page, /function createExpandedGoal\(/);
   assert.match(page, /body = reconcileConfirmedContentPolicy\(body, answers\);\s*body = ensureMeaningfulGoal\(body, createExpandedGoal/);
@@ -259,7 +259,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /bundleAudit.blockers.length > 0 && <div className="finding-card">/);
   assert.match(page, /能力选型结果/);
   assert.match(page, /目标、子目标与循环/);
-  assert.match(page, /AI 已推荐并采用一条可执行流程/);
+  assert.doesNotMatch(page, /AI 已推荐并采用一条可执行流程/);
+  assert.doesNotMatch(page, /✓ 已采用 · \{loopPlan\.label\}/);
   assert.match(page, /推荐工作流：目标、子目标与循环/);
   assert.match(page, /本次无需额外安装/);
   assert.match(page, /没有为了显得“专业”而机械添加 MCP/);
@@ -314,7 +315,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /notifyGenerationLoopResult\(state\)/);
   assert.match(page, /完成后通过浏览器通知你/);
   assert.match(page, /项运行能力已采用/);
-  assert.match(page, /adoptedRuntimeCapabilities\.map/);
+  assert.match(page, /coreRuntimeCapabilities\.map/);
+  assert.match(page, /optionalToolCapabilities\.map/);
   assert.match(page, /完成这个任务实际会用到什么/);
   assert.match(page, /runIsolatedEvalHarness/);
   assert.match(page, /三用例执行未完成，仅拆分当前小批次/);
@@ -543,7 +545,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(css, /\.eval-optimize-button/);
   assert.match(css, /\.optimization-backdrop/);
   assert.match(css, /\.optimization-score-change/);
-  assert.match(css, /\.capability-plan-card/);
+  assert.doesNotMatch(page, /className="capability-plan-card"/);
   assert.match(css, /\.capability-plan-grid/);
   assert.match(css, /grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);
   assert.match(css, /\.question-options\.single \.choice-indicator/);
