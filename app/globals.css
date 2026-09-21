@@ -2884,6 +2884,7 @@ h3 {
 .blueprint-frame {
   --blueprint-dash: #83bfe3;
   border-radius: 16px;
+  padding: 20px;
   position: relative;
 }
 
@@ -3150,7 +3151,6 @@ h3 {
 .loop-goal {
   background: #edf5f1;
   border: 1px solid #d2e2dc;
-  border-left: 4px solid var(--green);
   border-radius: 12px;
   display: grid;
   gap: 6px;
@@ -3850,19 +3850,6 @@ h3 {
   gap: 10px;
   grid-template-columns: 34px minmax(0, 1fr) auto;
   padding: 12px;
-}
-
-.adopted-capability-grid article.kind-llm {
-  border-left: 3px solid #318b73;
-}
-
-.adopted-capability-grid article.kind-script {
-  border-left: 3px solid #5e91b5;
-}
-
-.adopted-capability-grid article.kind-reference,
-.adopted-capability-grid article.kind-asset {
-  border-left: 3px solid #d3a54b;
 }
 
 .adopted-capability-grid article > div {

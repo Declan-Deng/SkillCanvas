@@ -73,6 +73,9 @@ test("blueprint uses sky dashed sheets and capability selection has one surface"
   assert.match(css, /\.blueprint-card\s*\{[^}]*border: 0;/);
   assert.doesNotMatch(css, /\.blueprint-card::before/);
   assert.match(css, /\.blueprint-frame::before\s*\{[\s\S]*?12px[\s\S]*?1\.4px/);
+  assert.match(css, /\.blueprint-frame\s*\{[\s\S]*?padding: 20px/);
+  assert.doesNotMatch(css, /\.adopted-capability-grid article\.kind-[^{]+\{[^}]*border-left/);
+  assert.doesNotMatch(css, /\.loop-goal\s*\{[^}]*border-left/);
   assert.doesNotMatch(page, /className="capability-plan-card"/);
   assert.match(page, /<section className="tool-ability-picker">/);
 });
