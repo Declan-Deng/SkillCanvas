@@ -5123,6 +5123,7 @@ export default function Home() {
   const [busyExecutionKind, setBusyExecutionKind] = useState<BusyExecutionKind>("local");
   const [busyExecutionNote, setBusyExecutionNote] = useState("正在准备当前步骤");
   const [busyOutputText, setBusyOutputText] = useState("");
+  const [busyOutputRevision, setBusyOutputRevision] = useState(0);
   const busyOutputArrivedAt = useRef(0);
   const busyOutputViewportRef = useRef<HTMLDivElement | null>(null);
   const [activeAiMode, setActiveAiMode] = useState("");
@@ -5712,6 +5713,13 @@ export default function Home() {
     viewport.scrollTop = 0;
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     let animationFrame = 0;
+    let interrupted = false;
+    const stopAutoScroll = () => {
+      interrupted = true;
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+    };
+    viewport.addEventListener("wheel", stopAutoScroll, { passive: true });
+    viewport.addEventListener("touchstart", stopAutoScroll, { passive: true });
     const startDelay = window.setTimeout(() => {
       const bottomPadding = Number.parseFloat(window.getComputedStyle(viewport).paddingBottom) || 0;
       const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight - bottomPadding);
@@ -5719,6 +5727,7 @@ export default function Home() {
       const startedAt = performance.now();
       const duration = Math.min(2_750, Math.max(1_300, maxScroll * 3.125));
       const advance = (now: number) => {
+        if (interrupted) return;
         const progress = Math.min(1, (now - startedAt) / duration);
         const easedProgress = 1 - Math.pow(1 - progress, 3);
         viewport.scrollTop = Math.min(maxScroll, maxScroll * easedProgress);
@@ -5729,6 +5738,8 @@ export default function Home() {
     return () => {
       window.clearTimeout(startDelay);
       if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      viewport.removeEventListener("wheel", stopAutoScroll);
+      viewport.removeEventListener("touchstart", stopAutoScroll);
     };
   }, [busyOutputText]);
 
@@ -5991,12 +6002,22 @@ export default function Home() {
 
   function notifyGenerationLoopResult(state: GenerationLoopState) {
     const elapsedSeconds = loopStartedAt.current ? Math.max(1, Math.round((Date.now() - loopStartedAt.current) / 1_000)) : 0;
-    const title = state.status === "passed" ? "Skill 优化已完成" : state.status === "stable" ? "Skill 已保留当前最佳版本" : "Skill 优化需要查看";
+    const candidateSafelyRejected = state.status === "attention"
+      && state.benchmarkRuns > 0
+      && state.acceptedPatches === 0
+      && state.rejectedPatches > 0;
+    const title = state.status === "passed"
+      ? "Skill 优化已完成"
+      : state.status === "stable" || candidateSafelyRejected
+        ? "Skill 已生成，当前版本已保留"
+        : "Skill 优化需要查看";
     const result = state.status === "passed"
       ? `当前最佳版本已通过回归门控${state.lift ? `，Skill Lift ${state.lift > 0 ? "+" : ""}${state.lift}` : ""}。`
       : state.status === "stable"
         ? "冻结评测全部通过，但没有候选证明额外提升；已安全保留当前最佳版本。"
-      : `${state.stopReason || "Loop 已停止并保留当前最佳版本。"}`;
+        : candidateSafelyRejected
+          ? `候选优化未通过独立评测，系统已自动回滚；Skill 已正常生成，当前版本没有被覆盖${state.issues.length ? `。另有 ${state.issues.length} 个观察项可稍后查看` : ""}。`
+          : `${state.stopReason || "Loop 已停止并保留当前最佳版本。"}`;
     const body = `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220);
     setCompletionNotice({ title, body });
     document.title = `● ${title} · SkillCanvas`;
@@ -6347,6 +6368,7 @@ export default function Home() {
         }
         settleActualUsage(data.usage || {}, data.content);
         setBusyOutputText(data.content.slice(0, 16_000));
+        setBusyOutputRevision((revision) => revision + 1);
         busyOutputArrivedAt.current = Date.now();
         return jsonFromText<T>(data.content);
       } catch (error) {
@@ -11889,7 +11911,7 @@ export default function Home() {
             </div>
             <div className={`ai-output-stage ${busyOutputText ? "has-output" : "waiting"}`} aria-label={busyOutputText ? "模型本轮输出" : "模型正在处理"}>
               {busyOutputText
-                ? <div className="ai-output-scroll" ref={busyOutputViewportRef}><pre>{busyOutputText}</pre></div>
+                ? <div className="ai-output-scroll" ref={busyOutputViewportRef} key={busyOutputRevision} tabIndex={0}><pre>{busyOutputText}</pre></div>
                 : <WaitingDotField />}
             </div>
             <DotMatrixProgress progress={(busyStageIndex + 0.42) / BUSY_STAGES[busyTask].stages.length} label={`总进度：${busyStage}`} />

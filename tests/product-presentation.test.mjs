@@ -95,6 +95,15 @@ test("workflow recommendation keeps the decision and removes redundant explanati
   assert.match(page, /1 - Math\.pow\(1 - progress, 3\)/);
 });
 
+test("model output fades between responses and yields scrolling to the user", () => {
+  assert.match(page, /key=\{busyOutputRevision\}/);
+  assert.match(page, /viewport\.addEventListener\("wheel", stopAutoScroll, \{ passive: true \}\)/);
+  assert.match(page, /viewport\.addEventListener\("touchstart", stopAutoScroll, \{ passive: true \}\)/);
+  assert.match(css, /\.ai-output-scroll\s*\{[^}]*animation: model-output-enter 220ms var\(--ease-out\) both;[^}]*overflow-y: auto;[^}]*scrollbar-width: none;/);
+  assert.match(css, /\.ai-output-scroll::-webkit-scrollbar\s*\{[^}]*display: none;/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.ai-output-scroll\s*\{[^}]*animation-duration: 140ms;[^}]*transform: none;/);
+});
+
 test("capability picker separates core work from optional tools without duplicates", () => {
   assert.match(page, /const coreRuntimeCapabilities = adoptedRuntimeCapabilities\.filter\(\(item\) => !item\.optional\)/);
   assert.match(page, /<strong>核心能力<\/strong><span>直接决定任务结果<\/span>/);

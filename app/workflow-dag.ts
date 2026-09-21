@@ -168,12 +168,17 @@ export function isOptionalToolAvailability(capability: RoutableCapability) {
     && !capability.affects?.some((effect) => /artifact-output|file-output/.test(effect));
 }
 
+function validOptionalCapabilityPlacement(step: WorkflowDagStep, capability: RoutableCapability | undefined, capabilities: RoutableCapability[]) {
+  return Boolean(capability && isOptionalToolAvailability(capability)
+    && ["read", "transform"].includes(step.role || "transform")
+    && !step.mutates.length
+    && step.capabilityIds.some((owner) => capabilities.some((item) => item.id === owner && item.kind === "llm")));
+}
+
 export function workflowCapabilityRouteIssues(steps: WorkflowDagStep[], capabilities: RoutableCapability[]) {
   return steps.flatMap((step) => (step.availableCapabilityIds || []).flatMap((id) => {
     const capability = capabilities.find((item) => item.id === id);
-    return !capability || !isOptionalToolAvailability(capability)
-      || !["read", "transform"].includes(step.role || "transform") || step.mutates.length
-      || !step.capabilityIds.some((owner) => capabilities.some((item) => item.id === owner && item.kind === "llm"))
+    return !validOptionalCapabilityPlacement(step, capability, capabilities)
       ? [`Workflow step ${step.id} 的可选能力 ${id} 无效；必需操作、产物写入与确认不能降级为能力可用性声明`] : [];
   }));
 }
@@ -192,7 +197,28 @@ export function isReadOnlyHostEvidence(capability: RoutableCapability) {
 /** Bind missing runtime steps using declared data, never array position.
  * Ambiguity is intentionally left as an unmet dependency for targeted repair. */
 export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabilities: RoutableCapability[]) {
-  const steps = existing.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], delivers: [...(step.delivers || [])] }));
+  const steps = bindOwnerlessWorkflowSteps(existing.map((step) => ({
+    ...step,
+    requires: [...step.requires],
+    produces: [...step.produces],
+    delivers: [...(step.delivers || [])],
+  })), capabilities);
+  // Restored plans may contain optional providers on a checkpoint, delivery,
+  // mutation, or a capability whose planner-authored metadata drifted. Remove
+  // only the invalid availability edge here. The unrouted provider is then
+  // deterministically rebound below to a real semantic consumer (or remains a
+  // strict explicit operation when it is genuinely required).
+  for (const step of steps) if (step.availableCapabilityIds?.length) {
+    const valid = unique(step.availableCapabilityIds.filter((id) => {
+      const capability = capabilities.find((item) => item.id === id);
+      // Unknown or required providers stay visible to the strict validator;
+      // silently removing them could disguise a missing real operation.
+      if (!capability || !isOptionalToolAvailability(capability)) return true;
+      return validOptionalCapabilityPlacement(step, capability, capabilities);
+    }));
+    if (valid.length) step.availableCapabilityIds = valid;
+    else delete step.availableCapabilityIds;
+  }
   const needsBinding = new Set<string>();
   for (const step of steps) {
     const owners = capabilities.filter((item) => step.capabilityIds.includes(item.id));

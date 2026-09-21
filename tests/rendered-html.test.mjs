@@ -312,6 +312,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /requireInteraction:\s*true/);
   assert.match(page, /renotify:\s*true/);
   assert.match(page, /notifyGenerationLoopResult\(state\)/);
+  assert.match(page, /const candidateSafelyRejected = state\.status === "attention"/);
+  assert.match(page, /候选优化未通过独立评测，系统已自动回滚；Skill 已正常生成，当前版本没有被覆盖/);
   assert.match(page, /完成后通过浏览器通知你/);
   assert.match(page, /项运行能力已采用/);
   assert.match(page, /coreRuntimeCapabilities\.map/);

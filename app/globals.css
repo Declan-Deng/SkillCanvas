@@ -10004,8 +10004,12 @@ h3 {
 }
 
 .ai-output-scroll {
+  animation: model-output-enter 220ms var(--ease-out) both;
   height: 100%;
-  overflow: hidden;
+  -ms-overflow-style: none;
+  overscroll-behavior: contain;
+  overflow-x: hidden;
+  overflow-y: auto;
   padding: 14px 16px 26px;
   scrollbar-width: none;
 }
@@ -10020,10 +10024,8 @@ h3 {
   font-size: 10.1px;
   line-height: 1.62;
   margin: 0;
-  opacity: 0;
   overflow-wrap: anywhere;
   white-space: pre-wrap;
-  animation: model-output-enter 220ms var(--ease-out) forwards;
 }
 
 .dot-matrix-progress {
@@ -12125,8 +12127,7 @@ h3 {
   }
 
   .dot-matrix-progress i,
-  .ai-wind-field i,
-  .ai-output-scroll pre {
+  .ai-wind-field i {
     animation: none;
   }
 
@@ -12135,8 +12136,8 @@ h3 {
     transform: none;
   }
 
-  .ai-output-scroll pre {
-    opacity: 1;
+  .ai-output-scroll {
+    animation-duration: 140ms;
     transform: none;
   }
 
