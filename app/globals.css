@@ -1,5 +1,13 @@
 @import "tailwindcss";
 
+@font-face {
+  font-display: swap;
+  font-family: "SkillCanvas DM Mono";
+  font-style: normal;
+  font-weight: 400;
+  src: url("/fonts/dm-mono-latin.woff2") format("woff2");
+}
+
 :root {
   --canvas: #f3f0e8;
   --paper: #fffdfa;
@@ -1354,6 +1362,25 @@ h3 {
   margin-bottom: 0;
 }
 
+.interview-heading-copy {
+  min-width: 0;
+}
+
+.interview-heading-aside {
+  align-items: flex-end;
+  display: flex;
+  flex: 0 0 auto;
+  gap: 12px;
+}
+
+.interview-heading-pen {
+  display: block;
+  height: 132px;
+  object-fit: contain;
+  transform: rotate(7deg);
+  width: 132px;
+}
+
 .completeness-badge {
   align-items: flex-end;
   background: var(--ink);
@@ -2333,7 +2360,7 @@ h3 {
   gap: 16px;
   grid-template-columns: 76px minmax(170px, 0.8fr) minmax(220px, 1.1fr);
   padding: 16px;
-  transition: background 160ms ease, border-color 160ms ease, box-shadow 180ms ease;
+  transition: transform 180ms ease, background 160ms ease, border-color 160ms ease, box-shadow 180ms ease;
 }
 
 .question-card:focus-within {
@@ -2345,36 +2372,46 @@ h3 {
 .question-index {
   align-self: center;
   display: grid;
-  gap: 8px;
+  gap: 9px;
+  grid-template-rows: 18px 26px;
   justify-items: center;
   width: 76px;
 }
 
 .question-number {
   color: var(--coral-dark);
-  font-family: var(--font-geist-mono), monospace;
-  font-size: 13.75px;
-  font-variant-numeric: tabular-nums slashed-zero;
-  font-weight: 520;
-  letter-spacing: -0.055em;
+  font-family: "SkillCanvas DM Mono", "SFMono-Regular", "SF Mono", Menlo, Monaco, Consolas, monospace;
+  font-size: 18px;
+  font-variant-numeric: tabular-nums;
+  font-weight: 400;
+  letter-spacing: -0.06em;
   line-height: 1;
 }
 
 .question-dimension {
+  align-items: center;
   background: #fff0e9;
   border-radius: 99px;
   color: var(--coral-dark);
   display: inline-flex;
   font-size: 8.75px;
   font-weight: 700;
+  height: 26px;
   justify-content: center;
-  line-height: 1;
+  line-height: 1.2;
   max-width: 76px;
-  min-height: 22px;
   min-width: 68px;
-  padding: 5px 7px;
+  padding: 0 7px;
   text-align: center;
   white-space: normal;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .question-card:hover {
+    border-color: rgba(201, 75, 56, 0.28);
+    box-shadow: 0 11px 28px rgba(28, 38, 36, 0.07);
+    transform: translateY(-2px);
+  }
 }
 
 .question-copy {
@@ -2654,6 +2691,131 @@ h3 {
 
 .question-options button.unsure {
   color: #777f7c;
+}
+
+.final-note-card {
+  background:
+    linear-gradient(90deg, transparent 0 45px, rgba(205, 97, 76, 0.14) 45px 46px, transparent 46px),
+    repeating-linear-gradient(180deg, rgba(255, 255, 255, 0) 0 32px, rgba(126, 111, 66, 0.1) 32px 33px),
+    #fff3b8;
+  border: 1px solid #dec77b;
+  border-radius: 4px 10px 9px 5px;
+  box-shadow: 0 3px 0 rgba(121, 91, 34, 0.12), 0 16px 34px rgba(86, 65, 24, 0.12);
+  display: grid;
+  gap: 14px 20px;
+  grid-template-columns: minmax(200px, 0.42fr) minmax(320px, 1fr);
+  margin: 22px 4px 0;
+  padding: 27px 28px 20px 58px;
+  position: relative;
+}
+
+.final-note-card::after {
+  border-color: transparent #f3dfa0 #f3dfa0 transparent;
+  border-style: solid;
+  border-width: 0 0 20px 20px;
+  bottom: 0;
+  box-shadow: -3px -3px 7px rgba(91, 72, 31, 0.08);
+  content: "";
+  height: 0;
+  position: absolute;
+  right: 0;
+  width: 0;
+}
+
+.final-note-tape {
+  background: rgba(255, 253, 239, 0.68);
+  box-shadow: 0 1px 3px rgba(74, 62, 34, 0.1);
+  height: 22px;
+  left: 50%;
+  position: absolute;
+  top: -11px;
+  transform: translateX(-50%) rotate(-1.5deg);
+  width: 112px;
+}
+
+.final-note-copy {
+  align-content: center;
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+}
+
+.final-note-kicker {
+  color: #9a6920;
+  font-family: "SFMono-Regular", "SF Mono", var(--font-geist-mono), Menlo, monospace;
+  font-size: 9px;
+  font-weight: 650;
+  letter-spacing: 0.08em;
+}
+
+.final-note-copy h3 {
+  font-size: 22px;
+  letter-spacing: -0.045em;
+  margin: 0;
+}
+
+.final-note-copy p {
+  color: #746542;
+  font-size: 10.5px;
+  line-height: 1.65;
+  margin: 0;
+  max-width: 36ch;
+}
+
+.final-note-card textarea {
+  background: rgba(255, 253, 232, 0.58);
+  border: 1px solid rgba(165, 135, 67, 0.38);
+  border-radius: 7px;
+  box-shadow: inset 0 1px 3px rgba(91, 72, 31, 0.06);
+  font-size: 11px;
+  line-height: 1.7;
+  min-height: 106px;
+  outline: 0;
+  padding: 12px 13px;
+  resize: vertical;
+  width: 100%;
+}
+
+.final-note-card textarea:focus {
+  background: rgba(255, 254, 240, 0.78);
+  border-color: #b68f36;
+  box-shadow: inset 0 1px 3px rgba(91, 72, 31, 0.06), 0 0 0 3px rgba(182, 143, 54, 0.12);
+}
+
+.final-note-footer {
+  align-items: center;
+  display: flex;
+  grid-column: 2;
+  justify-content: space-between;
+}
+
+.final-note-footer > div {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.final-note-footer small {
+  color: #81724f;
+  font-size: 8.5px;
+}
+
+.final-note-card .material-upload-button {
+  background: rgba(255, 253, 235, 0.76);
+  border-color: #c9ad62;
+  color: #72591c;
+}
+
+.final-note-status {
+  color: #537063;
+  font-size: 9px;
+  grid-column: 2;
+  line-height: 1.5;
+  margin: -6px 0 0;
+}
+
+.final-note-status.warning {
+  color: #a25a26;
 }
 
 .requirement-map {
@@ -3021,6 +3183,283 @@ h3 {
   color: #9eaaa7;
   font-size: 8px;
   line-height: 1.5;
+}
+
+.workflow-editor {
+  background: rgba(255, 255, 255, 0.045);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 13px;
+  margin-top: 12px;
+  padding: 15px 14px 14px;
+}
+
+.workflow-editor-heading {
+  align-items: flex-end;
+  display: flex;
+  gap: 20px;
+  justify-content: space-between;
+  margin-bottom: 13px;
+}
+
+.workflow-editor-heading > div {
+  display: grid;
+  gap: 3px;
+}
+
+.workflow-editor-heading span {
+  color: #7fc3b1;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.workflow-editor-heading strong {
+  color: #f6f7f5;
+  font-size: 12px;
+}
+
+.workflow-editor-heading small {
+  color: #91a09b;
+  font-size: 8px;
+}
+
+.workflow-editor-flow {
+  align-items: stretch;
+  display: flex;
+  min-width: 0;
+  overflow-x: auto;
+  padding: 2px 0 7px;
+  scrollbar-color: rgba(127, 195, 177, 0.35) transparent;
+  scrollbar-width: thin;
+}
+
+.workflow-step-card {
+  background: #fbfaf7;
+  border: 1px solid transparent;
+  border-radius: 12px;
+  color: var(--ink);
+  display: grid;
+  flex: 0 0 210px;
+  gap: 7px;
+  min-height: 142px;
+  padding: 13px;
+  position: relative;
+  transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
+}
+
+.workflow-step-card.editing {
+  border-color: #73c1ad;
+  box-shadow: 0 0 0 3px rgba(115, 193, 173, 0.12);
+}
+
+.workflow-step-meta {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+}
+
+.workflow-step-meta span {
+  color: var(--coral-dark);
+  font-family: "SkillCanvas DM Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+}
+
+.workflow-step-meta em {
+  background: #edf4f1;
+  border-radius: 999px;
+  color: var(--green);
+  font-size: 8px;
+  font-style: normal;
+  padding: 4px 7px;
+}
+
+.workflow-step-card > strong {
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.workflow-step-card > p {
+  color: var(--muted);
+  font-size: 9px;
+  line-height: 1.45;
+  margin: 0;
+}
+
+.workflow-step-card > small {
+  color: #68736f;
+  font-size: 8px;
+  line-height: 1.45;
+}
+
+.workflow-step-actions {
+  display: flex;
+  gap: 5px;
+  margin-top: auto;
+  opacity: 0;
+  transform: translateY(2px);
+  transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.workflow-step-actions button {
+  background: transparent;
+  border: 1px solid #d8ddd9;
+  border-radius: 7px;
+  color: #4e5e59;
+  cursor: pointer;
+  font: inherit;
+  font-size: 8px;
+  padding: 5px 8px;
+}
+
+.workflow-step-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.35;
+}
+
+.workflow-step-insert {
+  align-items: center;
+  align-self: stretch;
+  background: transparent;
+  border: 0;
+  color: #83c9b7;
+  cursor: pointer;
+  display: flex;
+  flex: 0 0 32px;
+  justify-content: center;
+  min-height: 44px;
+  padding: 0;
+  position: relative;
+}
+
+.workflow-step-insert::before {
+  background: rgba(127, 195, 177, 0.3);
+  content: "";
+  height: 1px;
+  left: 0;
+  position: absolute;
+  right: 0;
+  top: 50%;
+}
+
+.workflow-step-insert span {
+  align-items: center;
+  background: #18352f;
+  border: 1px solid #70bba8;
+  border-radius: 50%;
+  display: flex;
+  font-size: 13px;
+  height: 23px;
+  justify-content: center;
+  opacity: 0;
+  position: relative;
+  transform: scale(0.78);
+  transition: opacity 160ms ease, transform 180ms ease;
+  width: 23px;
+  z-index: 1;
+}
+
+.workflow-step-insert:first-child::before,
+.workflow-step-insert.trailing::before {
+  opacity: 0.55;
+}
+
+.workflow-step-form {
+  background: #f7f5ef;
+  border: 1px solid #d9ddd7;
+  border-radius: 12px;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+  padding: 13px;
+}
+
+.workflow-step-form label {
+  display: grid;
+  gap: 5px;
+}
+
+.workflow-step-form label.wide {
+  grid-column: 1 / -1;
+}
+
+.workflow-step-form label span {
+  color: #5f6b67;
+  font-size: 8px;
+  font-weight: 750;
+}
+
+.workflow-step-form input,
+.workflow-step-form textarea {
+  background: white;
+  border: 1px solid #d8ddd9;
+  border-radius: 8px;
+  color: var(--ink);
+  font: inherit;
+  font-size: 9px;
+  line-height: 1.5;
+  padding: 9px 10px;
+  resize: vertical;
+}
+
+.workflow-step-form input:focus,
+.workflow-step-form textarea:focus {
+  border-color: #69b49f;
+  box-shadow: 0 0 0 3px rgba(105, 180, 159, 0.12);
+  outline: none;
+}
+
+.workflow-step-form-actions {
+  display: flex;
+  gap: 7px;
+  grid-column: 1 / -1;
+  justify-content: flex-end;
+}
+
+.workflow-step-form-actions button {
+  background: white;
+  border: 1px solid #d0d8d3;
+  border-radius: 8px;
+  color: #53625d;
+  cursor: pointer;
+  font: inherit;
+  font-size: 8px;
+  padding: 7px 11px;
+}
+
+.workflow-step-form-actions button:last-child {
+  background: var(--green);
+  border-color: var(--green);
+  color: white;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .workflow-step-card:hover {
+    border-color: #bad8cf;
+    box-shadow: 0 8px 20px rgba(3, 20, 16, 0.16);
+    transform: translateY(-2px);
+  }
+
+  .workflow-step-card:hover .workflow-step-actions,
+  .workflow-step-card:focus-within .workflow-step-actions {
+    opacity: 1;
+    transform: translateY(0);
+  }
+
+  .workflow-step-insert:hover span,
+  .workflow-step-insert:focus-visible span {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@media (hover: none), (pointer: coarse) {
+  .workflow-step-actions,
+  .workflow-step-insert span {
+    opacity: 1;
+    transform: none;
+  }
 }
 
 .loop-columns {
@@ -9944,9 +10383,9 @@ h3 {
 }
 
 @keyframes wind-dot {
-  0%, 18%, 100% { opacity: 0.12; transform: translateX(-8px) scale(0.62); }
-  42% { opacity: 0.96; transform: translateX(0) scale(1.35); }
-  68% { opacity: 0.38; transform: translateX(8px) scale(0.86); }
+  0%, 18%, 100% { opacity: 0.12; transform: scale(0.62); }
+  42% { opacity: 0.96; transform: scale(1.35); }
+  68% { opacity: 0.38; transform: scale(0.86); }
 }
 
 @keyframes model-output-enter {
@@ -10273,6 +10712,10 @@ h3 {
   .inspector-pane {
     display: none;
   }
+
+  .final-note-card {
+    grid-template-columns: minmax(180px, 0.38fr) minmax(280px, 1fr);
+  }
 }
 
 @media (max-width: 620px) {
@@ -10502,6 +10945,17 @@ h3 {
     gap: 13px;
   }
 
+  .interview-heading-aside {
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+  }
+
+  .interview-heading-pen {
+    height: 82px;
+    width: 82px;
+  }
+
   .discovery-preview-card {
     border-radius: 15px;
     margin-left: -4px;
@@ -10649,6 +11103,29 @@ h3 {
     width: 100%;
   }
 
+  .final-note-card {
+    gap: 14px;
+    grid-template-columns: 1fr;
+    margin-left: 0;
+    margin-right: 0;
+    padding: 34px 18px 18px 38px;
+  }
+
+  .final-note-card textarea {
+    font-size: 16px;
+  }
+
+  .final-note-footer,
+  .final-note-status {
+    grid-column: 1;
+  }
+
+  .final-note-footer {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
   .requirement-map > div:first-child {
     align-items: flex-start;
     flex-direction: column;
@@ -10793,6 +11270,21 @@ h3 {
 
   .loop-plan-card {
     padding: 16px;
+  }
+
+  .workflow-editor-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 5px;
+  }
+
+  .workflow-step-form {
+    grid-template-columns: 1fr;
+  }
+
+  .workflow-step-form label.wide,
+  .workflow-step-form-actions {
+    grid-column: 1;
   }
 
   .loop-plan-heading {
@@ -11642,6 +12134,26 @@ h3 {
 
   .question-options button.auto-selected {
     animation: none;
+  }
+
+  .question-card {
+    transition-duration: 80ms;
+  }
+
+  .question-card:hover {
+    transform: none;
+  }
+
+  .workflow-step-card,
+  .workflow-step-actions,
+  .workflow-step-insert span {
+    transition-duration: 80ms;
+  }
+
+  .workflow-step-card:hover,
+  .workflow-step-actions,
+  .workflow-step-insert span {
+    transform: none;
   }
 
   .blueprint-grid,

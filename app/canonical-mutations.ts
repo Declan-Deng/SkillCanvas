@@ -7,6 +7,7 @@ import { reconcileRuntimeInputResources, hasRuntimeInputBinding } from "./bundle
 
 export type CanonicalMutation =
   | { type: "identity.update"; changes: Partial<SkillIR["identity"]> }
+  | { type: "workflow.replace"; steps: SkillIR["runtimeContract"]["workflow"] }
   | { type: "requirement.add"; requirement: SkillIRRequirement }
   | { type: "requirement.update"; requirementId: string; changes: Partial<SkillIRRequirement> }
   | { type: "requirement.remove"; requirementId: string }
@@ -107,9 +108,9 @@ function canonicalMutationType(value: unknown) {
     const [owner, action] = raw.split(".", 2);
     return `${canonicalOwner(owner)}.${action}`;
   }
-  const direct = raw.match(/^(requirement|task|capability|input|output|constraint|knowledge|domain_evidence|risk_branch|identity|state|eval_source)_(add|update|remove)$/);
+  const direct = raw.match(/^(requirement|task|capability|input|output|constraint|knowledge|domain_evidence|risk_branch|identity|state|eval_source|workflow)_(add|update|remove|replace)$/);
   if (direct) return `${canonicalOwner(direct[1])}.${direct[2]}`;
-  const reversed = raw.match(/^(add|update|remove)_(requirement|task|capability|input|output|constraint|knowledge|domain_evidence|risk_branch|identity|state|eval_source)$/);
+  const reversed = raw.match(/^(add|update|remove|replace)_(requirement|task|capability|input|output|constraint|knowledge|domain_evidence|risk_branch|identity|state|eval_source|workflow)$/);
   if (reversed) return `${canonicalOwner(reversed[2])}.${reversed[1]}`;
   return raw.replaceAll("_", ".");
 }
@@ -123,6 +124,7 @@ export function normalizeCanonicalMutations(value: unknown): CanonicalMutation[]
     const targetId = (...keys: string[]) => text(keys.map((key) => raw[key]).find((candidate) => text(candidate)) || raw.targetId || raw.target_id || raw.target || raw.id);
     const addedRecord = (key: string) => record(raw[key]) || record(raw.item) || record(raw.value);
     if (type === "identity.update") return [{ type, changes } as CanonicalMutation];
+    if (type === "workflow.replace") return [{ type, steps: normalizeWorkflowDagSteps(raw.steps || raw.workflow || raw.value) }];
     if (type === "requirement.add" && addedRecord("requirement")) return [{ type, requirement: addedRecord("requirement") as SkillIRRequirement }];
     if (type === "requirement.update" && targetId("requirementId", "requirement_id")) return [{ type, requirementId: targetId("requirementId", "requirement_id"), changes } as CanonicalMutation];
     if (type === "requirement.remove" && targetId("requirementId", "requirement_id")) return [{ type, requirementId: targetId("requirementId", "requirement_id") }];
@@ -255,6 +257,7 @@ export function applySkillIRMutations(ir: SkillIR, mutations: CanonicalMutation[
     }
     changedTargets.push(mutation.type);
     if (mutation.type === "identity.update") next.identity = { ...next.identity, ...mutation.changes, skillName: next.identity.skillName };
+    else if (mutation.type === "workflow.replace") next.runtimeContract.workflow = normalizeWorkflowDagSteps(mutation.steps);
     else if (mutation.type === "requirement.add") next.requirements = [...next.requirements, mutation.requirement];
     else if (mutation.type === "requirement.update") next.requirements = replaceById(next.requirements, "id", mutation.requirementId, mutation.changes);
     else if (mutation.type === "requirement.remove") next.requirements = next.requirements.filter((item) => item.id !== mutation.requirementId);

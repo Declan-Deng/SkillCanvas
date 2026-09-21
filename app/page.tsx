@@ -14,11 +14,12 @@ import { HOST_FILE_WORKSPACE_CAPABILITY } from "./host-file-capability";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "./bundle-resource-repair";
 import { validateImplementationFiles } from "./canonical-mutations";
 
-import { ChangeEvent, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { ChangeEvent, Fragment, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { FileUploadButton, MaterialInput, type MaterialUploadState } from "./material-input";
 import { appendReferenceFiles, readReferenceFiles } from "./reference-upload";
 import { enableMultipleSelection, toggleInterviewAnswer } from "./interview-selection";
 import { capabilityIconPath, CAPABILITY_CATEGORY_ICONS } from "./capability-icons";
+import { insertWorkflowStep, removeWorkflowStep, updateWorkflowStep, workflowStepDraft, type WorkflowStepDraft } from "./workflow-editor";
 import {
   OPTIMIZATION_EDIT_BUDGET,
   OPTIMIZATION_SELECTION_SAMPLE,
@@ -5044,7 +5045,6 @@ export default function Home() {
   const [aiGenerationIssue, setAiGenerationIssue] = useState("");
   const [contextPanelOpen, setContextPanelOpen] = useState(false);
   const [activeContextField, setActiveContextField] = useState<ContextFieldId>("idealOutput");
-  const [interviewEvidenceOpen, setInterviewEvidenceOpen] = useState(false);
   const [contextNotes, setContextNotes] = useState<ContextNotes>({ idealOutput: "", negativeOutput: "", existingPrompt: "", background: "" });
   const [contextUploads, setContextUploads] = useState<Partial<Record<ContextFieldId, MaterialUploadState>>>({});
   const materialsLoading = sourcesLoading || Object.values(contextUploads).some((upload) => upload?.loading);
@@ -5065,6 +5065,7 @@ export default function Home() {
   const blueprintGridRef = useRef<HTMLDivElement | null>(null);
   const blueprintCheckpointRef = useRef<BlueprintCheckpoint>({});
   const [capabilityPlan, setCapabilityPlan] = useState<CapabilityPlan>(DEFAULT_CAPABILITY_PLAN);
+  const [workflowStepEditor, setWorkflowStepEditor] = useState<{ stepId: string; draft: WorkflowStepDraft } | null>(null);
   const [loopPlan, setLoopPlan] = useState<LoopPlan>(DEFAULT_LOOP_PLAN);
   const [buildLoop, setBuildLoop] = useState<BuildLoopState>(DEFAULT_BUILD_LOOP);
   const [generationLoop, setGenerationLoop] = useState<GenerationLoopState>(DEFAULT_GENERATION_LOOP);
@@ -10617,6 +10618,69 @@ export default function Home() {
     setToast("SKILL.md 已复制");
   }
 
+  function commitWorkflowSteps(nextSteps: WorkflowDagStep[], message: string) {
+    const nextPlan = { ...capabilityPlan, workflowSteps: nextSteps };
+    setCapabilityPlan(nextPlan);
+    if (!completedSteps.has("build")) {
+      setToast(`${message}；生成 Skill 时会同步写入全部文件`);
+      return;
+    }
+    const currentIR = parseCanonicalSkillIR(files);
+    if (!currentIR) {
+      setToast("工作流已保存在蓝图，但现有 SkillIR 无法解析；重新生成时会完整同步");
+      return;
+    }
+    try {
+      const mutated = applySkillIRMutations(currentIR, [{ type: "workflow.replace", steps: nextSteps }]).ir;
+      const nextFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, nextPlan, loopPlan, mutated);
+      const nextAudit = auditSkillFiles(nextFiles, demoAnswers);
+      setFiles(nextFiles);
+      setBuildLoop({ status: nextAudit.blockers.length ? "attention" : "passed", phase: nextAudit.blockers.length ? "bundle" : "frozen", rounds: 0, issues: nextAudit.blockers, frozen: !nextAudit.blockers.length });
+      setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, stopReason: "Workflow 已更新并重新编译；需要重新运行真实任务评测" });
+      setEvals([]);
+      setEvalRan(false);
+      setSkillDemo(null);
+      setDemoReviewPending(false);
+      setRejectedOptimizations([]);
+      setOptimizationSession(null);
+      setCompletedSteps((current) => new Set([...current].filter((item) => item !== "evaluate" && item !== "ship")));
+      setToast(`${message}；SkillIR 与相关文件已同步，旧评测已失效`);
+    } catch (error) {
+      setToast(error instanceof Error ? `工作流已保存在蓝图；同步现有 Skill 时发现：${error.message}` : "工作流已保存在蓝图；现有 Skill 需要重新生成");
+    }
+  }
+
+  function beginWorkflowStepEdit(step: WorkflowDagStep) {
+    setWorkflowStepEditor({ stepId: step.id, draft: workflowStepDraft(step) });
+  }
+
+  function addWorkflowStep(index: number) {
+    const inserted = insertWorkflowStep(capabilityPlan.workflowSteps, index);
+    commitWorkflowSteps(inserted.steps, "已新增工作步骤");
+    const step = inserted.steps.find((item) => item.id === inserted.stepId);
+    if (step) setWorkflowStepEditor({ stepId: step.id, draft: workflowStepDraft(step) });
+  }
+
+  function saveWorkflowStep() {
+    if (!workflowStepEditor) return;
+    try {
+      const nextSteps = updateWorkflowStep(capabilityPlan.workflowSteps, workflowStepEditor.stepId, workflowStepEditor.draft);
+      commitWorkflowSteps(nextSteps, "工作步骤已更新");
+      setWorkflowStepEditor(null);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "工作步骤没有保存");
+    }
+  }
+
+  function deleteWorkflowStep(stepId: string) {
+    try {
+      commitWorkflowSteps(removeWorkflowStep(capabilityPlan.workflowSteps, stepId), "工作步骤已移除");
+      if (workflowStepEditor?.stepId === stepId) setWorkflowStepEditor(null);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "工作步骤没有移除");
+    }
+  }
+
   function renderSkillDemoCard(pendingReview: boolean) {
     if (!skillDemo) return null;
     const completedConversationTurns = demoConversation.filter((message) => message.role === "assistant").length;
@@ -10867,12 +10931,15 @@ export default function Home() {
           {step === "interview" && (
             <div className="stage-content interview-stage">
               <div className="stage-heading-row">
-                <div>
+                <div className="interview-heading-copy">
                   <div className="stage-kicker">让 AI 更了解你</div>
                   <h2>确认你的目标、偏好与工作方式</h2>
                   <p>按实际需求选择，或直接写下你的想法。AI 会围绕影响结果的关键选择继续细化，最多四轮。</p>
                 </div>
-                <div className="completeness-badge"><strong>{completeness}%</strong><span>需求完整度</span></div>
+                <div className="interview-heading-aside">
+                  <img className="interview-heading-pen" src="/skillcanvas-note-pen.png" width="1254" height="1254" alt="" aria-hidden="true" />
+                  <div className="completeness-badge"><strong>{completeness}%</strong><span>需求完整度</span></div>
+                </div>
               </div>
 
               {sourceInsights.map((insight, index) => (
@@ -10885,28 +10952,6 @@ export default function Home() {
                   <small className="source-privacy-note">{insight.privacyNote} · 这里只保存特征和页码证据，不把完整 PDF 塞进 Skill。</small>
                 </article>
               ))}
-
-              {isFinalInterviewRound && <div className={`understanding-evidence ${interviewEvidenceOpen ? "open" : ""}`}>
-                <button className="understanding-evidence-toggle" type="button" aria-expanded={interviewEvidenceOpen} onClick={() => setInterviewEvidenceOpen((current) => !current)}>
-                  <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/file-star.svg" alt="" aria-hidden="true" /></span>
-                  <div><strong>再给AI一点材料 <b className="optional-tag">可选</b></strong><small>补充理想结果、反例或参考文件，让 AI 更了解你的标准。</small></div>
-                  <em>{contextFilledCount + sourceNames.length ? `正在参考 ${contextFilledCount + sourceNames.length} 项上下文` : "还没有示例"}</em>
-                  <i><img className={interviewEvidenceOpen ? "expanded" : ""} src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" /></i>
-                </button>
-                {interviewEvidenceOpen && (
-                  <div className="understanding-example-fields">
-                    <MaterialInput id="understanding-ideal-output" className="understanding-example-field" title="你理想的产出" tag="AI 提取结构与标准" placeholder="粘贴一份你觉得很好的方案、文章、报告、代码或其他结果……"
-                      value={contextNotes.idealOutput} onChange={(value) => setContextNotes((current) => ({ ...current, idealOutput: value }))}
-                      onUpload={(event) => void handleContextSources(event, "idealOutput")} upload={contextUploads.idealOutput} disabled={busy} />
-                    <MaterialInput id="understanding-negative-output" className="understanding-example-field" title="你不喜欢的结果" tag="AI 识别跑偏模式" placeholder="粘贴反例，或直接写下哪里让你觉得不对……"
-                      value={contextNotes.negativeOutput} onChange={(value) => setContextNotes((current) => ({ ...current, negativeOutput: value }))}
-                      onUpload={(event) => void handleContextSources(event, "negativeOutput")} upload={contextUploads.negativeOutput} disabled={busy} />
-                    <div className="understanding-evidence-action">
-                      <button type="button" onClick={regenerateCurrentInterviewRound} disabled={busy || materialsLoading}>{materialsLoading ? "等待材料解析…" : "让 AI 参考材料，重做本轮理解"}</button>
-                    </div>
-                  </div>
-                )}
-              </div>}
 
               <div className="round-navigator" aria-label="需求澄清轮次">
                 {INTERVIEW_ROUND_META.map((round, index) => (
@@ -11007,6 +11052,44 @@ export default function Home() {
                 </div>
 
               </div>
+              {isFinalInterviewRound && (
+                <section className="final-note-card" aria-labelledby="final-note-title">
+                  <span className="final-note-tape" aria-hidden="true" />
+                  <div className="final-note-copy">
+                    <span className="final-note-kicker">可选补充</span>
+                    <h3 id="final-note-title">还有什么想说的吗</h3>
+                    <p>可以补充你的背景，你不喜欢的，或者选项里面不完整的内容，或者任何你想写的</p>
+                  </div>
+                  <textarea
+                    id="final-note-input"
+                    value={contextNotes.background}
+                    maxLength={20_000}
+                    disabled={contextUploads.background?.loading}
+                    onChange={(event) => setContextNotes((current) => ({ ...current, background: event.target.value }))}
+                    placeholder="写在这里，AI 会把它和上面的选择一起理解……"
+                    aria-label="还有什么想说的吗"
+                    aria-describedby="final-note-description"
+                  />
+                  <div className="final-note-footer" id="final-note-description">
+                    <div>
+                      <FileUploadButton
+                        onChange={(event) => void handleContextSources(event, "background")}
+                        loading={contextUploads.background?.loading}
+                        disabled={busy}
+                        label="上传文件"
+                        ariaLabel="为补充内容上传文件"
+                      />
+                      <small>PDF / MD / 文本</small>
+                    </div>
+                    <small>{contextNotes.background.length.toLocaleString("en-US")} / 20,000</small>
+                  </div>
+                  {contextUploads.background?.message && (
+                    <p className={`final-note-status ${contextUploads.background.warning ? "warning" : ""}`} role="status" aria-live="polite">
+                      {contextUploads.background.message}
+                    </p>
+                  )}
+                </section>
+              )}
               <div className="stage-footer">
                 <button className="secondary-button" onClick={() => interviewRoundIndex > 0 ? setInterviewRoundIndex(interviewRoundIndex - 1) : setStep("brief")}>{interviewRoundIndex > 0 ? "返回上一轮" : "返回修改一句话"}</button>
                 <div className="adaptive-footer-actions">
@@ -11070,6 +11153,39 @@ export default function Home() {
                   <span>总目标</span>
                   <strong>{loopPlan.goal}</strong>
                 </div>
+                <section className="workflow-editor" aria-labelledby="workflow-editor-title">
+                  <div className="workflow-editor-heading">
+                    <div><span>可执行 Workflow</span><strong id="workflow-editor-title">Skill 实际会按这些步骤运行</strong></div>
+                    <small>{completedSteps.has("build") ? "修改后自动重编译 · 需重新 Eval" : "确认后写入 SkillIR 与生成文件"}</small>
+                  </div>
+                  <div className="workflow-editor-flow" aria-label="可编辑工作流">
+                    {capabilityPlan.workflowSteps.map((workflowStep, index) => (
+                      <Fragment key={workflowStep.id}>
+                        <button className="workflow-step-insert" type="button" onClick={() => addWorkflowStep(index)} aria-label={`在步骤 ${index + 1} 前新增步骤`}><span>＋</span></button>
+                        <article className={`workflow-step-card ${workflowStepEditor?.stepId === workflowStep.id ? "editing" : ""}`}>
+                          <div className="workflow-step-meta"><span>{String(index + 1).padStart(2, "0")}</span><em>{workflowStep.role === "deliver" ? "交付" : workflowStep.role === "validate" ? "验证" : workflowStep.role === "persist" ? "保存" : workflowStep.role?.startsWith("await") ? "等待确认" : "执行"}</em></div>
+                          <strong>{workflowStep.action}</strong>
+                          <p>{workflowStep.when}</p>
+                          <small>产出 · {workflowStep.output}</small>
+                          <div className="workflow-step-actions">
+                            <button type="button" onClick={() => beginWorkflowStepEdit(workflowStep)}>修改</button>
+                            <button type="button" onClick={() => deleteWorkflowStep(workflowStep.id)} disabled={capabilityPlan.workflowSteps.length <= 1}>移除</button>
+                          </div>
+                        </article>
+                      </Fragment>
+                    ))}
+                    <button className="workflow-step-insert trailing" type="button" onClick={() => addWorkflowStep(capabilityPlan.workflowSteps.length)} aria-label="在工作流末尾新增步骤"><span>＋</span></button>
+                  </div>
+                  {workflowStepEditor && (
+                    <div className="workflow-step-form" role="group" aria-label="修改工作步骤">
+                      <label><span>什么时候执行</span><input value={workflowStepEditor.draft.when} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, when: event.target.value } } : current)} /></label>
+                      <label className="wide"><span>这一步做什么</span><textarea rows={2} value={workflowStepEditor.draft.action} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, action: event.target.value } } : current)} /></label>
+                      <label><span>产生什么结果</span><input value={workflowStepEditor.draft.output} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, output: event.target.value } } : current)} /></label>
+                      <label><span>失败时怎么办</span><input value={workflowStepEditor.draft.fallback} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, fallback: event.target.value } } : current)} /></label>
+                      <div className="workflow-step-form-actions"><button type="button" onClick={() => setWorkflowStepEditor(null)}>取消</button><button type="button" onClick={saveWorkflowStep}>保存并同步</button></div>
+                    </div>
+                  )}
+                </section>
                 <div className="loop-columns">
                   <div className="loop-subgoals">
                     <div className="loop-section-title"><span>01</span><div><strong>必要子目标</strong><small>只保留完成总目标必须经过的中间状态</small></div></div>

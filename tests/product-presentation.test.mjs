@@ -42,7 +42,31 @@ test("loading overlay omits token noise and uses truthful dotted waiting/output 
   assert.match(overlay, /busyOutputText[\s\S]*?WaitingDotField/);
   assert.match(overlay, /DotMatrixProgress progress=/);
   assert.match(css, /\.ai-wind-field i\s*\{[^}]*animation: wind-dot 1\.9s linear infinite;/);
+  const windAnimation = css.match(/@keyframes wind-dot\s*\{([\s\S]*?)\n\}/)?.[1] || "";
+  assert.doesNotMatch(windAnimation, /translateX/);
+  assert.match(windAnimation, /transform: scale\(/);
   assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.ai-wind-field i/);
   assert.match(page, /setSessionTokenUsage\(reconcile\)/);
   assert.match(page, /setBusyTokenUsage\(reconcile\)/);
+});
+
+test("interview heading uses the transparent pen and final note is below the four questions", () => {
+  const pen = readFileSync(new URL("../public/skillcanvas-note-pen.png", import.meta.url));
+  assert.equal(pen.subarray(1, 4).toString(), "PNG");
+  assert.equal(pen[25], 6, "pen stays transparent");
+  assert.match(page, /className="interview-heading-pen" src="\/skillcanvas-note-pen\.png"/);
+  const questionListEnd = page.indexOf("{isFinalInterviewRound && (\n                <section className=\"final-note-card\"");
+  const footer = page.indexOf('<div className="stage-footer">', questionListEnd);
+  assert.ok(questionListEnd > page.indexOf('<div className="question-list">'));
+  assert.ok(footer > questionListEnd);
+  assert.match(page, /还有什么想说的吗/);
+  assert.match(page, /handleContextSources\(event, "background"\)/);
+  assert.match(css, /\.final-note-card\s*\{[\s\S]*?#fff3b8;/);
+});
+
+test("question cards use restrained hover feedback and distinctive aligned labels", () => {
+  assert.match(css, /@media \(hover: hover\) and \(pointer: fine\)[\s\S]*?\.question-card:hover\s*\{[^}]*transform: translateY\(-2px\);/);
+  assert.match(css, /\.question-number\s*\{[^}]*font-family: "SkillCanvas DM Mono"/);
+  assert.match(css, /\.question-dimension\s*\{[^}]*align-items: center;[^}]*height: 26px;[^}]*justify-content: center;/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.question-card:hover\s*\{[^}]*transform: none;/);
 });
