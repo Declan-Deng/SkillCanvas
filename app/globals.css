@@ -2881,27 +2881,6 @@ h3 {
   transition: height 260ms var(--ease-in-out);
 }
 
-.blueprint-frame {
-  --blueprint-dash: #83bfe3;
-  border-radius: 16px;
-  padding: 20px;
-  position: relative;
-}
-
-.blueprint-frame::before {
-  background:
-    repeating-linear-gradient(90deg, var(--blueprint-dash) 0 12px, transparent 12px 20px) top left / 100% 1.4px no-repeat,
-    repeating-linear-gradient(90deg, var(--blueprint-dash) 0 12px, transparent 12px 20px) bottom left / 100% 1.4px no-repeat,
-    repeating-linear-gradient(180deg, var(--blueprint-dash) 0 12px, transparent 12px 20px) top left / 1.4px 100% no-repeat,
-    repeating-linear-gradient(180deg, var(--blueprint-dash) 0 12px, transparent 12px 20px) top right / 1.4px 100% no-repeat;
-  border-radius: inherit;
-  content: "";
-  inset: 0;
-  pointer-events: none;
-  position: absolute;
-  z-index: 7;
-}
-
 .blueprint-grid::after {
   border-radius: 15px;
   box-shadow: 0 24px 52px rgba(28, 38, 36, 0.16);
@@ -2927,10 +2906,10 @@ h3 {
 
 .blueprint-stack-toggle {
   align-items: center;
-  background: var(--coral);
-  border: 1px solid var(--coral);
+  background: #397fa9;
+  border: 1px solid #397fa9;
   border-radius: 13px;
-  box-shadow: 0 8px 20px rgba(202, 74, 54, 0.18);
+  box-shadow: 0 8px 20px rgba(57, 127, 169, 0.22);
   color: white;
   display: inline-flex;
   flex: 0 0 auto;
@@ -10568,8 +10547,8 @@ h3 {
   }
 
   .blueprint-stack-toggle:hover {
-    background: var(--coral-dark);
-    box-shadow: 0 11px 24px rgba(202, 74, 54, 0.24);
+    background: #2f6f96;
+    box-shadow: 0 11px 24px rgba(57, 127, 169, 0.28);
     transform: translateY(-1px);
   }
 
