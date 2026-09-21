@@ -4989,7 +4989,7 @@ function reportClientGenerationLoopEvent(
   });
 }
 
-const DOT_PROGRESS_COUNT = 56;
+const DOT_PROGRESS_COUNT = 36;
 const WAITING_DOT_COUNT = 120;
 
 function DotMatrixProgress({ progress, tone = "light", label = "正在处理" }: { progress?: number; tone?: "light" | "dark"; label?: string }) {
@@ -5009,7 +5009,11 @@ function DotMatrixProgress({ progress, tone = "light", label = "正在处理" }:
         <i
           className={determinate && index < settled ? "settled" : "pending"}
           key={index}
-          style={{ "--dot-index": index, "--dot-distance": Math.max(0, index - settled) } as CSSProperties}
+          style={{
+            "--dot-index": index,
+            "--dot-distance": Math.max(0, index - settled),
+            "--dot-color": `hsl(${8 + (index / (DOT_PROGRESS_COUNT - 1)) * 28} 82% 58%)`,
+          } as CSSProperties}
         />
       ))}
     </div>

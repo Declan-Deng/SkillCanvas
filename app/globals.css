@@ -2346,13 +2346,18 @@ h3 {
   align-self: center;
   display: grid;
   gap: 8px;
-  justify-items: start;
+  justify-items: center;
+  width: 76px;
 }
 
 .question-number {
   color: var(--coral-dark);
   font-family: var(--font-geist-mono), monospace;
   font-size: 13.75px;
+  font-variant-numeric: tabular-nums slashed-zero;
+  font-weight: 520;
+  letter-spacing: -0.055em;
+  line-height: 1;
 }
 
 .question-dimension {
@@ -2362,10 +2367,13 @@ h3 {
   display: inline-flex;
   font-size: 8.75px;
   font-weight: 700;
+  justify-content: center;
   line-height: 1;
-  max-width: 72px;
-  min-height: 20px;
+  max-width: 76px;
+  min-height: 22px;
+  min-width: 68px;
   padding: 5px 7px;
+  text-align: center;
   white-space: normal;
 }
 
@@ -9542,12 +9550,12 @@ h3 {
 
 .dot-matrix-progress {
   --dot-off: #d7d3ca;
-  --dot-on: #1b8068;
+  --dot-on: var(--coral);
   display: grid;
   gap: 5px;
-  grid-template-columns: repeat(28, minmax(0, 1fr));
+  grid-template-columns: repeat(36, minmax(0, 1fr));
   margin: 13px 0 11px;
-  min-height: 13px;
+  min-height: 5px;
 }
 
 .dot-matrix-progress.dark {
@@ -9570,7 +9578,7 @@ h3 {
 }
 
 .dot-matrix-progress i.settled {
-  background: var(--dot-on);
+  background: var(--dot-color, var(--dot-on));
   opacity: 1;
   transform: scale(1.08);
 }
@@ -9849,6 +9857,7 @@ h3 {
 .ai-progress-steps > div.done {
   background: var(--green-soft);
   color: var(--green);
+  transition-delay: calc(var(--stage-index) * 55ms);
 }
 
 .ai-progress-steps > div > i {
@@ -9874,6 +9883,7 @@ h3 {
 .ai-progress-steps > div.done > i {
   background: var(--green);
   transform: scale(1);
+  transition-delay: calc((var(--stage-index) * 55ms) + 35ms);
 }
 
 .ai-progress-steps > div > span {

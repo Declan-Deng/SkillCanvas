@@ -197,6 +197,71 @@ test("sequential confirmations are scoped through transitive artifacts and expli
   assert.equal(repaired.attempts, 0);
 });
 
+test("a uniquely earliest state writer initializes fields before later revisions mutate them", async () => {
+  const context = { capabilities: [cap("core", "llm", "Request", "Weekly plan")], inputs: [], workflowSteps: [
+    { ...node("resolve-weekly-inputs", ["$request"], ["$input_required"], "await-input"), resumeProduces: ["$feedback"] },
+    { ...node("plan-weekly-priorities", ["$request"], ["weeklyPlanDraft"]), mutates: ["currentWeekPlan", "uncertaintyFlags", "defaultPreference"] },
+    { ...node("revise-scoped-days", ["weeklyPlanDraft", "$feedback"], ["revisedWeeklyPlan"]), mutates: ["currentWeekPlan", "uncertaintyFlags", "userCorrections"] },
+    { ...node("deliver-weekly-plan", ["revisedWeeklyPlan", "currentWeekPlan", "uncertaintyFlags", "defaultPreference", "userCorrections"], ["$output"], "deliver"), delivers: ["revisedWeeklyPlan"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  const first = checked.steps.find((step) => step.id === "plan-weekly-priorities");
+  const revision = checked.steps.find((step) => step.id === "revise-scoped-days");
+  assert.deepEqual(first.mutates, []);
+  assert.ok(["currentWeekPlan", "uncertaintyFlags", "defaultPreference"].every((token) => first.produces.includes(token)));
+  assert.deepEqual(revision.mutates, ["currentWeekPlan", "uncertaintyFlags"]);
+  assert.ok(["currentWeekPlan", "uncertaintyFlags"].every((token) => revision.requires.includes(token)));
+  assert.ok(revision.produces.includes("userCorrections"));
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("deterministic state initialization must not call the model"));
+  assert.equal(repaired.attempts, 0);
+});
+
+test("a unique state revision is explicitly ordered before its unique delivery reader", async () => {
+  const context = { capabilities: [cap("core", "llm", "Request", "Weekly plan")], inputs: [], workflowSteps: [
+    { ...node("plan-weekly-priorities", ["$request"], ["currentWeekPlan", "uncertaintyFlags", "conflictFlags"]), action: "Create the initial weekly plan state" },
+    { ...node("collect-corrections", ["currentWeekPlan"], ["$input_required"], "await-input"), resumeProduces: ["$feedback"] },
+    { ...node("revise-indicated-days", ["currentWeekPlan", "uncertaintyFlags", "conflictFlags", "$feedback"], ["revisionSummary"]), mutates: ["currentWeekPlan", "uncertaintyFlags", "conflictFlags"] },
+    { ...node("deliver-week-plan", ["currentWeekPlan", "uncertaintyFlags", "conflictFlags"], ["$output"], "deliver"), delivers: ["currentWeekPlan"] },
+    { ...node("consume-revision-summary", ["revisionSummary"], ["revisionAudit"]), role: "validate" },
+    { ...node("deliver-audit", ["revisionAudit"], ["$output"], "deliver"), delivers: ["revisionAudit"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  const revision = checked.steps.find((step) => step.id === "revise-indicated-days");
+  const delivery = checked.steps.find((step) => step.id === "deliver-week-plan");
+  const completion = revision.produces.find((token) => token.startsWith("state:") && token.endsWith(":updated-by:revise-indicated-days"));
+  assert.ok(completion, "one explicit completion edge orders all fields written by the same unique revision");
+  assert.ok(delivery.requires.includes(completion));
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("unique state handoff must not call the model"));
+  assert.equal(repaired.attempts, 0);
+});
+
+test("a terminal-only handoff delivers its unique validated artifact", async () => {
+  const context = { capabilities: [cap("core", "llm", "Request", "Weekly plan")], inputs: [], workflowSteps: [
+    node("plan", ["$request"], ["weeklyPlan"]),
+    node("validate", ["weeklyPlan"], ["validatedWeekPlan"], "validate"),
+    { ...node("deliver-week-plan", ["validatedWeekPlan"], ["$output"], "deliver"), delivers: ["$output"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  assert.deepEqual(checked.steps.find((step) => step.id === "deliver-week-plan").delivers, ["validatedWeekPlan"]);
+});
+
+test("orphaned outputs from one reader feed the unique root semantic transform", async () => {
+  const context = { capabilities: [cap("core", "llm", "Request", "Weekly plan")], inputs: [], workflowSteps: [
+    { ...node("read-weekly-inputs", ["$request"], ["weeklyTaskList", "dailyEnergyLevels"], "read"), capabilityIds: ["core"] },
+    { ...node("plan-weekly-priorities", ["$request"], ["weeklyPlan"]), capabilityIds: ["core"] },
+    node("validate", ["weeklyPlan"], ["validatedWeekPlan"], "validate"),
+    { ...node("deliver", ["validatedWeekPlan"], ["$output"], "deliver"), delivers: ["validatedWeekPlan"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  assert.ok(["weeklyTaskList", "dailyEnergyLevels"].every((token) => checked.steps.find((step) => step.id === "plan-weekly-priorities").requires.includes(token)));
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("unique read wiring must not call the model"));
+  assert.equal(repaired.attempts, 0);
+});
+
 test("invalid root producers can be corrected without deleting real task outputs", async () => {
   const draft = node("draft", ["input:material"], ["$draft"]);
   const bad = { ...node("wait", [], ["input:material", "$input_required"], "await-input"), resumeProduces: [] };

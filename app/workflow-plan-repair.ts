@@ -134,6 +134,117 @@ function bindUnambiguousDeliveries(steps: WorkflowDagStep[]) {
   });
 }
 
+/** `$output` is a control terminal, never the content being handed over. If a
+ * delivery has exactly one validated (or otherwise sole) business dependency,
+ * bind that real artifact. Multiple candidates stay invalid for model repair. */
+function bindTerminalOnlyDeliveries(steps: WorkflowDagStep[]) {
+  const producers = new Map<string, WorkflowDagStep | null>();
+  for (const step of steps) for (const token of step.produces) producers.set(token, producers.has(token) ? null : step);
+  return steps.map((step) => {
+    if (step.role !== "deliver" || !step.delivers?.length || step.delivers.some((token) => !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token))) return step;
+    const candidates = step.requires.filter((token) => !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)
+      && !isUserReplyToken(token) && !["$request", "$source"].includes(token) && !token.startsWith("input:") && !token.startsWith("state:"));
+    const validated = candidates.filter((token) => producers.get(token)?.role === "validate");
+    const selected = validated.length === 1 ? validated : candidates.length === 1 ? candidates : [];
+    return selected.length === 1 ? { ...step, delivers: selected } : step;
+  });
+}
+
+/** A single read operation followed by a single root semantic transform has
+ * one lossless wiring: the transform consumes every otherwise-orphaned read
+ * product. This covers planners that describe those inputs in prose but omit
+ * the exact token names. Ambiguous multi-consumer workflows remain invalid. */
+function bindUniqueReadProducts(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires] }));
+  const consumed = new Set(next.flatMap((step) => [...step.requires, ...step.mutates, ...(step.delivers || [])]));
+  for (const reader of next.filter((step) => step.role === "read")) {
+    const products = reader.produces.filter((token) => !consumed.has(token) && !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token));
+    if (!products.length) continue;
+    const candidates = next.filter((step) => step.id !== reader.id && step.role === "transform"
+      && step.capabilityIds.some((id) => reader.capabilityIds.includes(id))
+      && step.requires.every((token) => ["$request", "$source"].includes(token) || token.startsWith("input:") || isUserReplyToken(token)));
+    if (candidates.length !== 1) continue;
+    candidates[0].requires.push(...products);
+    products.forEach((token) => consumed.add(token));
+  }
+  return next;
+}
+
+/** A mutable field cannot be updated before it exists. Models occasionally
+ * mark the first assignment as mutates[], then keep using mutates[] for later
+ * revisions. Turn only the uniquely earliest writer into the initializer and
+ * wire every later writer to that state. Ambiguous parallel writers remain a
+ * compiler error instead of being ordered by array position. */
+function initializeFirstStateWrites(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], mutates: [...step.mutates] }));
+  const producers = new Map<string, string | null>();
+  for (const step of next) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    producers.set(token, producers.has(token) ? null : step.id);
+  }
+  const outgoing = new Map(next.map((step) => [step.id, new Set<string>()]));
+  for (const step of next) for (const dependency of step.requires) {
+    const producer = producers.get(dependency);
+    if (producer && producer !== step.id) outgoing.get(producer)?.add(step.id);
+  }
+  const precedes = (from: string, to: string, seen = new Set<string>()): boolean => {
+    if (seen.has(from)) return false;
+    seen.add(from);
+    return [...(outgoing.get(from) || [])].some((nextId) => nextId === to || precedes(nextId, to, seen));
+  };
+  const tokens = new Set(next.flatMap((step) => step.mutates));
+  for (const token of tokens) {
+    if (producers.has(token) || isUserReplyToken(token) || Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)) continue;
+    const writers = next.filter((step) => step.mutates.includes(token));
+    const roots = writers.filter((candidate) => !writers.some((other) => other.id !== candidate.id && precedes(other.id, candidate.id)));
+    if (roots.length !== 1 || !["transform", "read", "validate"].includes(roots[0].role || "transform")) continue;
+    const initializer = roots[0];
+    initializer.mutates = initializer.mutates.filter((value) => value !== token);
+    initializer.requires = initializer.requires.filter((value) => value !== token);
+    if (!initializer.produces.includes(token)) initializer.produces.push(token);
+    producers.set(token, initializer.id);
+    for (const writer of writers.filter((step) => step.id !== initializer.id)) {
+      if (!writer.requires.includes(token)) writer.requires.push(token);
+    }
+  }
+  return next;
+}
+
+/** If exactly one step updates a state field and exactly one terminal step
+ * reads it, an otherwise disconnected handoff has only one safe direction:
+ * update, then validate/deliver. Add an explicit completion edge so runtime
+ * ordering matches that contract. Multiple writers/readers remain untouched
+ * because joining conditional branches would be unsafe. */
+function orderUniqueStateHandoffs(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces] }));
+  const producers = new Map<string, string | null>();
+  for (const step of next) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    producers.set(token, producers.has(token) ? null : step.id);
+  }
+  const outgoing = new Map(next.map((step) => [step.id, new Set<string>()]));
+  for (const step of next) for (const dependency of step.requires) {
+    const producer = producers.get(dependency);
+    if (producer && producer !== step.id) outgoing.get(producer)?.add(step.id);
+  }
+  const precedes = (from: string, to: string, seen = new Set<string>()): boolean => {
+    if (seen.has(from)) return false;
+    seen.add(from);
+    return [...(outgoing.get(from) || [])].some((nextId) => nextId === to || precedes(nextId, to, seen));
+  };
+  for (const token of new Set(next.flatMap((step) => step.mutates))) {
+    const writers = next.filter((step) => step.mutates.includes(token));
+    const terminalReaders = next.filter((step) => step.requires.includes(token) && !step.mutates.includes(token)
+      && ["validate", "deliver", "persist"].includes(step.role || ""));
+    if (writers.length !== 1 || terminalReaders.length !== 1) continue;
+    const [writer] = writers, [reader] = terminalReaders;
+    if (precedes(writer.id, reader.id) || precedes(reader.id, writer.id)) continue;
+    const completion = `state:${token}:updated-by:${writer.id}`;
+    if (!writer.produces.includes(completion)) writer.produces.push(completion);
+    if (!reader.requires.includes(completion)) reader.requires.push(completion);
+    outgoing.get(writer.id)?.add(reader.id);
+  }
+  return next;
+}
+
 /** Lossless boundary metadata, not task invention. Bind only a unique declared
  * input or an actual parent capability. Derived data still needs a producer. */
 export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, previous: WorkflowDagStep[] = []) {
@@ -160,7 +271,11 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
       ? "persist" : owners.length && owners.every((item) => item.kind === "reference" || item.kind === "asset") ? "read" : "transform";
     return { ...step, role: step.role || before?.role || closed.role || capabilityRole as WorkflowDagStep["role"] };
   });
+  steps = initializeFirstStateWrites(steps);
+  steps = bindUniqueReadProducts(steps);
+  steps = bindTerminalOnlyDeliveries(steps);
   steps = bindUnambiguousDeliveries(steps);
+  steps = orderUniqueStateHandoffs(steps);
   steps = scopeCheckpointReplies(steps);
   steps = scopeDeliveredVersions(steps);
   // Reply values written by models without "$" are still runtime events when
