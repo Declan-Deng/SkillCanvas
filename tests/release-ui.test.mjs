@@ -66,7 +66,9 @@ test("question toggle shares tag dimensions, capability heading has an icon, and
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(css, /\.question-meta\s*\{[^}]*--question-tag-height: 20px;/);
-  assert.match(css, /\.question-meta b,\s*\.question-meta i,\s*\.question-multiple-toggle\s*\{[^}]*font-size: 8\.75px;[^}]*height: var\(--question-tag-height\);[^}]*padding: 0 6px;/);
+  assert.match(css, /\.question-meta i,\s*\.question-multiple-toggle\s*\{[^}]*font-size: 8\.75px;[^}]*height: var\(--question-tag-height\);[^}]*padding: 0 6px;/);
+  assert.match(page, /className="question-index"[\s\S]*?className="question-number"[\s\S]*?className="question-dimension"/);
+  assert.match(css, /\.question-index\s*\{[^}]*display: grid;[^}]*gap: 8px;/);
   assert.doesNotMatch(css, /\.question-multiple-toggle\s*\{[^}]*min-height:/);
   assert.match(css, /\.question-multiple-toggle::after\s*\{[^}]*inset: -12px -4px;/);
   assert.match(page, /className="capability-library-title"><img src="\/icons\/tabler\/plug.svg" alt="" aria-hidden="true" \/>添加能力/);

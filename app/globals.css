@@ -2331,7 +2331,7 @@ h3 {
   border-radius: 14px;
   display: grid;
   gap: 16px;
-  grid-template-columns: 34px minmax(170px, 0.8fr) minmax(220px, 1.1fr);
+  grid-template-columns: 76px minmax(170px, 0.8fr) minmax(220px, 1.1fr);
   padding: 16px;
   transition: background 160ms ease, border-color 160ms ease, box-shadow 180ms ease;
 }
@@ -2342,10 +2342,31 @@ h3 {
   box-shadow: 0 8px 26px rgba(28, 38, 36, 0.055);
 }
 
+.question-index {
+  align-self: center;
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+}
+
 .question-number {
   color: var(--coral-dark);
   font-family: var(--font-geist-mono), monospace;
   font-size: 13.75px;
+}
+
+.question-dimension {
+  background: #fff0e9;
+  border-radius: 99px;
+  color: var(--coral-dark);
+  display: inline-flex;
+  font-size: 8.75px;
+  font-weight: 700;
+  line-height: 1;
+  max-width: 72px;
+  min-height: 20px;
+  padding: 5px 7px;
+  white-space: normal;
 }
 
 .question-copy {
@@ -2362,7 +2383,6 @@ h3 {
   margin-bottom: 1px;
 }
 
-.question-meta b,
 .question-meta i,
 .question-multiple-toggle {
   align-items: center;
@@ -2375,11 +2395,6 @@ h3 {
   line-height: 1;
   padding: 0 6px;
   white-space: nowrap;
-}
-
-.question-meta b {
-  background: #fff0e9;
-  color: var(--coral-dark);
 }
 
 .question-meta i {
@@ -9457,6 +9472,119 @@ h3 {
   margin: 0;
 }
 
+.ai-output-stage {
+  background: linear-gradient(145deg, #0d1c18, #132721 62%, #0e1b18);
+  border: 1px solid rgba(112, 197, 170, 0.2);
+  border-radius: 12px;
+  height: 112px;
+  margin-top: 12px;
+  overflow: hidden;
+  position: relative;
+}
+
+.ai-output-stage::after {
+  background: linear-gradient(180deg, transparent, rgba(13, 28, 24, 0.88));
+  bottom: 0;
+  content: "";
+  height: 24px;
+  left: 0;
+  pointer-events: none;
+  position: absolute;
+  right: 0;
+}
+
+.ai-output-stage.waiting::after {
+  display: none;
+}
+
+.ai-wind-field {
+  display: grid;
+  gap: 9px 14px;
+  grid-template-columns: repeat(20, 1fr);
+  inset: 0;
+  padding: 22px 28px;
+  position: absolute;
+}
+
+.ai-wind-field i {
+  animation: wind-dot 1.9s linear infinite;
+  animation-delay: calc((var(--wind-column) * 42ms) + (var(--wind-row) * -96ms));
+  background: #75d0b1;
+  border-radius: 50%;
+  height: 4px;
+  opacity: 0.16;
+  transform: scale(0.72);
+  width: 4px;
+}
+
+.ai-output-scroll {
+  height: 100%;
+  overflow: hidden;
+  padding: 14px 16px 26px;
+  scrollbar-width: none;
+}
+
+.ai-output-scroll::-webkit-scrollbar {
+  display: none;
+}
+
+.ai-output-scroll pre {
+  color: #c9ddd6;
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 7.5px;
+  line-height: 1.62;
+  margin: 0;
+  opacity: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+  animation: model-output-enter 220ms var(--ease-out) forwards;
+}
+
+.dot-matrix-progress {
+  --dot-off: #d7d3ca;
+  --dot-on: #1b8068;
+  display: grid;
+  gap: 5px;
+  grid-template-columns: repeat(28, minmax(0, 1fr));
+  margin: 13px 0 11px;
+  min-height: 13px;
+}
+
+.dot-matrix-progress.dark {
+  --dot-off: rgba(255, 255, 255, 0.11);
+  --dot-on: #76d3b3;
+  margin-bottom: 0;
+}
+
+.dot-matrix-progress i {
+  aspect-ratio: 1;
+  background: var(--dot-off);
+  border-radius: 50%;
+  display: block;
+  max-height: 4px;
+  max-width: 4px;
+  opacity: 0.72;
+  place-self: center;
+  transition: background-color 220ms var(--ease-out), opacity 220ms var(--ease-out), transform 220ms var(--ease-out);
+  width: 100%;
+}
+
+.dot-matrix-progress i.settled {
+  background: var(--dot-on);
+  opacity: 1;
+  transform: scale(1.08);
+}
+
+.dot-matrix-progress.determinate i.pending {
+  animation: dot-progress-wave 1.2s linear infinite;
+  animation-delay: calc(var(--dot-distance) * 34ms);
+}
+
+.dot-matrix-progress.indeterminate i {
+  animation: dot-progress-wave 1.25s linear infinite;
+  animation-delay: calc(var(--dot-index) * 34ms);
+}
+
 .ai-progress-token-usage {
   align-items: stretch;
   background: #f8f5ef;
@@ -9709,6 +9837,7 @@ h3 {
   padding: 9px 12px;
   position: relative;
   text-align: left;
+  transition: background-color 240ms var(--ease-out), color 240ms var(--ease-out);
 }
 
 .ai-progress-steps > div.active {
@@ -9733,6 +9862,8 @@ h3 {
   font-weight: 800;
   height: 22px;
   justify-content: center;
+  transform: scale(0.94);
+  transition: background-color 240ms var(--ease-out), transform 220ms var(--ease-out);
   width: 22px;
 }
 
@@ -9742,6 +9873,7 @@ h3 {
 
 .ai-progress-steps > div.done > i {
   background: var(--green);
+  transform: scale(1);
 }
 
 .ai-progress-steps > div > span {
@@ -9793,6 +9925,23 @@ h3 {
 @keyframes progress-scan {
   from { transform: translateX(-110%); }
   to { transform: translateX(340%); }
+}
+
+@keyframes dot-progress-wave {
+  0%, 18%, 100% { opacity: 0.42; transform: scale(0.72); }
+  42% { background: var(--dot-on); opacity: 1; transform: scale(1.12); }
+  68% { opacity: 0.68; transform: scale(0.9); }
+}
+
+@keyframes wind-dot {
+  0%, 18%, 100% { opacity: 0.12; transform: translateX(-8px) scale(0.62); }
+  42% { opacity: 0.96; transform: translateX(0) scale(1.35); }
+  68% { opacity: 0.38; transform: translateX(8px) scale(0.86); }
+}
+
+@keyframes model-output-enter {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
 }
 
 @keyframes busy-status-enter {
@@ -10469,7 +10618,7 @@ h3 {
   .question-card {
     align-items: start;
     gap: 11px;
-    grid-template-columns: 28px 1fr;
+    grid-template-columns: 72px 1fr;
     padding: 14px;
   }
 
@@ -11439,6 +11588,28 @@ h3 {
     animation: none;
     transform: none;
     width: 100%;
+  }
+
+  .dot-matrix-progress i,
+  .ai-wind-field i,
+  .ai-output-scroll pre {
+    animation: none;
+  }
+
+  .ai-wind-field i {
+    opacity: 0.46;
+    transform: none;
+  }
+
+  .ai-output-scroll pre {
+    opacity: 1;
+    transform: none;
+  }
+
+  .dot-matrix-progress i,
+  .ai-progress-steps > div,
+  .ai-progress-steps > div > i {
+    transition-duration: 80ms;
   }
 
   .busy-line {

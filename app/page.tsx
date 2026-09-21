@@ -1536,44 +1536,6 @@ function createCanonicalSkillIR(input: {
   return ensureCanonicalBundledResources(ir, files, input.answers);
 }
 
-function compactThinkingPhrase(value: string) {
-  const phrase = value
-    .replace(/^[#>*\-\d.)、\s]+/, "")
-    .replace(/[：:].*$/, "")
-    .replace(/[，。；、!?！？]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return phrase.length > 16 ? `${phrase.slice(0, 16)}…` : phrase;
-}
-
-function createContextualThinkingWords(input: {
-  task: BusyTask;
-  idea: string;
-  stage: string;
-  questions: Question[];
-  answers: Record<string, string>;
-  blueprint: BlueprintSection[];
-  capabilities: CapabilityItem[];
-  loopPlan: LoopPlan;
-  issues: string[];
-  feedback: string[];
-  demo: SkillDemo | null;
-}) {
-  const answeredChoices = input.questions.map((question) => input.answers[question.id]).filter(Boolean);
-  const taskSources: Record<BusyTask, string[]> = {
-    interview: [input.idea, ...input.questions.map((question) => question.dimension), ...answeredChoices],
-    blueprint: [...input.blueprint.map((section) => section.title), ...answeredChoices, ...input.capabilities.map((item) => item.name)],
-    build: [input.loopPlan.goal, ...input.loopPlan.subgoals.map((item) => item.title), ...input.capabilities.filter(capabilityIsActive).map((item) => item.name)],
-    repair: [...input.issues, ...input.capabilities.filter(capabilityIsActive).map((item) => item.name), input.loopPlan.stopConditions[0] || ""],
-    evaluate: [input.idea, input.demo?.title || "", ...(input.demo?.uncertainties || []), ...input.capabilities.filter(capabilityIsActive).map((item) => item.name)],
-    personalize: [...input.feedback, input.demo?.title || "", ...(input.demo?.uncertainties || []), ...input.loopPlan.qualityGates.map((item) => item.criterion)],
-  };
-  const words = [input.stage, ...taskSources[input.task]]
-    .map(compactThinkingPhrase)
-    .filter((word) => word.length >= 2);
-  return Array.from(new Set(words)).slice(0, 8);
-}
-
 function deriveLoopPlan(idea: string, answers: Record<string, string>, capabilityPlan: CapabilityPlan = DEFAULT_CAPABILITY_PLAN): LoopPlan {
   const task = compactTaskPhrase(idea);
   const outcome = answers.outcome?.trim() || `完成“${task}”并交付可用结果`;
@@ -5027,6 +4989,43 @@ function reportClientGenerationLoopEvent(
   });
 }
 
+const DOT_PROGRESS_COUNT = 56;
+const WAITING_DOT_COUNT = 120;
+
+function DotMatrixProgress({ progress, tone = "light", label = "正在处理" }: { progress?: number; tone?: "light" | "dark"; label?: string }) {
+  const determinate = typeof progress === "number";
+  const normalized = determinate ? Math.min(1, Math.max(0, progress)) : 0;
+  const settled = Math.round(normalized * DOT_PROGRESS_COUNT);
+  return (
+    <div
+      className={`dot-matrix-progress ${tone} ${determinate ? "determinate" : "indeterminate"}`}
+      role="progressbar"
+      aria-label={label}
+      aria-valuemin={determinate ? 0 : undefined}
+      aria-valuemax={determinate ? 100 : undefined}
+      aria-valuenow={determinate ? Math.round(normalized * 100) : undefined}
+    >
+      {Array.from({ length: DOT_PROGRESS_COUNT }, (_, index) => (
+        <i
+          className={determinate && index < settled ? "settled" : "pending"}
+          key={index}
+          style={{ "--dot-index": index, "--dot-distance": Math.max(0, index - settled) } as CSSProperties}
+        />
+      ))}
+    </div>
+  );
+}
+
+function WaitingDotField() {
+  return (
+    <div className="ai-wind-field" aria-hidden="true">
+      {Array.from({ length: WAITING_DOT_COUNT }, (_, index) => (
+        <i key={index} style={{ "--wind-dot": index, "--wind-column": index % 20, "--wind-row": Math.floor(index / 20) } as CSSProperties} />
+      ))}
+    </div>
+  );
+}
+
 export default function Home() {
   const [sessionHydrated, setSessionHydrated] = useState(false);
   const [step, setStep] = useState<StepId>("brief");
@@ -5118,6 +5117,9 @@ export default function Home() {
   const [busyElapsed, setBusyElapsed] = useState(0);
   const [busyExecutionKind, setBusyExecutionKind] = useState<BusyExecutionKind>("local");
   const [busyExecutionNote, setBusyExecutionNote] = useState("正在准备当前步骤");
+  const [busyOutputText, setBusyOutputText] = useState("");
+  const busyOutputArrivedAt = useRef(0);
+  const busyOutputViewportRef = useRef<HTMLDivElement | null>(null);
   const [activeAiMode, setActiveAiMode] = useState("");
   const [busyTokenUsage, setBusyTokenUsage] = useState<AiTokenUsage>(EMPTY_AI_TOKEN_USAGE);
   const [sessionTokenUsage, setSessionTokenUsage] = useState<AiTokenUsage>(EMPTY_AI_TOKEN_USAGE);
@@ -5701,21 +5703,32 @@ export default function Home() {
   const adoptedRuntimeCapabilities = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind !== "eval" && item.layer === "runtime");
   const unresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
   const selectedCatalogCapabilityCount = CAPABILITY_LIBRARY.filter((libraryItem) => capabilityPlan.items.some((item) => item.id === libraryItem.id && capabilityIsActive(item))).length;
-  const thinkingWords = busyTask ? createContextualThinkingWords({
-    task: busyTask,
-    idea,
-    stage: busyStage,
-    questions,
-    answers,
-    blueprint,
-    capabilities: capabilityPlan.items,
-    loopPlan,
-    issues: buildLoop.issues,
-    feedback: [...feedbackReasons, feedbackCustom, ...(personalizationHistory.at(-1)?.feedback || [])].filter(Boolean),
-    demo: skillDemo,
-  }) : [];
   const activeSkillName = stripYamlQuotes(files["SKILL.md"]?.match(/^name:\s*([^\n]+)$/m)?.[1] || "") || "generated-skill";
   const workspaceName = completedSteps.has("build") ? activeSkillName : ideaReady ? "新 Skill 草稿" : "未命名 Skill";
+
+  useEffect(() => {
+    const viewport = busyOutputViewportRef.current;
+    if (!viewport || !busyOutputText) return;
+    viewport.scrollTop = 0;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    let animationFrame = 0;
+    const startDelay = window.setTimeout(() => {
+      const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      if (!maxScroll) return;
+      const startedAt = performance.now();
+      const duration = Math.min(1_100, Math.max(520, maxScroll * 1.25));
+      const advance = (now: number) => {
+        const progress = Math.min(1, (now - startedAt) / duration);
+        viewport.scrollTop = maxScroll * progress;
+        if (progress < 1) animationFrame = window.requestAnimationFrame(advance);
+      };
+      animationFrame = window.requestAnimationFrame(advance);
+    }, 90);
+    return () => {
+      window.clearTimeout(startDelay);
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+    };
+  }, [busyOutputText]);
 
   useEffect(() => {
     if (!toast) return;
@@ -6183,24 +6196,34 @@ export default function Home() {
     setBusyElapsed(0);
     setBusyExecutionKind("local");
     setBusyExecutionNote("正在准备当前步骤");
+    setBusyOutputText("");
+    busyOutputArrivedAt.current = 0;
     setActiveAiMode("");
     setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
     setRetryAction(retry);
   }
 
   function finishBusy() {
-    setBusyClosing(true);
     if (busyCloseTimer.current !== null) window.clearTimeout(busyCloseTimer.current);
-    busyCloseTimer.current = window.setTimeout(() => {
-      setBusyTask(null);
-      setBusyClosing(false);
-      setBusyPhaseIndex(0);
-      setBusyElapsed(0);
-      setBusyExecutionKind("local");
-      setBusyExecutionNote("正在准备当前步骤");
-      setActiveAiMode("");
-      busyCloseTimer.current = null;
-    }, 220);
+    const close = () => {
+      setBusyClosing(true);
+      busyCloseTimer.current = window.setTimeout(() => {
+        setBusyTask(null);
+        setBusyClosing(false);
+        setBusyPhaseIndex(0);
+        setBusyElapsed(0);
+        setBusyExecutionKind("local");
+        setBusyExecutionNote("正在准备当前步骤");
+        setBusyOutputText("");
+        busyOutputArrivedAt.current = 0;
+        setActiveAiMode("");
+        busyCloseTimer.current = null;
+      }, 220);
+    };
+    const visibleFor = busyOutputArrivedAt.current ? Date.now() - busyOutputArrivedAt.current : Number.POSITIVE_INFINITY;
+    const remaining = Math.max(0, 1_100 - visibleFor);
+    if (remaining) busyCloseTimer.current = window.setTimeout(close, remaining);
+    else close();
   }
 
   function showLocalBusy(note: string) {
@@ -6321,6 +6344,8 @@ export default function Home() {
           throw responseError;
         }
         settleActualUsage(data.usage || {}, data.content);
+        setBusyOutputText(data.content.slice(0, 16_000));
+        busyOutputArrivedAt.current = Date.now();
         return jsonFromText<T>(data.content);
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
@@ -10910,9 +10935,12 @@ export default function Home() {
                     || Boolean(currentAnswer && selectedOptions.length === 0);
                   return (
                     <div className={`question-card selection-${question.selectionMode}`} key={question.id}>
-                      <span className="question-number">{String(index + 1).padStart(2, "0")}</span>
+                      <span className="question-index">
+                        <span className="question-number">{String(index + 1).padStart(2, "0")}</span>
+                        <b className="question-dimension">{question.dimension}</b>
+                      </span>
                       <span className="question-copy">
-                        <span className="question-meta"><b>{question.dimension}</b><i>{question.selectionMode === "multiple" ? "可多选" : "单选"}</i>
+                        <span className="question-meta"><i>{question.selectionMode === "multiple" ? "可多选" : "单选"}</i>
                           {question.selectionMode === "single" && <button type="button" className="question-multiple-toggle" disabled={busy} onClick={() => allowMultipleAnswers(question.id)} aria-label={`将“${question.label}”改为多选`}>我想多选</button>}
                         </span>
                         <span className="question-title-row">
@@ -11646,7 +11674,7 @@ export default function Home() {
             {optimizationStatus === "analyzing" && (
               <div className="optimization-loading" role="status" aria-live="polite">
                 <div className="optimization-loading-copy"><span className="coach-avatar">AI</span><div><strong>正在用多项任务寻找共性问题</strong><small>训练任务用于找问题，独立验证任务不会提供给修改 Agent</small></div><b>{optimizationElapsed}s</b></div>
-                <div className="optimization-scan"><span /></div>
+                <DotMatrixProgress tone="dark" label="正在分析评测证据" />
                 <p>系统会分别试跑训练组和验证组，只根据训练证据提出优化；验证组负责决定候选版本是否能够替换原版。</p>
                 <div className="optimization-token-usage" aria-live="polite">
                   <strong>Token 用量</strong>
@@ -11684,7 +11712,7 @@ export default function Home() {
             {optimizationActive && optimizationStatus !== "analyzing" && (
               <div className="optimization-run-state" role="status" aria-live="polite">
                 <div><span className="coach-avatar">AI</span><p><strong>{optimizationStatus === "optimizing" ? "正在生成有限修改的候选版本" : "正在进行独立验证"}</strong><small>{optimizationStatus === "optimizing" ? `本轮最多 ${OPTIMIZATION_EDIT_BUDGET} 处局部修改，不直接覆盖当前 Skill` : "使用修改 Agent 没看过的保留任务；没有严格提升就自动回滚"}</small></p><b>{optimizationElapsed}s</b></div>
-                <div className="optimization-scan"><span /></div>
+                <DotMatrixProgress tone="dark" label={optimizationStatus === "optimizing" ? "正在生成候选版本" : "正在进行独立验证"} />
                 <div className="optimization-token-usage" aria-live="polite">
                   <strong>Token 用量</strong>
                   <b>{formatAiTokens(busyTokenUsage.totalTokens)}</b>
@@ -11744,16 +11772,15 @@ export default function Home() {
               <span>{busyExecutionLabel}</span>
               <p>{busyExecutionNote}</p>
             </div>
-            <div className={`thinking-warp ${busyTask} ${busyExecutionKind}`} aria-hidden="true">
-              <span className="warp-core">AI</span>
-              {thinkingWords.map((word, index) => (
-                <i key={`${word}-${index}`} style={{ "--word-index": index, animationDelay: `${index * 170}ms` } as CSSProperties}>{word}</i>
-              ))}
+            <div className={`ai-output-stage ${busyOutputText ? "has-output" : "waiting"}`} aria-label={busyOutputText ? "模型本轮输出" : "模型正在处理"}>
+              {busyOutputText
+                ? <div className="ai-output-scroll" ref={busyOutputViewportRef}><pre>{busyOutputText}</pre></div>
+                : <WaitingDotField />}
             </div>
-            <div className="ai-progress-track"><span /></div>
+            <DotMatrixProgress progress={(busyStageIndex + 0.42) / BUSY_STAGES[busyTask].stages.length} label={`总进度：${busyStage}`} />
             <div className="ai-progress-steps">
               {BUSY_STAGES[busyTask].stages.map((stageName, index) => (
-                <div className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName}>
+                <div className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName} style={{ "--stage-index": index } as CSSProperties}>
                   <i aria-hidden="true">{index < busyStageIndex ? "✓" : index === busyStageIndex ? "●" : ""}</i>
                   <span><strong>{stageName}</strong><small>{index < busyStageIndex ? "已完成" : index === busyStageIndex ? "进行中" : "待进行"}</small></span>
                   {index < BUSY_STAGES[busyTask].stages.length - 1 && <img className="progress-step-arrow" src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-right.svg" alt="" aria-hidden="true" />}

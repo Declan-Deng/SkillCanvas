@@ -61,12 +61,43 @@ function scopeCheckpointReplies(steps: WorkflowDagStep[]) {
   }
   const businessProducts = new Set(steps.flatMap((step) => step.produces).filter((token) => !Object.values(WORKFLOW_TERMINALS).some((value) => value === token)));
   const occupied = new Set(steps.flatMap((step) => [...step.requires, ...step.produces, ...(step.resumeProduces || [])]));
+  const businessProducer = new Map<string, WorkflowDagStep | null>();
+  for (const step of steps) for (const token of step.produces.filter((value) => businessProducts.has(value))) {
+    businessProducer.set(token, businessProducer.has(token) ? null : step);
+  }
+  const ancestorsOf = (token: string, seen = new Set<string>()): Set<string> => {
+    if (seen.has(token)) return seen;
+    seen.add(token);
+    const producer = businessProducer.get(token);
+    if (producer) for (const dependency of producer.requires.filter((value) => businessProducts.has(value))) ancestorsOf(dependency, seen);
+    return seen;
+  };
+  const distanceToAncestor = (token: string, target: string, seen = new Set<string>()): number => {
+    if (token === target) return 0;
+    if (seen.has(token)) return Number.POSITIVE_INFINITY;
+    seen.add(token);
+    const producer = businessProducer.get(token);
+    if (!producer) return Number.POSITIVE_INFINITY;
+    const distances = producer.requires.filter((value) => businessProducts.has(value))
+      .map((value) => distanceToAncestor(value, target, new Set(seen)));
+    const nearest = distances.length ? Math.min(...distances) : Number.POSITIVE_INFINITY;
+    return Number.isFinite(nearest) ? nearest + 1 : nearest;
+  };
   const producedNames = new Map<string, Map<string, string>>();
   const consumedNames = new Map<string, Map<string, string>>();
   for (const [token, owners] of replies) {
     if (owners.length < 2 || token.startsWith("input:") || businessProducts.has(token)) continue;
     const consumers = steps.filter((step) => step.requires.includes(token));
-    const bindings = consumers.map((consumer) => ({ consumer, candidates: owners.filter((owner) => owner.id !== consumer.id && owner.requires.some((artifact) => businessProducts.has(artifact) && consumer.requires.includes(artifact))) }));
+    const bindings = consumers.map((consumer) => {
+      const dependencies = consumer.requires.filter((value) => value !== token && businessProducts.has(value));
+      const consumerContext = new Set(dependencies.flatMap((value) => [...ancestorsOf(value)]));
+      const ranked = owners.filter((owner) => owner.id !== consumer.id).map((owner) => ({ owner, distance: Math.min(...owner.requires
+        .filter((artifact) => businessProducts.has(artifact) && consumerContext.has(artifact))
+        .flatMap((artifact) => dependencies.map((dependency) => distanceToAncestor(dependency, artifact)))) }))
+        .filter((entry) => Number.isFinite(entry.distance));
+      const nearest = ranked.length ? Math.min(...ranked.map((entry) => entry.distance)) : Number.POSITIVE_INFINITY;
+      return { consumer, candidates: ranked.filter((entry) => entry.distance === nearest).map((entry) => entry.owner) };
+    });
     if (!consumers.length || bindings.some(({ candidates }) => candidates.length !== 1)) continue;
     const names = new Map(owners.map((owner) => [owner.id, `${token}:${owner.id}`]));
     if ([...names.values()].some((name) => occupied.has(name))) continue;
@@ -81,6 +112,25 @@ function scopeCheckpointReplies(steps: WorkflowDagStep[]) {
       resumeProduces: step.resumeProduces?.map((token) => outgoing?.get(token) || token),
       input: step.input.replace(/\$?[a-zA-Z_][a-zA-Z0-9_.:-]*/g, (token) => incoming?.get(token) || token),
       when: step.when.replace(/\$?[a-zA-Z_][a-zA-Z0-9_.:-]*/g, (token) => incoming?.get(token) || token) };
+  });
+}
+
+/** A delivery contract names the artifact being handed over. When exactly one
+ * real producer exists, bind that artifact as a dependency instead of asking
+ * a model to rediscover an already explicit edge. Ambiguous or missing
+ * products remain compiler errors and go through targeted repair. */
+function bindUnambiguousDeliveries(steps: WorkflowDagStep[]) {
+  const producers = new Map<string, WorkflowDagStep[]>();
+  for (const step of steps) for (const token of step.produces) producers.set(token, [...(producers.get(token) || []), step]);
+  return steps.map((step) => {
+    if (!["deliver", "persist"].includes(step.role || "") || !step.delivers?.length) return step;
+    const requires = [...step.requires];
+    for (const token of step.delivers) {
+      if (step.produces.includes(token) || requires.includes(token) || Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)) continue;
+      const owners = (producers.get(token) || []).filter((owner) => owner.id !== step.id);
+      if (owners.length === 1) requires.push(token);
+    }
+    return requires.length === step.requires.length ? step : { ...step, requires };
   });
 }
 
@@ -110,6 +160,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
       ? "persist" : owners.length && owners.every((item) => item.kind === "reference" || item.kind === "asset") ? "read" : "transform";
     return { ...step, role: step.role || before?.role || closed.role || capabilityRole as WorkflowDagStep["role"] };
   });
+  steps = bindUnambiguousDeliveries(steps);
   steps = scopeCheckpointReplies(steps);
   steps = scopeDeliveredVersions(steps);
   // Reply values written by models without "$" are still runtime events when
@@ -267,7 +318,7 @@ export async function repairWorkflowPlan(
   const originalCompile = compileWorkflowDag(originalSteps, current.initialInputs);
   const structuralProductions = new Set(originalCompile.issues.flatMap((issue) => issue.type === "duplicate-producer" && issue.dependency && current.initialInputs.includes(issue.dependency) ? [issue.dependency] : []));
   const originalArtifacts = new Set(originalSteps.flatMap((step) => [...step.produces, ...(step.resumeProduces || [])]
-    .filter((token) => !structuralProductions.has(token) && !(step.role && ["deliver", "persist"].includes(step.role) && /^\$output_(?:final|revised|draft)$/.test(token)
+    .filter((token) => !isUserReplyToken(token) && !structuralProductions.has(token) && !(step.role && ["deliver", "persist"].includes(step.role) && /^\$output_(?:final|revised|draft)$/.test(token)
       && !step.delivers?.includes(token) && !originalSteps.some((consumer) => consumer.requires.includes(token))))));
   const cyclicSteps = new Set(originalCompile.issues.filter((issue) => issue.type === "cycle").map((issue) => issue.stepId));
   let rejectionIssues: string[] = [];

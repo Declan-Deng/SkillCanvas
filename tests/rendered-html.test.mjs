@@ -156,7 +156,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /function normalizeSkillDemo\(/);
   assert.match(page, /function createPersonalizedFeedbackOptions\(/);
   assert.match(page, /function createDemoFeedbackFallback\(/);
-  assert.match(page, /function createContextualThinkingWords\(/);
+  assert.match(page, /function WaitingDotField\(/);
+  assert.match(page, /setBusyOutputText\(data\.content\.slice\(0, 16_000\)\)/);
+  assert.doesNotMatch(page, /function createContextualThinkingWords\(/);
   assert.doesNotMatch(page, /THINKING_WORDS/);
   assert.match(page, /function normalizeFeedbackOptions\(/);
   assert.match(page, /function removeGeneratedToolSections\(/);

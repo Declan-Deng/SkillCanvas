@@ -172,8 +172,29 @@ test("colliding checkpoint reply names are scoped by the exact reviewed artifact
   assert.ok(!checked.initialInputs.includes("$confirmed:review-again"));
   assert.deepEqual(normalizeWorkflowPlanBindings({ ...context, workflowSteps: checked.steps }), checked.steps, "idempotent");
   const ambiguous = structuredClone(context);
-  ambiguous.workflowSteps[4].requires = ["$confirmed", "$request"];
+  ambiguous.workflowSteps.splice(4, 0, node("ambiguous-reader", ["$confirmed", "$request"], ["$confirmation_note"]));
+  ambiguous.workflowSteps[5].requires.push("$confirmation_note");
   assert.equal(inspectWorkflowPlan(ambiguous).valid, false, "no guessed confirmation owner without matching reviewed content");
+});
+
+test("sequential confirmations are scoped through transitive artifacts and explicit delivery contracts bind their sole producer", async () => {
+  const context = { capabilities: [cap("core", "llm", "Request", "Plan")], inputs: [], workflowSteps: [
+    node("s1-extract-todos", ["$request"], ["$todos"]),
+    { ...node("s2-clarify-todos", ["$todos"], ["$input_required"], "await-input"), resumeProduces: ["$confirmed"] },
+    node("s3-draft-plan", ["$todos", "$confirmed"], ["$draft_plan"]),
+    node("s4-propose-cuts", ["$draft_plan"], ["$cuts"]),
+    { ...node("s5-confirm-cuts", ["$cuts"], ["$input_required"], "await-input"), resumeProduces: ["$confirmed"] },
+    { ...node("s6-deliver-plan", ["$cuts", "$confirmed"], ["$output"], "deliver"), delivers: ["$draft_plan"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  assert.deepEqual(checked.steps.find((step) => step.id === "s2-clarify-todos").resumeProduces, ["$confirmed:s2-clarify-todos"]);
+  assert.deepEqual(checked.steps.find((step) => step.id === "s5-confirm-cuts").resumeProduces, ["$confirmed:s5-confirm-cuts"]);
+  assert.ok(checked.steps.find((step) => step.id === "s3-draft-plan").requires.includes("$confirmed:s2-clarify-todos"));
+  assert.ok(checked.steps.find((step) => step.id === "s6-deliver-plan").requires.includes("$confirmed:s5-confirm-cuts"));
+  assert.ok(checked.steps.find((step) => step.id === "s6-deliver-plan").requires.includes("$draft_plan"));
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("deterministic normalization must not spend a model request"));
+  assert.equal(repaired.attempts, 0);
 });
 
 test("invalid root producers can be corrected without deleting real task outputs", async () => {

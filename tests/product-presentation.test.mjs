@@ -34,10 +34,15 @@ test("AI selection label and yellow multiple-choice button retain existing behav
   assert.match(page, /onClick=\{\(\) => allowMultipleAnswers\(question.id\)\}[^>]*>我想多选/);
 });
 
-test("loading overlay omits the entire token panel but retains progress and accounting", () => {
+test("loading overlay omits token noise and uses truthful dotted waiting/output states", () => {
   const overlay = page.slice(page.indexOf("{busyTask && ("));
   assert.doesNotMatch(overlay, /ai-progress-token-usage|本次加载 Token|会话累计/);
-  assert.match(overlay, /ai-progress-track/);
+  assert.doesNotMatch(overlay, /thinking-warp|warp-core/);
+  assert.match(overlay, /ai-output-stage/);
+  assert.match(overlay, /busyOutputText[\s\S]*?WaitingDotField/);
+  assert.match(overlay, /DotMatrixProgress progress=/);
+  assert.match(css, /\.ai-wind-field i\s*\{[^}]*animation: wind-dot 1\.9s linear infinite;/);
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.ai-wind-field i/);
   assert.match(page, /setSessionTokenUsage\(reconcile\)/);
   assert.match(page, /setBusyTokenUsage\(reconcile\)/);
 });
