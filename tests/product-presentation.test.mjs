@@ -84,10 +84,15 @@ test("workflow recommendation keeps the decision and removes redundant explanati
   assert.doesNotMatch(page, /AI 已推荐并采用一条可执行流程/);
   assert.doesNotMatch(page, /<p>\{loopPlan\.reason\}<\/p>/);
   assert.doesNotMatch(page, /✓ 已采用 · \{loopPlan\.label\}/);
-  assert.match(page, /推荐工作流：目标、子目标与循环/);
-  assert.match(css, /\.loop-plan-card\s*\{[^}]*background: transparent;[^}]*border: 0;/);
+  assert.match(page, /<h3>工作流<\/h3>/);
+  assert.match(css, /\.loop-plan-card\s*\{[^}]*background: rgba\(255, 255, 255, 0\.58\);[^}]*border: 1px solid var\(--line\);/);
   assert.match(css, /\.workflow-editor\s*\{[^}]*background: #17211f;/);
   assert.match(css, /\.workflow-step-card\s*\{[^}]*height: 230px;/);
+  assert.match(css, /\.adopted-capability-grid \.capability-icon\s*\{[^}]*background: transparent;/);
+  assert.match(css, /\.ai-output-scroll pre\s*\{[^}]*font-size: 10\.1px;/);
+  assert.match(css, /\.busy-execution-status p\s*\{[^}]*color: var\(--ink\);[^}]*font-size: 10\.4px;/);
+  assert.match(page, /Math\.min\(2_750, Math\.max\(1_300, maxScroll \* 3\.125\)\)/);
+  assert.match(page, /1 - Math\.pow\(1 - progress, 3\)/);
 });
 
 test("capability picker separates core work from optional tools without duplicates", () => {

@@ -258,10 +258,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /文件发布检查已通过|还有少量不会阻止下载的提醒/);
   assert.match(page, /bundleAudit.blockers.length > 0 && <div className="finding-card">/);
   assert.match(page, /能力选型结果/);
-  assert.match(page, /目标、子目标与循环/);
   assert.doesNotMatch(page, /AI 已推荐并采用一条可执行流程/);
   assert.doesNotMatch(page, /✓ 已采用 · \{loopPlan\.label\}/);
-  assert.match(page, /推荐工作流：目标、子目标与循环/);
+  assert.match(page, /<h3>工作流<\/h3>/);
   assert.match(page, /本次无需额外安装/);
   assert.match(page, /没有为了显得“专业”而机械添加 MCP/);
   assert.match(page, /if \(!normalizedQueries\.length \|\| !mcpConnections\.length\) return empty/);

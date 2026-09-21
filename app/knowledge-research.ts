@@ -374,7 +374,6 @@ export function buildKnowledgeEvidencePayload(sources: RetrievedKnowledgeSource[
 function behaviorChanging(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" | "action" | "type">) {
   const combined = `${atom.knowledge} ${atom.appliesWhen} ${atom.action}`;
   const onlyGeneric = /^(?:保持|做到|确保|需要|应该|尽量|注意)?\s*(?:专业|清晰|准确|自然|简洁|高质量|有逻辑|吸引人|完整)[，。、\s]*(?:专业|清晰|准确|自然|简洁|高质量|有逻辑|吸引人|完整)*[。.!！]?$/i.test(combined.trim());
-  const hasOperation = /检查|比较|识别|计算|验证|询问|停止|升级|记录|读取|引用|标记|分类|排序|保留|排除|转换|匹配|分支|触发|采用|使用|依据|按照|拆分|合并|重组|重写|改写|补充|删除|替换|提取|校准|映射|分配|选择|优先|降低|增加|输出|生成|review|verify|compare|calculate|classify|route|stop|use|apply|select|rank|rewrite|extract|map/i.test(atom.action);
   const hasDecisionMechanism = /分为|分级|等级|矩阵|权重|优先级|证据强度|信号|阈值|比较|记录.{0,20}缺口|先.{0,20}再|若.{0,40}则|当.{0,40}时|冲突|例外|取舍|回退|失败|映射|覆盖率|taxonomy|matrix|weight|priority|evidence tier|threshold|exception|trade-?off|fallback/i.test(combined);
   const hasNamedMechanism = /\b[A-Z][A-Z0-9/+.-]{2,12}\b|[\u4e00-\u9fff]{2,12}(?:法则|方法|模型|矩阵|框架|分层|分级|分类|结构|检查表|清单|评分卡)/i.test(combined);
   const genericRestatement = /(?:分析|提取|理解|识别).{0,24}(?:关键词|要求|信息|重点).{0,40}(?:突出|匹配|优化|调整|生成).{0,24}(?:内容|结果|表达|方案)/i.test(combined);
@@ -384,6 +383,10 @@ function behaviorChanging(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" 
   const specializedType = ["official_rule", "failure_pattern", "exception", "terminology"].includes(atom.type);
   const presentationContractRestatement = /(?:列名|表头|字段顺序|章节顺序|column names).{0,20}(?:固定|必须为|指定为|must be)|(?:固定|指定).{0,20}(?:列名|表头|字段顺序|章节顺序)/i.test(combined)
     && !/(?:标准|规范|协议|schema.org|RFC|ISO|国家标准|行业标准).{0,40}(?:字段|格式|结构)/i.test(combined);
+  // Keep this deterministic pass recall-oriented. Domain verbs and methods are
+  // open-ended (and multilingual), so a finite action vocabulary must never be
+  // an admission requirement. Evidence entailment and executability are judged
+  // by the downstream semantic verifier before anything is published.
   return !onlyGeneric
     && !presentationContractRestatement
     && !genericQualityAdvice
@@ -391,7 +394,6 @@ function behaviorChanging(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" 
     && atom.knowledge.length >= 12
     && atom.appliesWhen.length >= 4
     && atom.action.length >= 10
-    && hasOperation
     && (hasDecisionMechanism || hasNamedMechanism || specializedType || atom.action.length >= 24);
 }
 
@@ -401,14 +403,12 @@ function behaviorChanging(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" 
 function referenceValuable(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" | "action">) {
   const combined = `${atom.knowledge} ${atom.appliesWhen} ${atom.action}`;
   const genericQualityAdvice = /^(?:保持|确保|使用|采用|提升|优化)?\s*(?:专业|清晰|准确|自然|简洁|高质量|有逻辑|吸引人|完整)[，。、\s]*$/i.test(atom.action);
-  const hasConcreteMethod = /检查|比较|识别|计算|验证|询问|记录|读取|引用|标记|分类|排序|保留|排除|转换|匹配|分支|触发|采用|拆分|合并|重组|重写|改写|补充|删除|替换|提取|校准|映射|分配|选择|优先|降低|增加|输出|生成|review|verify|compare|calculate|classify|route|use|apply|select|rank|rewrite|extract|map/i.test(atom.action);
   const hasSpecificStructure = /分为|分级|等级|矩阵|权重|优先级|信号|阈值|先.{0,20}再|若.{0,40}则|当.{0,40}时|冲突|例外|取舍|回退|失败|映射|覆盖率|taxonomy|matrix|weight|priority|threshold|exception|fallback|\b[A-Z][A-Z0-9/+.-]{2,12}\b|[\u4e00-\u9fff]{2,12}(?:法则|方法|模型|矩阵|框架|分层|分级|分类|结构|检查表|清单|评分卡)/i.test(combined);
   return !genericQualityAdvice
     && atom.knowledge.length >= 12
     && atom.appliesWhen.length >= 4
     && atom.action.length >= 10
-    && hasConcreteMethod
-    && hasSpecificStructure;
+    && (hasSpecificStructure || atom.action.length >= 24);
 }
 
 function knowledgeApplicationMode(input: {

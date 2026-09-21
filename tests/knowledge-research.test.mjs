@@ -271,6 +271,71 @@ test("concrete community knowledge is preserved as advisory insight instead of a
   assert.equal(restored.diagnostics.validatorRejectedCount, 14);
 });
 
+test("domain actions are not rejected by a finite verb vocabulary", () => {
+  const plan = normalizeKnowledgePlan({
+    required: true,
+    domain: "个人时间管理与周计划排期",
+    knowledgeGaps: ["精力时段安排"],
+    decisionDimensions: ["精力时段安排"],
+    queries: ["energy based scheduling method"],
+  });
+  const sources = normalizeRetrievedSources([{
+    url: "https://example.com/blog/energy-scheduling",
+    title: "Energy-aware scheduling guide",
+    excerpt: "先按认知需求给事项分级，再把高认知事项对齐精力高峰并安排到对应时段；发生冲突时保护高峰时段，把低认知事项延后。",
+  }]);
+  const pack = normalizeKnowledgePack({
+    plan,
+    sources,
+    raw: { atoms: [{
+      id: "energy-window-placement",
+      title: "按精力窗口安排事项",
+      dimension: "精力时段安排",
+      knowledge: "不同认知需求的事项应与相应的精力时段对齐。",
+      type: "decision_rule",
+      appliesWhen: "一周内同时存在高认知和低认知事项时",
+      action: "把高认知事项对齐精力高峰并安排到对应时段，冲突时保护高峰时段并将低认知事项延后。",
+      sourceUrls: [sources[0].url],
+      confidence: 0.82,
+    }] },
+  });
+
+  assert.equal(pack.atoms.length, 1);
+  assert.equal(pack.atoms[0].applicationMode, "advisory");
+  assert.match(pack.atoms[0].action, /对齐精力高峰/);
+
+  const unfamiliarDomainSources = normalizeRetrievedSources([{
+    url: "https://example.com/blog/conservation-protocol",
+    title: "Conservation protocol",
+    excerpt: "When pigment separation appears, sequester the sample, feather the boundary, and anneal the coating only after the control strip remains stable.",
+  }]);
+  const unfamiliarDomainPlan = normalizeKnowledgePlan({
+    required: true,
+    domain: "conservation protocol",
+    knowledgeGaps: ["pigment separation response"],
+    decisionDimensions: ["pigment separation response"],
+    queries: ["pigment separation conservation protocol"],
+  });
+  const unfamiliarDomainPack = normalizeKnowledgePack({
+    plan: unfamiliarDomainPlan,
+    sources: unfamiliarDomainSources,
+    raw: { atoms: [{
+      id: "pigment-separation-response",
+      title: "Pigment separation response",
+      dimension: "pigment separation response",
+      knowledge: "Pigment separation calls for an isolated, staged conservation response.",
+      type: "decision_rule",
+      appliesWhen: "Pigment separation appears on the sample",
+      action: "Sequester the sample, feather the boundary, and anneal the coating only after the control strip remains stable.",
+      sourceUrls: [unfamiliarDomainSources[0].url],
+      confidence: 0.82,
+    }] },
+  });
+
+  assert.equal(unfamiliarDomainPack.atoms.length, 1);
+  assert.match(unfamiliarDomainPack.atoms[0].action, /Sequester/);
+});
+
 test("a zero-yield refinement cannot overwrite the accepted pack with a contradictory summary", () => {
   const plan = normalizeKnowledgePlan({ required: true, domain: "内容策略", knowledgeGaps: ["结构方法"], decisionDimensions: ["结构方法"], queries: ["content structure method"] });
   const sources = normalizeRetrievedSources([{ url: "https://example.com/blog/structure-guide", title: "Structure guide", excerpt: "A detailed structure method with a decision condition, an ordered action, and a concrete exception for content drafting." }]);

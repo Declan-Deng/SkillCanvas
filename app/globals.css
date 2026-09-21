@@ -3089,17 +3089,18 @@ h3 {
 }
 
 .loop-plan-card {
-  background: transparent;
-  border: 0;
-  border-radius: 0;
+  background: rgba(255, 255, 255, 0.58);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  box-shadow: 0 18px 44px rgba(31, 48, 44, 0.07);
   color: var(--ink);
   margin-top: 30px;
   overflow: visible;
-  padding: 0;
+  padding: 22px;
 }
 
 .loop-plan-card.turn-based {
-  background: transparent;
+  background: rgba(255, 255, 255, 0.58);
 }
 
 .loop-plan-heading {
@@ -3829,6 +3830,15 @@ h3 {
   gap: 10px;
   grid-template-columns: 34px minmax(0, 1fr) auto;
   padding: 12px;
+}
+
+.adopted-capability-grid .capability-icon {
+  background: transparent;
+  border-radius: 0;
+}
+
+.adopted-capability-grid .capability-icon img {
+  filter: none;
 }
 
 .adopted-capability-grid article > div {
@@ -9925,7 +9935,7 @@ h3 {
   background: #e4e0d7;
   border-radius: 99px;
   color: #5d6763;
-  font-size: 7px;
+  font-size: 9.1px;
   font-weight: 760;
   letter-spacing: 0.04em;
   padding: 4px 7px;
@@ -9942,8 +9952,8 @@ h3 {
 }
 
 .busy-execution-status p {
-  color: var(--muted);
-  font-size: 8px;
+  color: var(--ink);
+  font-size: 10.4px;
   line-height: 1.45;
   margin: 0;
 }
@@ -10007,7 +10017,7 @@ h3 {
 .ai-output-scroll pre {
   color: #c9ddd6;
   font-family: var(--font-geist-mono), monospace;
-  font-size: 7.5px;
+  font-size: 10.1px;
   line-height: 1.62;
   margin: 0;
   opacity: 0;
@@ -11300,7 +11310,7 @@ h3 {
   }
 
   .loop-plan-card {
-    padding: 0;
+    padding: 14px;
   }
 
   .workflow-editor-heading {

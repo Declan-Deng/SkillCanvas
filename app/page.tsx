@@ -5713,13 +5713,15 @@ export default function Home() {
     if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     let animationFrame = 0;
     const startDelay = window.setTimeout(() => {
-      const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+      const bottomPadding = Number.parseFloat(window.getComputedStyle(viewport).paddingBottom) || 0;
+      const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight - bottomPadding);
       if (!maxScroll) return;
       const startedAt = performance.now();
-      const duration = Math.min(1_100, Math.max(520, maxScroll * 1.25));
+      const duration = Math.min(2_750, Math.max(1_300, maxScroll * 3.125));
       const advance = (now: number) => {
         const progress = Math.min(1, (now - startedAt) / duration);
-        viewport.scrollTop = maxScroll * progress;
+        const easedProgress = 1 - Math.pow(1 - progress, 3);
+        viewport.scrollTop = Math.min(maxScroll, maxScroll * easedProgress);
         if (progress < 1) animationFrame = window.requestAnimationFrame(advance);
       };
       animationFrame = window.requestAnimationFrame(advance);
@@ -11137,7 +11139,7 @@ export default function Home() {
               <section className={`loop-plan-card ${loopPlan.mode}`}>
                 <div className="loop-plan-heading">
                   <div>
-                    <h3>推荐工作流：目标、子目标与循环</h3>
+                    <h3>工作流</h3>
                   </div>
                 </div>
                 <div className="loop-goal">
