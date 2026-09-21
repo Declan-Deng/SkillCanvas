@@ -13,6 +13,7 @@ import { runBlueprintPlanning, type BlueprintCheckpoint } from "./blueprint-plan
 import { HOST_FILE_WORKSPACE_CAPABILITY } from "./host-file-capability";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "./bundle-resource-repair";
 import { validateImplementationFiles } from "./canonical-mutations";
+import { generationResultCopy, type GenerationLoopOutcome } from "./generation-result-copy";
 
 import { ChangeEvent, Fragment, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { FileUploadButton, MaterialInput, type MaterialUploadState } from "./material-input";
@@ -482,6 +483,7 @@ type GenerationSemanticAudit = {
 
 type GenerationLoopState = {
   evaluationContractVersion: typeof EVAL_COMPILER_VERSION;
+  outcome: GenerationLoopOutcome;
   status: "idle" | "running" | "passed" | "stable" | "attention";
   phase: "idle" | "contract" | "static" | "rollout" | "diagnose" | "patch" | "validate" | "complete";
   rounds: number;
@@ -503,6 +505,8 @@ type GenerationLoopState = {
   closureScore: number;
   acceptedPatches: number;
   rejectedPatches: number;
+  candidateEvalAttempts: number;
+  candidateEvalCompletions: number;
   contractDigest: string;
   benchmarkCases: number;
   benchmarkRepeatsPerCase: number;
@@ -887,6 +891,7 @@ const BUILD_LOOP_PHASE_INDEX: Record<BuildLoopState["phase"], number> = { idle: 
 const OPTIMIZATION_LOOP_STEPS = ["冻结评测", "隔离执行", "隔离评分", "无 Skill 基线", "问题诊断", "有限修改", "匿名 A/B", "保留集回归", "保留任务", "精简冗余"] as const;
 const DEFAULT_GENERATION_LOOP: GenerationLoopState = {
   evaluationContractVersion: EVAL_COMPILER_VERSION,
+  outcome: "not-run",
   status: "idle",
   phase: "idle",
   rounds: 0,
@@ -907,6 +912,8 @@ const DEFAULT_GENERATION_LOOP: GenerationLoopState = {
   closureScore: 0,
   acceptedPatches: 0,
   rejectedPatches: 0,
+  candidateEvalAttempts: 0,
+  candidateEvalCompletions: 0,
   contractDigest: "",
   benchmarkCases: 0,
   benchmarkRepeatsPerCase: 0,
@@ -1842,7 +1849,18 @@ function sanitizeSkillFiles(files: Record<string, string>) {
 
 function friendlyReleaseBlocker(item: string) {
   return item
+    .replace(/P0(?:\s+Execution Gate)?/gi, "无法运行的问题")
+    .replace(/P1(?:\s+Contract Gate)?/gi, "关键逻辑问题")
+    .replace(/held-out Eval/gi, "独立测试任务")
+    .replace(/held-out/gi, "独立测试")
+    .replace(/Optimization Loop/gi, "自动优化")
+    .replace(/Build Loop/gi, "生成文件检查")
+    .replace(/Bundle/gi, "生成文件")
+    .replace(/Candidate/gi, "修改版")
+    .replace(/Canonical IR/gi, "核心数据结构")
+    .replace(/Patch Plan/gi, "修改方案")
     .replace(/Eval Harness/gi, "自动测试系统")
+    .replace(/Eval/gi, "自动测试")
     .replace(/SKILL\.md/gi, "主文件")
     .replace(/Tools?\/MCP/gi, "外部工具或 MCP")
     .replace(/grader/gi, "评分规则")
@@ -5668,10 +5686,26 @@ export default function Home() {
       && generationLoop.bestScore === 100
       && generationLoop.passRate === 100
       && generationLoop.closureScore === 100);
-  const optimizationCompletedWithRollback = generationLoop.status === "attention"
-    && generationLoop.minimalityChecked
-    && generationLoop.benchmarkRuns > 0
-    && !optimizationStableAtCeiling;
+  const visibleGenerationOutcome: GenerationLoopOutcome = optimizationBlockedByBuild
+    ? "build-blocked"
+    : generationLoop.status === "running"
+      ? "running"
+      : generationLoop.status === "passed"
+        ? "accepted"
+        : optimizationStableAtCeiling
+          ? "stable"
+          : generationLoop.outcome !== "not-run"
+            ? generationLoop.outcome
+            : generationLoop.status === "attention"
+              ? generationLoop.benchmarkRuns > 0 && generationLoop.rejectedPatches > 0
+                ? "no-safe-change"
+                : "evaluation-incomplete"
+              : "not-run";
+  const generationCopy = generationResultCopy({
+    outcome: visibleGenerationOutcome,
+    issueCount: generationLoop.issues.length,
+    lift: generationLoop.lift,
+  });
   const buildUnresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
   const buildProductCapabilities = capabilityPlan.items
     .filter((item) => capabilityIsActive(item) && item.kind !== "eval")
@@ -6002,27 +6036,12 @@ export default function Home() {
 
   function notifyGenerationLoopResult(state: GenerationLoopState) {
     const elapsedSeconds = loopStartedAt.current ? Math.max(1, Math.round((Date.now() - loopStartedAt.current) / 1_000)) : 0;
-    const candidateSafelyRejected = state.status === "attention"
-      && state.benchmarkRuns > 0
-      && state.acceptedPatches === 0
-      && state.rejectedPatches > 0;
-    const title = state.status === "passed"
-      ? "Skill 优化已完成"
-      : state.status === "stable" || candidateSafelyRejected
-        ? "Skill 已生成，当前版本已保留"
-        : "Skill 优化需要查看";
-    const result = state.status === "passed"
-      ? `当前最佳版本已通过回归门控${state.lift ? `，Skill Lift ${state.lift > 0 ? "+" : ""}${state.lift}` : ""}。`
-      : state.status === "stable"
-        ? "冻结评测全部通过，但没有候选证明额外提升；已安全保留当前最佳版本。"
-        : candidateSafelyRejected
-          ? `候选优化未通过独立评测，系统已自动回滚；Skill 已正常生成，当前版本没有被覆盖${state.issues.length ? `。另有 ${state.issues.length} 个观察项可稍后查看` : ""}。`
-          : `${state.stopReason || "Loop 已停止并保留当前最佳版本。"}`;
-    const body = `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220);
-    setCompletionNotice({ title, body });
-    document.title = `● ${title} · SkillCanvas`;
+    const copy = generationResultCopy({ outcome: state.outcome, issueCount: state.issues.length, lift: state.lift });
+    const body = `${copy.body}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220);
+    setCompletionNotice({ title: copy.title, body });
+    document.title = `● ${copy.title} · SkillCanvas`;
     if (!("Notification" in window) || window.Notification.permission !== "granted") return;
-    void deliverBrowserNotification(title, {
+    void deliverBrowserNotification(copy.title, {
       body,
       tag: "skillcanvas-generation-loop",
     });
@@ -7879,7 +7898,7 @@ export default function Home() {
     loopStartedAt.current = Date.now();
     setBusyPhaseIndex(4);
     showLoopBusy("Build 已通过，正在固定能力边界并启动 Optimization Loop");
-    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "static", stopReason: "正在建立能力闭环" });
+    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, outcome: "running", status: "running", phase: "static", stopReason: "正在建立能力闭环" });
     reportClientGenerationLoopEvent("generation_loop_started", { phase: "static", reason: "固定 Goal 并开始能力闭环检查" });
     const restoredCanonicalIR = parseCanonicalSkillIR(initialFiles);
     const restoredPlan = reconcileCapabilityPlanWithCanonicalIR(generationPlan, restoredCanonicalIR);
@@ -7968,6 +7987,7 @@ export default function Home() {
       const p0Evidence = bestBundleValidation.issues.filter((issue) => issue.priority === "P0").map((issue) => issue.message);
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "build-blocked",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -7983,6 +8003,7 @@ export default function Home() {
     if (!initialContractRepair.passed || !bestBundleValidation.contractReady || staticPolicy.priority === "P1") {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "build-blocked",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8042,6 +8063,7 @@ export default function Home() {
     if (heldOutCoverage.missing.length) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "evaluation-incomplete",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8057,6 +8079,7 @@ export default function Home() {
     if (trainCases.length < 1 || selectionCases.length < 2) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "evaluation-incomplete",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8162,6 +8185,8 @@ export default function Home() {
     });
     let acceptedPatches = 0;
     let rejectedPatches = 0;
+    let candidateEvalAttempts = 0;
+    let candidateEvalCompletions = 0;
     const rejectedHistory: Array<{
       round: number;
       reason: string;
@@ -8496,11 +8521,13 @@ export default function Home() {
       setGenerationLoop((current) => ({ ...current, phase: "validate", stopReason: `第 ${round} 轮：先运行冻结最终产物门禁；明显回退将不再触发诊断、复跑和匿名比较` }));
       let candidateHarness: HarnessReport;
       try {
+        candidateEvalAttempts += 1;
         candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 1 });
         if (comparisonNeedsStabilityRepeat(bestHarness, candidateHarness)) {
           reportClientGenerationLoopEvent("generation_loop_phase", { phase: "stability-repeat", round, reason: "候选首轮结果接近门槛或可能被接受，正在补充一次独立试跑" });
           candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 2, resumeFrom: candidateHarness });
         }
+        candidateEvalCompletions += 1;
       } catch {
         rejectedPatches += 1;
         rejectedHistory.push({ round, reason: "候选版本未完成全部诊断任务或独立保留任务", files: candidateChangedPaths });
@@ -8835,6 +8862,17 @@ export default function Home() {
     ].filter(Boolean).slice(0, 8);
     const state: GenerationLoopState = {
       ...DEFAULT_GENERATION_LOOP,
+      outcome: passed
+        ? "accepted"
+        : stableAtCeiling
+          ? "stable"
+          : acceptedPatches > 0
+            ? "accepted-with-issues"
+            : candidateEvalCompletions > 0
+              ? "evaluated-no-improvement"
+              : candidateEvalAttempts > 0
+                ? "evaluation-incomplete"
+                : "no-safe-change",
       status: passed ? "passed" : stableAtCeiling ? "stable" : "attention",
       phase: "complete",
       rounds: Math.min(GENERATION_GOAL_MAX_ROUNDS, acceptedPatches + rejectedPatches),
@@ -8854,6 +8892,8 @@ export default function Home() {
       closureScore: bestClosure.score,
       acceptedPatches,
       rejectedPatches,
+      candidateEvalAttempts,
+      candidateEvalCompletions,
       contractDigest: bestHarness.contract.digest,
       benchmarkCases: selectionCases.length,
       benchmarkRepeatsPerCase: Math.min(baselineHarness.benchmark.repeatsPerCase, bestHarness.benchmark.repeatsPerCase),
@@ -9217,7 +9257,7 @@ export default function Home() {
     beginBusy("build", "compile-skill");
     setAiGenerationIssue("");
     setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "checking", phase: "contract" });
-    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "contract", stopReason: "正在固定 Goal 与能力契约" });
+    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, outcome: "running", status: "running", phase: "contract", stopReason: "正在固定目标与能力边界" });
     try {
       if (!hasRealModel) throw new Error("模型配置已缺失，请重新连接");
       // Old sessions may contain a pre-guard blueprint. Repair it before any
@@ -9375,7 +9415,7 @@ export default function Home() {
           const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
           goalLoopError = message;
           reportClientGenerationLoopEvent("generation_loop_failed", { phase: "runtime", reason: message });
-          const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
+          const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
           setGenerationLoop(failedState);
           notifyGenerationLoopResult(failedState);
         }
@@ -9383,6 +9423,7 @@ export default function Home() {
         await durableBuild?.fail(new Error(contractRepair.failureReason));
         const blockedState: GenerationLoopState = {
           ...DEFAULT_GENERATION_LOOP,
+          outcome: "build-blocked",
           status: "attention",
           phase: "complete",
           closureScore: contractRepair.closure.score,
@@ -9422,20 +9463,20 @@ export default function Home() {
       setSelectedFile("SKILL.md");
       setRetryAction(goalLoopError ? "rerun-optimization-loop" : null);
       setToast(goalLoopError
-        ? `Skill 文件已生成，但自动优化停在：${goalLoopError}`
+        ? "Skill 文件已生成并保存，但自动测试没有完成。你可以查看记录后重新测试。"
         : unresolvedBuildIssues.length
-        ? "内部编译没有收敛，已保留当前候选并自动记录失败节点"
+        ? "Skill 文件已生成并保存，但还有结构问题需要修复。"
         : repairRounds
-          ? `已完成生成、质检和 ${repairRounds} 轮定向修复`
-          : "已完成目标拆解、循环设计和生成质检");
+          ? `Skill 已生成并通过检查，系统自动修复了 ${repairRounds} 轮问题。`
+          : "Skill 已生成并通过文件检查。");
     } catch (error) {
       await durableBuild?.fail(error);
       const message = error instanceof Error ? error.message : "AI Skill 生成失败";
       reportClientGenerationLoopEvent("generation_loop_failed", { phase: message.includes("WORKFLOW_DAG") ? "workflow-dag-preflight" : "build", reason: message });
       setAiGenerationIssue(message);
       setBuildLoop((current) => ({ ...current, status: "attention", issues: [message] }));
-      notifyGenerationLoopResult({ ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: message });
-      setToast(`${message}；没有生成模板 Skill`);
+      notifyGenerationLoopResult({ ...DEFAULT_GENERATION_LOOP, outcome: "failed", status: "attention", phase: "complete", issues: [message], stopReason: message });
+      setToast("这次没有生成完成。你填写的内容已经保留，可以直接重试。");
     } finally {
       finishBusy();
     }
@@ -9472,16 +9513,17 @@ export default function Home() {
         frozen: !buildIssues.length,
       });
       setRetryAction(result.state.status === "passed" ? null : "rerun-optimization-loop");
-      setToast(result.state.status === "passed" ? "Optimization Loop 已完成并通过回归门控" : result.state.stopReason);
+      const resultCopy = generationResultCopy({ outcome: result.state.outcome, issueCount: result.state.issues.length, lift: result.state.lift });
+      setToast(resultCopy.body);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
       reportClientGenerationLoopEvent("generation_loop_failed", { phase: "runtime", reason: message });
-      const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
+      const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
       setGenerationLoop(failedState);
       notifyGenerationLoopResult(failedState);
       setAiGenerationIssue(message);
       setRetryAction("rerun-optimization-loop");
-      setToast(`${message}；当前 Skill 文件没有被覆盖`);
+      setToast("测试没有完成，当前 Skill 文件仍然保留。请查看记录后重试。");
     } finally {
       optimizationRunInFlight.current = false;
       finishBusy();
@@ -10092,7 +10134,7 @@ export default function Home() {
         } catch (error) {
           const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
           reportClientGenerationLoopEvent("generation_loop_failed", { phase: "repair-handoff", reason: message });
-          setGenerationLoop((current) => ({ ...current, status: "attention", phase: "complete", issues: [message], stopReason: `文件契约已修复，但自动优化停在：${message}` }));
+          setGenerationLoop((current) => ({ ...current, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `文件契约已修复，但自动优化停在：${message}` }));
           setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "passed", phase: "frozen", frozen: true });
           setRetryAction("rerun-optimization-loop");
           setToast(`文件交付契约已自动补齐；Optimization Loop 可从当前文件继续：${message}`);
@@ -11414,11 +11456,11 @@ export default function Home() {
               )}
               <section className={`build-loop-result ${buildLoop.status}`} aria-label="Build Loop 结果">
                 <div className="build-loop-copy">
-                  <span>BUILD LOOP · 负责生成并冻结初始架构</span>
-                  <strong>{gateOutcomes.build.verdict === "satisfied" ? "确定性结构验证完成，初始架构已冻结" : buildLoop.status === "attention" ? "Build Loop 仍有结构问题" : "正在从需求生成初始 Bundle"}</strong>
-                  <p>{gateOutcomes.build.verdict === "satisfied" ? "这只证明语法、路径与跨文件契约可复现地成立，不代表实际任务效果已经验证。" : buildLoop.issues[0] || "需求 → Capability → Bundle"}</p>
+                  <span>生成文件检查</span>
+                  <strong>{gateOutcomes.build.verdict === "satisfied" ? "文件结构检查通过" : buildLoop.status === "attention" ? "生成文件需要修复" : "正在生成并检查文件"}</strong>
+                  <p>{gateOutcomes.build.verdict === "satisfied" ? "文件结构、引用路径和步骤衔接都已检查，可以开始真实任务测试。这里只说明文件可以运行，不代表效果一定更好。" : buildLoop.issues[0] ? friendlyReleaseBlocker(buildLoop.issues[0]) : "系统正在把你的需求整理成可以运行的 Skill 文件。"}</p>
                 </div>
-                <div className="gate-evidence-strip"><span>证据类型</span><strong>本地确定性检查</strong><em>{gateOutcomes.build.sampleSize} 项 · 可复现</em></div>
+                <div className="gate-evidence-strip"><span>检查方式</span><strong>自动结构检查</strong><em>{gateOutcomes.build.sampleSize} 项 · 可重复检查</em></div>
                 <div className="build-loop-flow">
                   {BUILD_LOOP_STEPS.map((label, index) => {
                     const reachedIndex = buildLoop.frozen ? BUILD_LOOP_STEPS.length - 1 : BUILD_LOOP_PHASE_INDEX[buildLoop.phase];
@@ -11427,17 +11469,17 @@ export default function Home() {
                   })}
                 </div>
               </section>
-              <section className={`generation-loop-result ${optimizationStableAtCeiling || optimizationCompletedWithRollback ? "completed" : generationLoop.status}`} aria-label="Optimization Loop 结果">
+              <section className={`generation-loop-result ${generationCopy.tone}`} aria-label="自动测试与优化结果">
                 <div className="generation-loop-head">
-                  <div><span>{optimizationBlockedByBuild ? "BUILD CONTRACT REPAIR · 先修复再评测" : "OPTIMIZATION LOOP · 只做有证据的局部优化"}</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationStableAtCeiling ? "评测已完成，当前版本处于稳定上限" : optimizationCompletedWithRollback ? "评测已完成，已保留当前最佳版本" : optimizationBlockedByBuild ? "初始 Bundle 尚未通过契约检查" : generationLoop.status === "attention" ? "Optimization Loop 需要处理" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{optimizationStableAtCeiling ? "无 Skill 与当前版本都达到评测上限，保留任务全部通过。候选没有证明额外提升，系统已自动回滚并保留当前最佳版本。" : optimizationCompletedWithRollback ? "候选已完成真实试跑，但没有稳定优于当前版本，因此系统自动回滚候选。当前最佳版本没有被失败修改覆盖。" : generationLoop.stopReason}</p></div>
+                  <div><span>{optimizationBlockedByBuild ? "生成前检查" : "自动测试与优化"}</span><strong>{generationCopy.panelTitle}</strong><p>{generationCopy.panelBody}</p></div>
                   <div className="generation-loop-actions">
-                    <em>{gateOutcomes.optimization.verdict === "satisfied" ? "✓ 已接受" : optimizationStableAtCeiling ? "✓ 已保留最佳版" : optimizationCompletedWithRollback ? "✓ 已安全回滚" : optimizationBlockedByBuild ? "未启动" : generationLoop.status === "attention" ? "需处理" : generationLoop.status === "running" ? "执行中" : "未运行"}</em>
-                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在处理…" : optimizationBlockedByBuild ? "继续修复 Bundle" : optimizationCompletedWithRollback ? "再次尝试优化" : "重跑 Optimization Loop"}</button>}
+                    <em>{generationCopy.badge}</em>
+                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在处理…" : generationCopy.action}</button>}
                   </div>
                 </div>
                 {optimizationBlockedByBuild
-                  ? <div className="optimization-waiting-note">真实试跑尚未开始；当前只显示 Build Loop 的待修复原因，不提前展示评分、Lift 或 held-out 证据。</div>
-                  : generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>证据类型</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "重复 held-out 比较" : "单次 held-out 观察"}</strong><em>{generationLoop.benchmarkCases} 个冻结场景 · 每个版本每场景 {generationLoop.benchmarkRepeatsPerCase} 次</em></div>}
+                  ? <div className="optimization-waiting-note">真实任务测试还没有开始。先修复上面的生成文件问题，修好后系统会继续测试。</div>
+                  : generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>测试依据</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "多次独立测试" : "单次独立测试"}</strong><em>{generationLoop.benchmarkCases} 个固定场景 · 每个版本每场景 {generationLoop.benchmarkRepeatsPerCase} 次</em></div>}
                 {!optimizationBlockedByBuild && <div className="generation-loop-flow optimization-loop-flow">
                   {OPTIMIZATION_LOOP_STEPS.map((label, index) => {
                     const reachedIndex = generationLoop.status === "passed" || generationLoop.minimalityChecked
@@ -11454,16 +11496,16 @@ export default function Home() {
                   })}
                 </div>}
                 {generationLoop.status !== "idle" && !optimizationBlockedByBuild && <div className="generation-loop-metrics">
-                  <div><span>独立评分 · 普通 AI</span><strong>{generationLoop.benchmarkRuns ? generationLoop.baselineScore : "—"}</strong></div>
-                  <div><span>独立评分 · 当前 Skill</span><strong>{generationLoop.benchmarkRuns ? generationLoop.bestScore : "—"}</strong></div>
-                  <div className={generationLoop.lift > 0 ? "positive" : ""}><span>独立评分 Lift</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.lift >= 0 ? "+" : ""}${generationLoop.lift}` : "—"}</strong></div>
-                  <div><span>冻结断言通过率</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.passRate}%` : "—"}</strong></div>
-                  <div><span>冻结场景正式总分</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.baselineQualityScore} / ${generationLoop.bestQualityScore}` : "—"}</strong></div>
-                  <div><span>匿名 A/B 结果</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 胜" : generationLoop.blindWinner === "baseline" ? "普通 AI 胜" : generationLoop.blindWinner === "tie" ? "两者持平" : "—"}</strong></div>
-                  <div><span>试跑设计</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkCases} 场景 × 每版 ${generationLoop.benchmarkRepeatsPerCase} 次` : "—"}</strong></div>
-                  <div><span>重复运行稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? `Skill σ ${generationLoop.bestStddev} · 基线 σ ${generationLoop.baselineStddev ?? "—"}` : "未测（每场景仅 1 次）"}</strong></div>
+                  <div><span>未使用 Skill 的得分</span><strong>{generationLoop.benchmarkRuns ? generationLoop.baselineScore : "—"}</strong></div>
+                  <div><span>当前 Skill 的得分</span><strong>{generationLoop.benchmarkRuns ? generationLoop.bestScore : "—"}</strong></div>
+                  <div className={generationLoop.lift > 0 ? "positive" : ""}><span>使用 Skill 后提升</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.lift >= 0 ? "+" : ""}${generationLoop.lift}` : "—"}</strong></div>
+                  <div><span>关键要求通过率</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.passRate}%` : "—"}</strong></div>
+                  <div><span>对照评分（普通 AI / Skill）</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.baselineQualityScore} / ${generationLoop.bestQualityScore}` : "—"}</strong></div>
+                  <div><span>盲测结果</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 更好" : generationLoop.blindWinner === "baseline" ? "普通 AI 更好" : generationLoop.blindWinner === "tie" ? "两者接近" : "—"}</strong></div>
+                  <div><span>测试规模</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkCases} 个场景 × 每版 ${generationLoop.benchmarkRepeatsPerCase} 次` : "—"}</strong></div>
+                  <div><span>结果稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? `Skill 波动 ${generationLoop.bestStddev} · 普通 AI 波动 ${generationLoop.baselineStddev ?? "—"}` : "每个场景只测了 1 次"}</strong></div>
                 </div>}
-                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{optimizationStableAtCeiling ? `查看 ${generationLoop.issues.length} 条比较说明` : optimizationCompletedWithRollback ? `查看 ${generationLoop.issues.length} 条未采纳证据` : `查看仍需观察的 ${generationLoop.issues.length} 项`}</summary><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
+                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{generationCopy.issueLabel}</summary><p>这些是测试记录，不一定代表不同问题；同一问题可能有多条证据。</p><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
               </section>
               <div className="editor-shell">
                 <div className="file-tree">
