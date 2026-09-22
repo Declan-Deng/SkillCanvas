@@ -410,6 +410,38 @@ test("explicit checkpoint tokens in step prose become real dependencies", () => 
   assert.ok(checked.steps.find((step) => step.id === "write-draft").requires.includes("$supplemented_inputs"));
 });
 
+test("checkpoint control markers and optional file availability do not become business dependencies", async () => {
+  const hostFile = {
+    id: "host-file-workspace", kind: "builtin-tool", input: "用户授权范围内的文件路径和任务要求",
+    output: "可验证的文件内容或明确的文件变更", fallback: "只给出可复制文本",
+    requirement: "按任务读取、创建、修改和检查本地文件", purpose: "处理真实文件",
+    routingCondition: "任务明确涉及已有文件、项目目录或文件交付时", optional: true,
+    scope: "conditional", affects: ["output-contract"],
+  };
+  const context = {
+    capabilities: [cap("core", "llm", "Customer message", "Reply draft"), hostFile], inputs: [], workflowSteps: [
+      node("resolve", ["$request", "$source"], ["$customer_email", "$order_status"]),
+      { ...node("missing-email", ["$input_required"], ["$input_required"], "await-input"), input: "$input_required", resumeProduces: ["$customer_email"] },
+      { ...node("draft", ["$customer_email"], ["$draft_reply"]), input: "$customer_email、$order_status" },
+      { ...node("deliver-draft", ["$draft_reply"], ["$output"], "deliver"), delivers: ["$draft_reply"] },
+      { ...node("confirm", ["$output"], ["$approval_required"], "await-approval"), input: "$approval_required", resumeProduces: ["$confirmed"] },
+      node("formalize", ["$draft_reply", "$confirmed"], ["$formal_reply"]),
+      { ...node("deliver-formal", ["$formal_reply"], ["$output"], "deliver"), delivers: ["$formal_reply"] },
+    ],
+  };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  const missing = checked.steps.find((step) => step.id === "missing-email");
+  assert.ok(!missing.requires.includes("$input_required"));
+  const confirm = checked.steps.find((step) => step.id === "confirm");
+  assert.ok(!confirm.requires.includes("$output"));
+  assert.ok(confirm.requires.includes("$draft_reply"));
+  assert.ok(!checked.steps.some((step) => step.id === "step-capability-host-file-workspace"));
+  assert.ok(checked.steps.some((step) => step.availableCapabilityIds?.includes("host-file-workspace")));
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("control markers and optional host tools bind deterministically"));
+  assert.equal(repaired.attempts, 0);
+});
+
 test("alternative terminal deliveries may close the same declared state without a fake cross-branch edge", async () => {
   const context = {
     capabilities: [cap("core", "llm", "Brief", "Draft")], inputs: [], stateFields: ["draftDelivered"], workflowSteps: [

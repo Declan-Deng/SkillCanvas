@@ -255,8 +255,14 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
         continue;
       }
     }
-    const persist = /artifact-output|file-output/.test((item.affects || []).join(" "))
-      || (!isOptionalToolAvailability(item) && /(?:保存|写入|导出|save|write|export).{0,24}(?:文件|file|artifact|pdf|docx|csv)/i.test(`${item.requirement} ${item.output}`));
+    // A catalog capability that is explicitly optional is runtime
+    // availability, even if it *can* write files. The artifact compiler turns
+    // it into optional=false when this particular task really promises a file;
+    // only that required form becomes a persist node.
+    const persist = !isOptionalToolAvailability(item) && (
+      /artifact-output|file-output/.test((item.affects || []).join(" "))
+      || /(?:保存|写入|导出|save|write|export).{0,24}(?:文件|file|artifact|pdf|docx|csv)/i.test(`${item.requirement} ${item.output}`)
+    );
     const step: WorkflowDagStep = {
       id: `step-capability-${item.id}`, capabilityIds: [item.id], when: item.activationCondition || item.routingCondition || "执行相关任务时",
       input: item.input, action: item.purpose || item.requirement || item.id, output: item.output, fallback: item.fallback,
@@ -403,7 +409,11 @@ export function compileWorkflowDag(steps: WorkflowDagStep[], initialInputs: stri
   const indegree = new Map(steps.map((step) => [step.id, 0]));
   const outgoing = new Map(steps.map((step) => [step.id, new Set<string>()]));
   for (const step of steps) {
+    const pause = pauseTerminalForStep(step);
     for (const token of step.input.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || []) {
+      // A checkpoint may name its own emitted pause marker as the UI/control
+      // input. It is not business data and must not create a self-dependency.
+      if (token === pause) continue;
       if (!step.requires.some((dependency) => dependency === token || token.startsWith(`${dependency}.`))) issues.push({ type: "unmet-dependency", stepId: step.id, dependency: token, message: `Workflow step ${step.id} 读取 ${token}，但 requires[] 未声明该输入` });
     }
     for (const target of step.mutates) {

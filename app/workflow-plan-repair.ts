@@ -267,6 +267,47 @@ function bindDeclaredStateReads(steps: WorkflowDagStep[], stateFields: string[])
   });
 }
 
+/** Pause markers and completion markers are runtime control signals, not
+ * business payloads. Models sometimes serialize a checkpoint as reading its
+ * own `$input_required`/`$approval_required`, or make it depend on `$output`
+ * to mean "after the draft was shown". Remove the self-read and, when the
+ * upstream hand-off is unambiguous, replace `$output` with the actual artifact
+ * that was handed off. A delivery that depends on this checkpoint's future
+ * reply is downstream and can never be that upstream hand-off. */
+function bindCheckpointControlEdges(steps: WorkflowDagStep[]) {
+  const owners = new Map<string, WorkflowDagStep[]>();
+  for (const step of steps) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    owners.set(token, [...(owners.get(token) || []), step]);
+  }
+  const dependsOnReply = (step: WorkflowDagStep, replies: Set<string>, seen = new Set<string>()): boolean => {
+    if (seen.has(step.id)) return false;
+    seen.add(step.id);
+    if (step.requires.some((token) => replies.has(token))) return true;
+    return step.requires.some((token) => (owners.get(token) || []).some((owner) => owner.id !== step.id
+      && dependsOnReply(owner, replies, new Set(seen))));
+  };
+  return steps.map((step) => {
+    if (!["await-input", "await-approval"].includes(step.role || "")) return step;
+    const pause = step.role === "await-approval" ? WORKFLOW_TERMINALS.approvalRequired : WORKFLOW_TERMINALS.inputRequired;
+    let requires = step.requires.filter((token) => token !== pause);
+    if (requires.includes(WORKFLOW_TERMINALS.completed)) {
+      const replies = new Set(step.resumeProduces || []);
+      const upstreamArtifacts = steps.filter((candidate) => candidate.id !== step.id
+        && ["deliver", "persist"].includes(candidate.role || "")
+        && candidate.produces.includes(WORKFLOW_TERMINALS.completed)
+        && !dependsOnReply(candidate, replies))
+        .flatMap((candidate) => candidate.delivers || [])
+        .filter((token) => !isControlToken(token) && !isRawInputToken(token));
+      const uniqueArtifacts = [...new Set(upstreamArtifacts)];
+      if (uniqueArtifacts.length === 1) {
+        requires = requires.map((token) => token === WORKFLOW_TERMINALS.completed ? uniqueArtifacts[0] : token);
+      }
+    }
+    return requires.length === step.requires.length && requires.every((token, index) => token === step.requires[index])
+      ? step : { ...step, requires };
+  });
+}
+
 /** If prose explicitly references an exact workflow token and that token has
  * one real producer, the missing requires[] entry is a serialization omission,
  * not an ambiguous planning decision. Bind the edge without promoting the
@@ -521,6 +562,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
     return { ...step, role: step.role || before?.role || closed.role || capabilityRole as WorkflowDagStep["role"] };
   });
   steps = bindCheckpointReplyOwnership(steps);
+  steps = bindCheckpointControlEdges(steps);
   steps = bindExplicitTokenReads(steps);
   steps = bindDeclaredStateReads(steps, context.stateFields || []);
   // Undeclared fields still need a real initializer. Declared fields already

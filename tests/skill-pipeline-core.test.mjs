@@ -21,6 +21,7 @@ import {
   optimizationPolicyFor,
   pruneBundleDeterministically,
   reconcileArtifactProducerCapabilities,
+  removeUnrequestedOptionalArtifactOwnership,
   validatePatchPlan,
 } from "../app/skill-pipeline-core.ts";
 
@@ -266,6 +267,19 @@ test("semantic LLM content does not impersonate a real file producer", () => {
   assert.equal(capabilityOwnsArtifacts({ id: "web-search", kind: "builtin-tool", output: "搜索结果", affects: ["output-contract"] }), false);
   assert.equal(capabilityOwnsArtifacts({ id: "host-shell-code", kind: "builtin-tool", output: "退出状态、标准输出、测试结果或生成文件", affects: ["tool-routing"] }), false);
   assert.equal(capabilityOwnsArtifacts({ id: "csv-template", kind: "asset", output: "CSV 模板", affects: ["artifact-output"] }), false);
+});
+
+test("optional host tools cannot invent a file-delivery contract for a text-only task", () => {
+  const optionalWriter = {
+    id: "host-file-workspace", kind: "builtin-tool", optional: true, scope: "conditional",
+    affects: ["artifact-output", "output-contract"], output: "File change when explicitly requested",
+  };
+  const textOnly = removeUnrequestedOptionalArtifactOwnership([optionalWriter], false)[0];
+  assert.deepEqual(textOnly.affects, ["output-contract"]);
+  assert.equal(capabilityOwnsArtifacts(textOnly), false);
+  const fileTask = removeUnrequestedOptionalArtifactOwnership([optionalWriter], true)[0];
+  assert.deepEqual(fileTask.affects, optionalWriter.affects);
+  assert.equal(capabilityOwnsArtifacts(fileTask), true);
 });
 
 test("artifact compiler promotes one real file owner without duplicating a disabled declaration", () => {
