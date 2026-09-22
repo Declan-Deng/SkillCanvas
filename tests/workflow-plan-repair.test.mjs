@@ -368,6 +368,35 @@ test("orphaned companions remain strict when multiple delivery branches make own
   assert.ok(checked.issues.some((issue) => issue.includes("notes 没有被消费")));
 });
 
+test("declared session state and checkpoint-owned replies normalize without a repair request", async () => {
+  const context = {
+    capabilities: [cap("core", "llm", "Product facts and audience", "Draft and revision")],
+    inputs: [],
+    stateFields: ["draftStatus"],
+    workflowSteps: [
+      node("s1-read-brief", ["$request"], ["brief"]),
+      { ...node("s2-generate-draft", ["brief"], ["draft"]), mutates: ["draftStatus"] },
+      { ...node("s3-deliver-draft", ["draft"], ["draftPresented", "$draft_feedback", "$draft_approved", "$output"], "deliver"),
+        delivers: ["draft", "$draft_feedback", "$draft_approved"], mutates: ["draftStatus"] },
+      { ...node("s4-await-feedback", ["draftPresented"], ["$input_required"], "await-input"),
+        resumeProduces: ["$draft_feedback", "$draft_approved"], mutates: ["draftStatus"] },
+      { ...node("s5-revise", ["draft", "$draft_feedback", "$draft_approved"], ["revisedDraft"]), mutates: ["draftStatus"] },
+      { ...node("s6-deliver-revision", ["revisedDraft"], ["$output"], "deliver"), delivers: ["revisedDraft"], mutates: ["draftStatus"] },
+    ],
+  };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  const preview = checked.steps.find((step) => step.id === "s3-deliver-draft");
+  assert.ok(!preview.produces.includes("$draft_feedback") && !preview.produces.includes("$draft_approved"));
+  assert.deepEqual(preview.delivers, ["draft"]);
+  const checkpoint = checked.steps.find((step) => step.id === "s4-await-feedback");
+  assert.deepEqual(checkpoint.resumeProduces, ["$draft_feedback", "$draft_approved"]);
+  assert.ok(checked.steps.filter((step) => step.mutates.includes("draftStatus")).every((step) => step.requires.includes("draftStatus")));
+  assert.ok(checked.initialInputs.includes("draftStatus"));
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("declared state and reply ownership are deterministic bindings"));
+  assert.equal(repaired.attempts, 0);
+});
+
 test("invalid root producers can be corrected without deleting real task outputs", async () => {
   const draft = node("draft", ["input:material"], ["$draft"]);
   const bad = { ...node("wait", [], ["input:material", "$input_required"], "await-input"), resumeProduces: [] };

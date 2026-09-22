@@ -9,6 +9,10 @@ export type WorkflowPlanContext = {
   workflowSteps: WorkflowDagStep[];
   capabilities: WorkflowPlanCapability[];
   inputs: Array<{ id: string; name: string; required: boolean; concept?: string; representations?: string[] }>;
+  /** Runtime state declared by the capability plan. These values exist as
+   * internal session roots even before their first update; they are not user
+   * inputs and must never be invented by the graph repair model. */
+  stateFields?: string[];
 };
 
 const normalizedLabel = (value: string) => value.replace(/^(?:\$|input:|input-|custom-)+/g, "").replace(/[\s_.:\-/]+/g, "").toLowerCase();
@@ -224,6 +228,43 @@ function bindUniqueDeliveryCompanions(steps: WorkflowDagStep[], capabilities: Wo
     if (!delivery.delivers?.includes(token)) delivery.delivers?.push(token);
   }
   return next;
+}
+
+/** A token listed in resumeProduces belongs to the real user checkpoint. Some
+ * planners also put that future reply on the preceding preview/delivery node,
+ * which falsely claims that showing a draft manufactured the user's answer.
+ * The explicit checkpoint is authoritative, so remove only that duplicate
+ * ownership from ordinary producers. The reviewed artifact and all other
+ * outputs remain intact. */
+function bindCheckpointReplyOwnership(steps: WorkflowDagStep[]) {
+  const checkpointReplies = new Set(steps
+    .filter((step) => ["await-input", "await-approval"].includes(step.role || ""))
+    .flatMap((step) => step.resumeProduces || []));
+  if (!checkpointReplies.size) return steps;
+  return steps.map((step) => {
+    if (["await-input", "await-approval"].includes(step.role || "")) return step;
+    const duplicated = step.produces.filter((token) => checkpointReplies.has(token));
+    if (!duplicated.length) return step;
+    const owned = new Set(duplicated);
+    return {
+      ...step,
+      produces: step.produces.filter((token) => !owned.has(token)),
+      delivers: step.delivers?.filter((token) => !owned.has(token)),
+    };
+  });
+}
+
+/** Declared session/persistent fields are internal runtime state, not missing
+ * business artifacts. Every mutation reads the current value before writing
+ * it, so expose that dependency explicitly. Ordering still has to come from
+ * real workflow edges; the DAG compiler continues to reject unordered writes. */
+function bindDeclaredStateReads(steps: WorkflowDagStep[], stateFields: string[]) {
+  const declared = new Set(stateFields.map(String).map((value) => value.trim()).filter(Boolean));
+  if (!declared.size) return steps;
+  return steps.map((step) => {
+    const required = step.mutates.filter((token) => declared.has(token) && !step.requires.includes(token));
+    return required.length ? { ...step, requires: [...step.requires, ...required] } : step;
+  });
 }
 
 /**
@@ -463,7 +504,16 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
       ? "persist" : owners.length && owners.every((item) => item.kind === "reference" || item.kind === "asset") ? "read" : "transform";
     return { ...step, role: step.role || before?.role || closed.role || capabilityRole as WorkflowDagStep["role"] };
   });
-  steps = initializeFirstStateWrites(steps);
+  steps = bindCheckpointReplyOwnership(steps);
+  steps = bindDeclaredStateReads(steps, context.stateFields || []);
+  // Undeclared fields still need a real initializer. Declared fields already
+  // have an internal runtime root and must retain their mutation semantics.
+  const declaredState = new Set(context.stateFields || []);
+  const stateful = steps.map((step) => ({ ...step, mutates: step.mutates.filter((token) => !declaredState.has(token)) }));
+  const initialized = initializeFirstStateWrites(stateful);
+  steps = initialized.map((step, index) => ({ ...step,
+    mutates: [...new Set([...step.mutates, ...steps[index].mutates.filter((token) => declaredState.has(token))])],
+  }));
   steps = bindUniqueReadProducts(steps);
   steps = bindTerminalOnlyDeliveries(steps);
   steps = bindUnambiguousDeliveries(steps);
@@ -531,7 +581,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
 }
 
 export function inspectWorkflowPlan(context: WorkflowPlanContext) {
-  const initialInputs = ["$request", "$source", ...context.inputs.map((input) => `input:${input.id}`)];
+  const initialInputs = ["$request", "$source", ...context.inputs.map((input) => `input:${input.id}`), ...(context.stateFields || [])];
   const normalized = normalizeWorkflowPlanBindings(context);
   const bound = bindWorkflowCapabilities(normalized, context.capabilities);
   const baseline = closeWorkflowDagTerminals(bound, initialInputs);

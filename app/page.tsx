@@ -9236,6 +9236,7 @@ export default function Home() {
       workflowSteps: plan.workflowSteps,
       capabilities: plan.items.filter((item) => item.kind !== "eval" && capabilityIsActive(item)),
       inputs: deriveTaskInputContract({ idea, answers: demoAnswers, capabilityInputs: plan.items.filter((item) => item.kind === "llm").map((item) => item.input) }),
+      stateFields: plan.stateModel.needed ? plan.stateModel.fields.map((field) => field.name) : [],
     }, (workflowRepair) => callAI("workflow-repair", {
       idea, answers: interviewEvidence, outputContract: plan.outputContract, workflowRepair,
     }), ({ attempt, status, issues }) => {
