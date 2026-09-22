@@ -1,0 +1,5 @@
+# SkillCanvas executable Skill illustration
+
+Generated with built-in image_gen. Final transparent PNG; not integrated into the Hero.
+
+Create a new transparent-background PNG asset, with real alpha transparency. A premium 3D emoji illustration for “turning a vague request into an executable AI skill.” A friendly mint-green robot holds an ivory rounded square module with an orange play triangle and a green check badge. Two rounded ivory-and-mint document tabs sit behind the module. Beside the robot, a small speech bubble contains a dark green tangled cord representing a vague idea; above it a warm yellow lightbulb represents understanding. Plump sculpted emoji shapes, smooth satin clay, gentle glossy highlights, dark forest green accents, upper-left studio light, three-quarter view, compact centered composition on a square canvas. Cohesive with mint and ivory 3D emoji website illustrations. No writing, no logos, no scenery. Isolated objects, no backdrop, no floor, no colored rectangle. The entire background and gaps between objects must be transparent pixels. Output transparent PNG.
