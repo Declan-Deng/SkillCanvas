@@ -127,20 +127,18 @@ export default function ShowcasePage() {
             <a className="showcase-secondary" href={githubUrl} target="_blank" rel="noreferrer">查看源代码 <span aria-hidden="true">↗</span></a>
           </div>
         </div>
-        <figure className="showcase-hero-visual">
-          <div className="showcase-shot-frame">
-            <Image
-              src="/showcase-product-small.jpg"
-              width="960"
-              height="600"
-              alt="SkillCanvas 真实产品界面，用户可输入任务并补充资料"
-              priority
-              quality={65}
-              sizes="(max-width: 760px) calc(100vw - 40px), (max-width: 1040px) 86vw, 42vw"
-            />
-          </div>
-          <figcaption>真实产品界面</figcaption>
-        </figure>
+        <div className="showcase-hero-visual">
+          <Image
+            className="showcase-hero-workflow"
+            src="/skillcanvas-workflow-hero-emoji.png"
+            width={1254}
+            height={1254}
+            alt="机器人协同任务清单、工作流、目标和日程的 SkillCanvas 插画"
+            priority
+            sizes="(max-width: 760px) calc(100vw - 40px), (max-width: 1040px) 620px, 44vw"
+            unoptimized
+          />
+        </div>
       </header>
 
       <section className="showcase-intro" id="story">
