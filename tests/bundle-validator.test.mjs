@@ -107,6 +107,18 @@ test("P1 contract gate allows pause-resume and productive missing-input branches
   assert.equal(issues.some((issue) => issue.code === "CONTRADICTORY_ACTION_PERMISSION"), false);
 });
 
+test("P1 contract gate does not invert a negated autonomous action", () => {
+  const files = baseBundle();
+  files["references/output-contract.md"] = `# Output contract
+
+- Validation:
+- 清单输出后停下等待用户确认，未自动执行对外发送
+- 等待用户确认，并未直接发送任何消息
+`;
+  const issues = validateBundleContentCoherence(files);
+  assert.equal(issues.some((issue) => issue.code === "CONTRADICTORY_ACTION_PERMISSION"), false);
+});
+
 test("P1 separates research hypotheses from executable permission while preserving the workflow gate", () => {
   const files = baseBundle();
   const conflict = "必须先询问用户确认，同时自动处理并继续执行。";

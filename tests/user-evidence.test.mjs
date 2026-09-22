@@ -182,6 +182,10 @@ test("negated autonomous actions are prohibitions, not permission conflicts", ()
   for (const text of [
     "当两份资料冲突时，标记冲突，并列出双方原文，不自动选择，等待用户决定。",
     "禁止自主处理，必须先询问用户确认。",
+    "清单输出后停下等待用户确认，未自动执行对外发送。",
+    "等待用户确认，并未直接发送任何消息。",
+    "需要先询问用户，并避免自主继续处理。",
+    "必须先确认，不会自动完成后续动作。",
     "Do not proceed autonomously; wait for user approval.",
   ]) {
     assert.equal(hasUnscopedActionPermissionConflict(text), false, text);

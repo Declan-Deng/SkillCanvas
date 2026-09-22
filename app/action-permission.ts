@@ -7,9 +7,12 @@ import { confirmationCheckpoints, confirmationConflicts } from "./user-evidence.
 function affirmativeSignal(value: string, signal: RegExp) {
   return [...value.matchAll(new RegExp(signal.source, "gi"))].some((match) => {
     const prefix = value.slice(0, match.index).trimEnd();
-    // “不自动选择，等待用户决定” prohibits autonomy; a substring match
-    // on 自动…决定 used to invert it and trigger an endless repair loop.
-    return !/(?:不|不得|不能|不可|禁止|不要|并非|not|never)\s*$/i.test(prefix);
+    // A matched action word is not a permission when the immediately
+    // preceding phrase negates it. Keep this broader than a single “不”:
+    // generated contracts naturally use forms such as “未自动执行”,
+    // “不会直接发送” and “避免自主处理”. Misreading those as affirmative
+    // autonomy creates a false P1 blocker that no semantic rewrite can fix.
+    return !/(?:不|未|尚未|并未|没有|不得|不能|不会|不应|不可|不允许|禁止|严禁|不要|避免|防止|并非|not|never|without)\s*$/i.test(prefix);
   });
 }
 
