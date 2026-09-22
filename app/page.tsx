@@ -7,6 +7,7 @@ import { EVAL_COMPILER_VERSION, providerRepairNeedsUserAction } from "./eval-pro
 import { generationClientBudget } from "./generation-request";
 import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract, contractRepairFailureReason } from "./skill-projection-repair";
 import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases, recommendedHostCapabilityIds } from "./capability-routing";
+import { goalNeedsTaskDiscovery } from "./interview-discovery";
 import { compileKnowledgeBatches, knowledgeClientTimeout, retainKnowledgeFailure } from "./knowledge-compiler";
 import { selectKnowledgeQueries } from "./knowledge-passages";
 import { runBlueprintPlanning, type BlueprintCheckpoint } from "./blueprint-planner";
@@ -4883,7 +4884,7 @@ function serializeSourceInsights(insights: SourceInsight[]) {
   return insights.map((insight) => `## ${insight.sourceName}\n- 文档类型：${insight.documentType}\n- 使用角色：${insight.roleLabel} (${insight.role})\n- 判断依据：${insight.roleReason}\n- 资料贡献：${insight.summary}\n- 可复用特征：${insight.observableTraits.join("；")}\n- 应影响的问题：${insight.questionInfluence.join("；") || "待确认"}\n- 页码证据：${insight.evidence.join("；") || "待确认"}\n- 隐私：${insight.privacyNote}`).join("\n\n");
 }
 
-function normalizeInterviewQuestions(raw: unknown, roundIndex: number, priorEvidence = "") {
+function normalizeInterviewQuestions(raw: unknown, roundIndex: number, priorEvidence = "", forceTaskDiscovery = false) {
   if (!Array.isArray(raw)) return [];
   const roundMeta = INTERVIEW_ROUND_META[roundIndex];
   const candidates = raw.filter((item) => {
@@ -4907,9 +4908,11 @@ function normalizeInterviewQuestions(raw: unknown, roundIndex: number, priorEvid
     // asks for one. The prompt requires the safest recommendation to be the
     // first option, so the normalizer can recover without losing the beginner
     // experience or guessing outside the model-proposed choices.
-    const recommendedOption = typeof value.recommendedOption === "string" && options.includes(value.recommendedOption) && !optionConflictsWithPriorEvidence(value.recommendedOption, priorEvidence)
-      ? value.recommendedOption
-      : options.find((option) => option !== UNSURE_OPTION && !optionConflictsWithPriorEvidence(option, priorEvidence));
+    const recommendedOption = forceTaskDiscovery
+      ? UNSURE_OPTION
+      : typeof value.recommendedOption === "string" && options.includes(value.recommendedOption) && !optionConflictsWithPriorEvidence(value.recommendedOption, priorEvidence)
+        ? value.recommendedOption
+        : options.find((option) => option !== UNSURE_OPTION && !optionConflictsWithPriorEvidence(option, priorEvidence));
     return {
       id: `ai-round-${roundIndex + 1}-question-${index + 1}`,
       dimension,
@@ -7219,7 +7222,7 @@ export default function Home() {
       setBusyPhaseIndex(2);
       const result = await callAI<{ interpretation?: string; preview?: unknown; questions?: unknown; readiness?: unknown }>("preview", { idea, sourceText: liveContext });
       setBusyPhaseIndex(3);
-      const generatedQuestions = normalizeInterviewQuestions(result.questions, 0);
+      const generatedQuestions = normalizeInterviewQuestions(result.questions, 0, "", goalNeedsTaskDiscovery(idea));
       const generatedPreview = normalizeDiscoveryPreview(result.preview);
       if (generatedQuestions.length !== INTERVIEW_ROUND_META[0].dimensions.length) throw new Error("模型没有返回完整的动态理解问题");
       if (!generatedPreview) throw new Error("模型没有完成可供判断的第一版理解预演");

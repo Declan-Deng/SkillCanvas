@@ -274,6 +274,26 @@ test("a missing-input branch does not replace normal delivery of an already prod
   assert.ok(delivery.produces.includes("$output"));
 });
 
+test("a resumed raw input is not protected as a business deliverable during graph repair", async () => {
+  const context = { capabilities: [cap("core", "llm", "Request", "Organized result")], inputs: [{ id: "input-custom-adjustment", name: "用户补充的调整要求", required: false }], workflowSteps: [
+    node("organize", ["$request"], ["organizedResult"]),
+    { ...node("revise-result", ["organizedResult"], ["$input_required"], "await-input"), resumeProduces: ["input:input-custom-adjustment"] },
+    node("polish-result", ["missingDraft"], ["finalResult"]),
+  ] };
+  assert.equal(inspectWorkflowPlan(context).valid, false);
+  const result = await repairWorkflowPlan(context, async () => ({
+    stepUpdates: [
+      { id: "revise-result", changes: { resumeProduces: ["$feedback"] } },
+      { id: "polish-result", changes: { requires: ["organizedResult"] } },
+    ],
+    addedSteps: [{ ...node("deliver-result", ["finalResult"], ["$output"], "deliver"), delivers: ["finalResult"] }],
+  }));
+  assert.equal(result.attempts, 1);
+  assert.equal(result.workflowSteps.find((step) => step.id === "revise-result").role, "await-input");
+  assert.ok(!result.workflowSteps.some((step) => step.produces.includes("input:input-custom-adjustment") || step.resumeProduces?.includes("input:input-custom-adjustment")));
+  assert.ok(result.workflowSteps.some((step) => step.produces.includes("$output")));
+});
+
 test("a declared deterministic format test is bound to its real step and its receipt gates delivery", async () => {
   const context = { capabilities: [
     cap("core", "llm", "Weekly notes", "Weekly report"),
