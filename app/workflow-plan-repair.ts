@@ -267,6 +267,22 @@ function bindDeclaredStateReads(steps: WorkflowDagStep[], stateFields: string[])
   });
 }
 
+/** If prose explicitly references an exact workflow token and that token has
+ * one real producer, the missing requires[] entry is a serialization omission,
+ * not an ambiguous planning decision. Bind the edge without promoting the
+ * value to a raw input or asking a model to rename either side. */
+function bindExplicitTokenReads(steps: WorkflowDagStep[]) {
+  const owners = new Map<string, WorkflowDagStep | null>();
+  for (const step of steps) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    owners.set(token, owners.has(token) ? null : step);
+  }
+  return steps.map((step) => {
+    const mentioned = (`${step.input} ${step.when}`.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || [])
+      .filter((token) => owners.get(token) && owners.get(token)?.id !== step.id && !step.requires.includes(token));
+    return mentioned.length ? { ...step, requires: [...step.requires, ...new Set(mentioned)] } : step;
+  });
+}
+
 /**
  * Close deterministic wiring omissions after capability binding. Model plans
  * commonly describe validators in prose but omit their exact edges, or use a
@@ -505,6 +521,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
     return { ...step, role: step.role || before?.role || closed.role || capabilityRole as WorkflowDagStep["role"] };
   });
   steps = bindCheckpointReplyOwnership(steps);
+  steps = bindExplicitTokenReads(steps);
   steps = bindDeclaredStateReads(steps, context.stateFields || []);
   // Undeclared fields still need a real initializer. Declared fields already
   // have an internal runtime root and must retain their mutation semantics.

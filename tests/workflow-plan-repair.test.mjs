@@ -397,6 +397,36 @@ test("declared session state and checkpoint-owned replies normalize without a re
   assert.equal(repaired.attempts, 0);
 });
 
+test("explicit checkpoint tokens in step prose become real dependencies", () => {
+  const context = {
+    capabilities: [cap("core", "llm", "Brief", "Draft")], inputs: [], workflowSteps: [
+      { ...node("ask-for-details", ["$request"], ["$input_required"], "await-input"), resumeProduces: ["$supplemented_inputs"] },
+      { ...node("write-draft", ["$request"], ["draft"]), input: "$request and $supplemented_inputs" },
+      { ...node("deliver-draft", ["draft"], ["$output"], "deliver"), delivers: ["draft"] },
+    ],
+  };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  assert.ok(checked.steps.find((step) => step.id === "write-draft").requires.includes("$supplemented_inputs"));
+});
+
+test("alternative terminal deliveries may close the same declared state without a fake cross-branch edge", async () => {
+  const context = {
+    capabilities: [cap("core", "llm", "Brief", "Draft")], inputs: [], stateFields: ["draftDelivered"], workflowSteps: [
+      node("write-draft", ["$request"], ["draft"]),
+      { ...node("deliver-original", ["draft"], ["$output"], "deliver"), delivers: ["draft"], mutates: ["draftDelivered"] },
+      { ...node("await-feedback", ["draft"], ["$input_required"], "await-input"), resumeProduces: ["$feedback"] },
+      node("revise-draft", ["draft", "$feedback"], ["revisedDraft"]),
+      { ...node("deliver-revised", ["revisedDraft"], ["$output"], "deliver"), delivers: ["revisedDraft"], mutates: ["draftDelivered"] },
+    ],
+  };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  assert.ok(checked.steps.filter((step) => step.mutates.includes("draftDelivered")).every((step) => step.requires.includes("draftDelivered")));
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("conditional terminal state writes are already explicit"));
+  assert.equal(repaired.attempts, 0);
+});
+
 test("invalid root producers can be corrected without deleting real task outputs", async () => {
   const draft = node("draft", ["input:material"], ["$draft"]);
   const bad = { ...node("wait", [], ["input:material", "$input_required"], "await-input"), resumeProduces: [] };

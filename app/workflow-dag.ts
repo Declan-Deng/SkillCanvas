@@ -451,9 +451,15 @@ export function compileWorkflowDag(steps: WorkflowDagStep[], initialInputs: stri
     seen.add(from);
     return [...(outgoing.get(from) || [])].some((next) => next === to || precedes(next, to, seen));
   };
+  const isTerminalBranch = (step: WorkflowDagStep) => ["deliver", "persist"].includes(step.role || "")
+    && step.produces.some((token) => terminalOutputSet.has(token));
   for (const writer of steps) for (const token of writer.mutates) {
     for (const other of steps) {
       if (other.id === writer.id || (!other.requires.includes(token) && !other.mutates.includes(token))) continue;
+      // Multiple terminal producers are conditional branch endings by
+      // contract. Their final state writes belong to those same alternatives,
+      // so they do not need an artificial cross-branch dependency.
+      if (other.mutates.includes(token) && isTerminalBranch(writer) && isTerminalBranch(other)) continue;
       if (!precedes(writer.id, other.id) && !precedes(other.id, writer.id)) issues.push({
         type: "unordered-mutation", stepId: writer.id, dependency: token,
         message: `${writer.id} 与 ${other.id} 对 ${token} 存在未排序的读写/写写冲突；请用产生的版本或完成令牌声明先后依赖`,
