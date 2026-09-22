@@ -338,6 +338,36 @@ test("orphaned outputs from one reader feed the unique root semantic transform",
   assert.equal(repaired.attempts, 0);
 });
 
+test("a unique delivery retains every orphaned companion artifact without model repair", async () => {
+  const context = { capabilities: [cap("core", "llm", "Tasks and constraints", "Weekly plan")], inputs: [], workflowSteps: [
+    { ...node("step-parse-input", ["$request"], ["parsedTasks", "unavailableSlots", "missingFlags"]), capabilityIds: ["core"] },
+    { ...node("step-estimate-duration", ["parsedTasks"], ["estimatedTasks", "estimateNotes"]), capabilityIds: ["core"] },
+    { ...node("step-schedule", ["estimatedTasks"], ["draftPlan", "conflictCandidates"]), capabilityIds: ["core"] },
+    { ...node("step-deliver", ["draftPlan"], ["$output"], "deliver", ["core"]), delivers: ["draftPlan"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  const delivery = checked.steps.find((step) => step.id === "step-deliver");
+  for (const token of ["unavailableSlots", "missingFlags", "estimateNotes", "conflictCandidates"]) {
+    assert.ok(delivery.requires.includes(token), `${token} must gate the final hand-off`);
+    assert.ok(delivery.delivers.includes(token), `${token} must remain observable instead of disappearing`);
+  }
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("unique companion wiring must not spend a model request"));
+  assert.equal(repaired.attempts, 0);
+});
+
+test("orphaned companions remain strict when multiple delivery branches make ownership ambiguous", () => {
+  const context = { capabilities: [cap("core", "llm", "Request", "Report")], inputs: [], workflowSteps: [
+    { ...node("analyze", ["$request"], ["draft", "notes"]), capabilityIds: ["core"] },
+    { ...node("deliver-draft", ["draft"], ["$output"], "deliver", ["core"]), delivers: ["draft"] },
+    { ...node("revise", ["draft", "$feedback"], ["revision"]), capabilityIds: ["core"] },
+    { ...node("deliver-revision", ["revision"], ["$output"], "deliver", ["core"]), delivers: ["revision"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, false);
+  assert.ok(checked.issues.some((issue) => issue.includes("notes 没有被消费")));
+});
+
 test("invalid root producers can be corrected without deleting real task outputs", async () => {
   const draft = node("draft", ["input:material"], ["$draft"]);
   const bad = { ...node("wait", [], ["input:material", "$input_required"], "await-input"), resumeProduces: [] };

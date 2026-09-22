@@ -184,6 +184,49 @@ function stepUsesDeterministicGate(step: WorkflowDagStep, capabilities: Map<stri
 }
 
 /**
+ * A planner may split one task result into a primary artifact plus companion
+ * facts (warnings, estimates, conflicts, provenance, and similar metadata),
+ * then wire only the primary artifact into the final hand-off. When there is
+ * exactly one delivery path, those otherwise-orphaned companion facts have one
+ * lossless destination: the same hand-off. This is data wiring, not a new task
+ * operation. Ambiguous multi-delivery graphs stay strict and go through the
+ * targeted repair loop.
+ */
+function bindUniqueDeliveryCompanions(steps: WorkflowDagStep[], capabilities: WorkflowPlanCapability[]) {
+  const next = steps.map((step) => ({
+    ...step,
+    requires: [...step.requires],
+    delivers: [...(step.delivers || [])],
+  }));
+  const deliveries = next.filter((step) => ["deliver", "persist"].includes(step.role || ""));
+  if (deliveries.length !== 1) return next;
+
+  const [delivery] = deliveries;
+  const capabilityById = new Map(capabilities.map((item) => [item.id, item]));
+  const consumed = new Set(next.flatMap((step) => [
+    ...step.requires,
+    ...step.mutates,
+    ...(step.delivers || []),
+  ]));
+  const companions = next.flatMap((step) => {
+    // Auto-created capability helpers are routed/folded by
+    // bindWorkflowCapabilities. Treating their disconnected output as a final
+    // user deliverable would hide a genuinely missing tool route.
+    if (step.id === delivery.id || step.id.startsWith("step-capability-") || stepLooksLikeGate(step, capabilityById)) return [];
+    return step.produces.filter((token) => !consumed.has(token)
+      && !isControlToken(token)
+      && !isRawInputToken(token)
+      && !token.startsWith("capability:"));
+  });
+
+  for (const token of new Set(companions)) {
+    if (!delivery.requires.includes(token)) delivery.requires.push(token);
+    if (!delivery.delivers?.includes(token)) delivery.delivers?.push(token);
+  }
+  return next;
+}
+
+/**
  * Close deterministic wiring omissions after capability binding. Model plans
  * commonly describe validators in prose but omit their exact edges, or use a
  * pause branch as the only apparent ending. This pass never invents a task
@@ -424,6 +467,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
   steps = bindUniqueReadProducts(steps);
   steps = bindTerminalOnlyDeliveries(steps);
   steps = bindUnambiguousDeliveries(steps);
+  steps = bindUniqueDeliveryCompanions(steps, context.capabilities);
   steps = orderUniqueStateHandoffs(steps);
   steps = scopeCheckpointReplies(steps);
   steps = scopeDeliveredVersions(steps);
