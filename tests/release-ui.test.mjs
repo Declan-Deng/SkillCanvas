@@ -33,16 +33,16 @@ test("shared material field renders a keyboard-accessible upload button, icon an
   assert.doesNotMatch(html, /<label/);
 });
 
-test("all four reference types and both interview examples use the same upload component and preserve their roles", async () => {
+test("all four reference types and the final freeform note preserve their upload role", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(page, /CONTEXT_FIELDS\.filter[\s\S]*?<MaterialInput[\s\S]*?handleContextSources\(event, field.id\)/);
-  for (const field of ["idealOutput", "negativeOutput"]) assert.match(page, new RegExp(`handleContextSources\\(event, "${field}"\\)`));
+  assert.match(page, /handleContextSources\(event, "background"\)/);
   const handler = page.slice(page.indexOf("async function handleContextSources"), page.indexOf("function updateSourceRole"));
   assert.match(handler, /\[fieldId\]: appended.text/);
   assert.doesNotMatch(handler, /setSourceText|setSourceInsights/);
-  assert.match(page, /再给AI一点材料 <b className="optional-tag">可选<\/b>/);
-  assert.doesNotMatch(page, /告诉 AI 什么样才算对/);
-  assert.match(page, /disabled=\{busy \|\| materialsLoading\}/);
+  assert.match(page, /还有什么想说的吗/);
+  assert.match(page, /可以补充你的背景，你不喜欢的，或者选项里面不完整的内容，或者任何你想写的/);
+  assert.match(page, /className="final-note-card"/);
 });
 
 test("release presentation hides success noise without disabling blockers", async () => {
@@ -66,7 +66,9 @@ test("question toggle shares tag dimensions, capability heading has an icon, and
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(css, /\.question-meta\s*\{[^}]*--question-tag-height: 20px;/);
-  assert.match(css, /\.question-meta b,\s*\.question-meta i,\s*\.question-multiple-toggle\s*\{[^}]*font-size: 8\.75px;[^}]*height: var\(--question-tag-height\);[^}]*padding: 0 6px;/);
+  assert.match(css, /\.question-meta i,\s*\.question-multiple-toggle\s*\{[^}]*font-size: 8\.75px;[^}]*height: var\(--question-tag-height\);[^}]*padding: 0 6px;/);
+  assert.match(page, /className="question-index"[\s\S]*?className="question-number"[\s\S]*?className="question-dimension"/);
+  assert.match(css, /\.question-index\s*\{[^}]*display: grid;[^}]*gap: 9px;/);
   assert.doesNotMatch(css, /\.question-multiple-toggle\s*\{[^}]*min-height:/);
   assert.match(css, /\.question-multiple-toggle::after\s*\{[^}]*inset: -12px -4px;/);
   assert.match(page, /className="capability-library-title"><img src="\/icons\/tabler\/plug.svg" alt="" aria-hidden="true" \/>添加能力/);

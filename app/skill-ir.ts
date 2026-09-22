@@ -1235,7 +1235,7 @@ export function compileSkillIR(input: {
     },
     traceability: [],
   };
-  return bindSkillIREvals(reconcileSkillIRContentPermission(ir, input.answers), "");
+  return reconcileSkillIRStateLoops(bindSkillIREvals(reconcileSkillIRContentPermission(ir, input.answers), ""));
 }
 
 function yamlString(value: string) {
@@ -1880,6 +1880,29 @@ export function skillIRDigest(ir: SkillIR) {
   return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
+/** Longitudinal control is meaningful only when the canonical state contract
+ * actually provides persistent fields, update rules and expiry semantics.
+ * Keep this invariant at the IR boundary so restores, repairs and projections
+ * cannot reintroduce a stale model-authored loop. */
+export function reconcileSkillIRStateLoops(ir: SkillIR): SkillIR {
+  const state = ir.stateRequirement || {};
+  const persistent = state.needed === true && state.scope === "persistent";
+  const scopes = Array.isArray(ir.controlModel?.scopes) ? ir.controlModel.scopes as Array<Record<string, unknown>> : [];
+  const reconciledScopes = persistent ? scopes : scopes.filter((scope) => scope.scope !== "longitudinal");
+  if (reconciledScopes.length === scopes.length) return ir;
+  const escalation = Array.isArray(ir.controlModel?.escalationConditions)
+    ? ir.controlModel.escalationConditions.map(String)
+    : [];
+  return {
+    ...ir,
+    controlModel: {
+      ...ir.controlModel,
+      scopes: reconciledScopes,
+      escalationConditions: [...new Set([...escalation, "跨会话继续时，请用户重新提供必要状态；当前 Skill 不承诺自动恢复历史状态"])],
+    },
+  };
+}
+
 /** One freeze boundary for every deterministic semantic projection. Compile
  * from the persisted shape, never from a subtly different in-memory object.
  * Caller-owned implementations and source evidence are left untouched. */
@@ -1888,7 +1911,7 @@ export function projectSkillIRFiles(ir: SkillIR, files: Record<string, string> =
   // validator. This is intentionally deterministic: never ask a repair model
   // to edit compiler-owned Capability Delta rationale.
   const normalizedDelta = normalizeCapabilityDelta(ir.capabilityDelta);
-  const normalizedIR: SkillIR = {
+  const normalizedIR: SkillIR = reconcileSkillIRStateLoops({
     ...ir,
     capabilityDelta: normalizedDelta,
     knowledgeAssessment: normalizeKnowledgeAssessment(
@@ -1897,7 +1920,7 @@ export function projectSkillIRFiles(ir: SkillIR, files: Record<string, string> =
       normalizedDelta.skillMustTeach.length > 0,
       normalizedDelta.skillMustTeach.map((gap) => gap.id),
     ),
-  };
+  });
   const persistedIR = JSON.parse(JSON.stringify(normalizedIR)) as SkillIR;
   const projections: Record<string, string> = {
     "evals/capability-manifest.json": JSON.stringify(projectCapabilityManifest(persistedIR), null, 2),

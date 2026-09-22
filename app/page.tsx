@@ -13,12 +13,14 @@ import { runBlueprintPlanning, type BlueprintCheckpoint } from "./blueprint-plan
 import { HOST_FILE_WORKSPACE_CAPABILITY } from "./host-file-capability";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "./bundle-resource-repair";
 import { validateImplementationFiles } from "./canonical-mutations";
+import { generationResultCopy, type GenerationLoopOutcome } from "./generation-result-copy";
 
-import { ChangeEvent, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { ChangeEvent, Fragment, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { FileUploadButton, MaterialInput, type MaterialUploadState } from "./material-input";
 import { appendReferenceFiles, readReferenceFiles } from "./reference-upload";
 import { enableMultipleSelection, toggleInterviewAnswer } from "./interview-selection";
 import { capabilityIconPath, CAPABILITY_CATEGORY_ICONS } from "./capability-icons";
+import { insertWorkflowStep, removeWorkflowStep, updateWorkflowStep, workflowStepDraft, type WorkflowStepDraft } from "./workflow-editor";
 import {
   OPTIMIZATION_EDIT_BUDGET,
   OPTIMIZATION_SELECTION_SAMPLE,
@@ -161,6 +163,7 @@ import {
   reconcileSkillIRContentPermission,
   reconcileSkillIRInputResolutions,
   reconcileSkillIRSourceEvidence,
+  reconcileSkillIRStateLoops,
   type SkillIR,
 } from "./skill-ir";
 import {
@@ -481,6 +484,7 @@ type GenerationSemanticAudit = {
 
 type GenerationLoopState = {
   evaluationContractVersion: typeof EVAL_COMPILER_VERSION;
+  outcome: GenerationLoopOutcome;
   status: "idle" | "running" | "passed" | "stable" | "attention";
   phase: "idle" | "contract" | "static" | "rollout" | "diagnose" | "patch" | "validate" | "complete";
   rounds: number;
@@ -502,6 +506,8 @@ type GenerationLoopState = {
   closureScore: number;
   acceptedPatches: number;
   rejectedPatches: number;
+  candidateEvalAttempts: number;
+  candidateEvalCompletions: number;
   contractDigest: string;
   benchmarkCases: number;
   benchmarkRepeatsPerCase: number;
@@ -886,6 +892,7 @@ const BUILD_LOOP_PHASE_INDEX: Record<BuildLoopState["phase"], number> = { idle: 
 const OPTIMIZATION_LOOP_STEPS = ["冻结评测", "隔离执行", "隔离评分", "无 Skill 基线", "问题诊断", "有限修改", "匿名 A/B", "保留集回归", "保留任务", "精简冗余"] as const;
 const DEFAULT_GENERATION_LOOP: GenerationLoopState = {
   evaluationContractVersion: EVAL_COMPILER_VERSION,
+  outcome: "not-run",
   status: "idle",
   phase: "idle",
   rounds: 0,
@@ -906,6 +913,8 @@ const DEFAULT_GENERATION_LOOP: GenerationLoopState = {
   closureScore: 0,
   acceptedPatches: 0,
   rejectedPatches: 0,
+  candidateEvalAttempts: 0,
+  candidateEvalCompletions: 0,
   contractDigest: "",
   benchmarkCases: 0,
   benchmarkRepeatsPerCase: 0,
@@ -1536,44 +1545,6 @@ function createCanonicalSkillIR(input: {
   return ensureCanonicalBundledResources(ir, files, input.answers);
 }
 
-function compactThinkingPhrase(value: string) {
-  const phrase = value
-    .replace(/^[#>*\-\d.)、\s]+/, "")
-    .replace(/[：:].*$/, "")
-    .replace(/[，。；、!?！？]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return phrase.length > 16 ? `${phrase.slice(0, 16)}…` : phrase;
-}
-
-function createContextualThinkingWords(input: {
-  task: BusyTask;
-  idea: string;
-  stage: string;
-  questions: Question[];
-  answers: Record<string, string>;
-  blueprint: BlueprintSection[];
-  capabilities: CapabilityItem[];
-  loopPlan: LoopPlan;
-  issues: string[];
-  feedback: string[];
-  demo: SkillDemo | null;
-}) {
-  const answeredChoices = input.questions.map((question) => input.answers[question.id]).filter(Boolean);
-  const taskSources: Record<BusyTask, string[]> = {
-    interview: [input.idea, ...input.questions.map((question) => question.dimension), ...answeredChoices],
-    blueprint: [...input.blueprint.map((section) => section.title), ...answeredChoices, ...input.capabilities.map((item) => item.name)],
-    build: [input.loopPlan.goal, ...input.loopPlan.subgoals.map((item) => item.title), ...input.capabilities.filter(capabilityIsActive).map((item) => item.name)],
-    repair: [...input.issues, ...input.capabilities.filter(capabilityIsActive).map((item) => item.name), input.loopPlan.stopConditions[0] || ""],
-    evaluate: [input.idea, input.demo?.title || "", ...(input.demo?.uncertainties || []), ...input.capabilities.filter(capabilityIsActive).map((item) => item.name)],
-    personalize: [...input.feedback, input.demo?.title || "", ...(input.demo?.uncertainties || []), ...input.loopPlan.qualityGates.map((item) => item.criterion)],
-  };
-  const words = [input.stage, ...taskSources[input.task]]
-    .map(compactThinkingPhrase)
-    .filter((word) => word.length >= 2);
-  return Array.from(new Set(words)).slice(0, 8);
-}
-
 function deriveLoopPlan(idea: string, answers: Record<string, string>, capabilityPlan: CapabilityPlan = DEFAULT_CAPABILITY_PLAN): LoopPlan {
   const task = compactTaskPhrase(idea);
   const outcome = answers.outcome?.trim() || `完成“${task}”并交付可用结果`;
@@ -1743,7 +1714,7 @@ ${plan.scopes.map((item) => `- **${item.scope}** — trigger: ${item.trigger}; a
 }
 
 function reconcileLoopPlanState(plan: LoopPlan, capabilityPlan: CapabilityPlan): LoopPlan {
-  if (capabilityPlan.stateModel.scope === "persistent") return plan;
+  if (capabilityPlan.stateModel.needed && capabilityPlan.stateModel.scope === "persistent") return plan;
   return {
     ...plan,
     scopes: plan.scopes.filter((scope) => scope.scope !== "longitudinal"),
@@ -1879,7 +1850,18 @@ function sanitizeSkillFiles(files: Record<string, string>) {
 
 function friendlyReleaseBlocker(item: string) {
   return item
+    .replace(/P0(?:\s+Execution Gate)?/gi, "无法运行的问题")
+    .replace(/P1(?:\s+Contract Gate)?/gi, "关键逻辑问题")
+    .replace(/held-out Eval/gi, "独立测试任务")
+    .replace(/held-out/gi, "独立测试")
+    .replace(/Optimization Loop/gi, "自动优化")
+    .replace(/Build Loop/gi, "生成文件检查")
+    .replace(/Bundle/gi, "生成文件")
+    .replace(/Candidate/gi, "修改版")
+    .replace(/Canonical IR/gi, "核心数据结构")
+    .replace(/Patch Plan/gi, "修改方案")
     .replace(/Eval Harness/gi, "自动测试系统")
+    .replace(/Eval/gi, "自动测试")
     .replace(/SKILL\.md/gi, "主文件")
     .replace(/Tools?\/MCP/gi, "外部工具或 MCP")
     .replace(/grader/gi, "评分规则")
@@ -3201,7 +3183,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   files["evals/result.schema.json"] = createEvalResultSchema();
   files["evals/artifact_checker.py"] = createArtifactChecker();
   files["evals/run_evals.py"] = createEvalRunner();
-  const canonicalBaseIR = ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
+  const canonicalBaseIR = reconcileSkillIRStateLoops(ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
     skillName,
     idea,
     answers,
@@ -3209,7 +3191,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     loop: loopPlan,
     sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
     files,
-  }), files, answers);
+  }), files, answers));
   const canonicalEvalSeed = evalNeedsRebuild
     ? files["evals/evals.json"]
     : canonicalIROverride ? projectEvalBank(canonicalBaseIR) : files["evals/evals.json"];
@@ -5027,6 +5009,47 @@ function reportClientGenerationLoopEvent(
   });
 }
 
+const DOT_PROGRESS_COUNT = 36;
+const WAITING_DOT_COUNT = 120;
+
+function DotMatrixProgress({ progress, tone = "light", label = "正在处理" }: { progress?: number; tone?: "light" | "dark"; label?: string }) {
+  const determinate = typeof progress === "number";
+  const normalized = determinate ? Math.min(1, Math.max(0, progress)) : 0;
+  const settled = Math.round(normalized * DOT_PROGRESS_COUNT);
+  return (
+    <div
+      className={`dot-matrix-progress ${tone} ${determinate ? "determinate" : "indeterminate"}`}
+      role="progressbar"
+      aria-label={label}
+      aria-valuemin={determinate ? 0 : undefined}
+      aria-valuemax={determinate ? 100 : undefined}
+      aria-valuenow={determinate ? Math.round(normalized * 100) : undefined}
+    >
+      {Array.from({ length: DOT_PROGRESS_COUNT }, (_, index) => (
+        <i
+          className={determinate && index < settled ? "settled" : "pending"}
+          key={index}
+          style={{
+            "--dot-index": index,
+            "--dot-distance": Math.max(0, index - settled),
+            "--dot-color": `hsl(${8 + (index / (DOT_PROGRESS_COUNT - 1)) * 28} 82% 58%)`,
+          } as CSSProperties}
+        />
+      ))}
+    </div>
+  );
+}
+
+function WaitingDotField() {
+  return (
+    <div className="ai-wind-field" aria-hidden="true">
+      {Array.from({ length: WAITING_DOT_COUNT }, (_, index) => (
+        <i key={index} style={{ "--wind-dot": index, "--wind-column": index % 20, "--wind-row": Math.floor(index / 20) } as CSSProperties} />
+      ))}
+    </div>
+  );
+}
+
 export default function Home() {
   const [sessionHydrated, setSessionHydrated] = useState(false);
   const [step, setStep] = useState<StepId>("brief");
@@ -5041,7 +5064,6 @@ export default function Home() {
   const [aiGenerationIssue, setAiGenerationIssue] = useState("");
   const [contextPanelOpen, setContextPanelOpen] = useState(false);
   const [activeContextField, setActiveContextField] = useState<ContextFieldId>("idealOutput");
-  const [interviewEvidenceOpen, setInterviewEvidenceOpen] = useState(false);
   const [contextNotes, setContextNotes] = useState<ContextNotes>({ idealOutput: "", negativeOutput: "", existingPrompt: "", background: "" });
   const [contextUploads, setContextUploads] = useState<Partial<Record<ContextFieldId, MaterialUploadState>>>({});
   const materialsLoading = sourcesLoading || Object.values(contextUploads).some((upload) => upload?.loading);
@@ -5062,6 +5084,7 @@ export default function Home() {
   const blueprintGridRef = useRef<HTMLDivElement | null>(null);
   const blueprintCheckpointRef = useRef<BlueprintCheckpoint>({});
   const [capabilityPlan, setCapabilityPlan] = useState<CapabilityPlan>(DEFAULT_CAPABILITY_PLAN);
+  const [workflowStepEditor, setWorkflowStepEditor] = useState<{ stepId: string; draft: WorkflowStepDraft } | null>(null);
   const [loopPlan, setLoopPlan] = useState<LoopPlan>(DEFAULT_LOOP_PLAN);
   const [buildLoop, setBuildLoop] = useState<BuildLoopState>(DEFAULT_BUILD_LOOP);
   const [generationLoop, setGenerationLoop] = useState<GenerationLoopState>(DEFAULT_GENERATION_LOOP);
@@ -5118,6 +5141,10 @@ export default function Home() {
   const [busyElapsed, setBusyElapsed] = useState(0);
   const [busyExecutionKind, setBusyExecutionKind] = useState<BusyExecutionKind>("local");
   const [busyExecutionNote, setBusyExecutionNote] = useState("正在准备当前步骤");
+  const [busyOutputText, setBusyOutputText] = useState("");
+  const [busyOutputRevision, setBusyOutputRevision] = useState(0);
+  const busyOutputArrivedAt = useRef(0);
+  const busyOutputViewportRef = useRef<HTMLDivElement | null>(null);
   const [activeAiMode, setActiveAiMode] = useState("");
   const [busyTokenUsage, setBusyTokenUsage] = useState<AiTokenUsage>(EMPTY_AI_TOKEN_USAGE);
   const [sessionTokenUsage, setSessionTokenUsage] = useState<AiTokenUsage>(EMPTY_AI_TOKEN_USAGE);
@@ -5564,18 +5591,11 @@ export default function Home() {
   const requirementCoverage = summarizeRequirementCoverage(interviewEvidence);
   const coveredDimensions = requirementCoverage.covered;
   const uncertainDimensions = requirementCoverage.uncertain;
-  const coveredDimensionCount = requirementCoverage.coveredCount;
-  const uncertainDimensionCount = requirementCoverage.uncertainCount;
   const ideaReady = idea.trim().length >= 2;
   const interviewReady = questions.length > 0 && currentAnsweredCount === questions.length;
   const isFinalInterviewRound = interviewRoundIndex === INTERVIEW_ROUND_META.length - 1;
   const interviewCompletion = interviewCompletionGate({ rounds: interviewRounds, origins: interviewRoundOrigins, answers,
     currentRoundIndex: interviewRoundIndex, highestRoundReached, expectedQuestionCounts: INTERVIEW_ROUND_META.map((round) => round.dimensions.length) });
-  const completeness = Math.min(100, Math.round(
-    (ideaReady ? 15 : 0)
-    + ((coveredDimensionCount - uncertainDimensionCount * 0.55) / REQUIREMENT_DIMENSIONS.length) * 85
-    + Math.min(10, (sourceNames.length + contextFilledCount) * 2.5),
-  ));
   const hasApiKey = apiKey.trim().length > 8 || credentialStored;
   const hasRealModel = hasApiKey;
   const researchReady = researchProvider === "firecrawl"
@@ -5621,16 +5641,6 @@ export default function Home() {
       : busyElapsed < 25
         ? `${activeAiMode ? AI_MODE_LABELS[activeAiMode] || activeAiMode : "模型任务"}正在返回真实结果；当前回答会一直保留。`
         : "流程仍在处理，已完成的步骤会保留；上方显示本次流程累计耗时，不代表当前请求超时或正在重试。";
-  const busyTokenUsageStatus = busyTokenUsage.pendingPromptTokens > 0
-    ? `输入约 ${formatAiTokens(busyTokenUsage.promptTokens)} · 输出生成中`
-    : busyTokenUsage.requests > 0
-      ? `${formatAiTokens(busyTokenUsage.promptTokens)} 输入 · ${formatAiTokens(busyTokenUsage.completionTokens)} 输出`
-      : "本地检查，不调用模型";
-  const busyTokenUsageHint = busyTokenUsage.pendingPromptTokens > 0
-    ? "当前为输入预估，模型返回后会自动校准"
-    : busyTokenUsage.estimated
-      ? "部分请求未返回 usage，已按文本长度估算"
-      : "已按模型返回的 usage 统计";
   const modelChoices = Array.from(new Set([
     ...PROVIDERS[provider].models.map((item) => item.id),
     ...availableModels,
@@ -5677,10 +5687,26 @@ export default function Home() {
       && generationLoop.bestScore === 100
       && generationLoop.passRate === 100
       && generationLoop.closureScore === 100);
-  const optimizationCompletedWithRollback = generationLoop.status === "attention"
-    && generationLoop.minimalityChecked
-    && generationLoop.benchmarkRuns > 0
-    && !optimizationStableAtCeiling;
+  const visibleGenerationOutcome: GenerationLoopOutcome = optimizationBlockedByBuild
+    ? "build-blocked"
+    : generationLoop.status === "running"
+      ? "running"
+      : generationLoop.status === "passed"
+        ? "accepted"
+        : optimizationStableAtCeiling
+          ? "stable"
+          : generationLoop.outcome !== "not-run"
+            ? generationLoop.outcome
+            : generationLoop.status === "attention"
+              ? generationLoop.benchmarkRuns > 0 && generationLoop.rejectedPatches > 0
+                ? "no-safe-change"
+                : "evaluation-incomplete"
+              : "not-run";
+  const generationCopy = generationResultCopy({
+    outcome: visibleGenerationOutcome,
+    issueCount: generationLoop.issues.length,
+    lift: generationLoop.lift,
+  });
   const buildUnresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
   const buildProductCapabilities = capabilityPlan.items
     .filter((item) => capabilityIsActive(item) && item.kind !== "eval")
@@ -5709,23 +5735,48 @@ export default function Home() {
     : createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0);
   const optionalToolCapabilities = capabilityPlan.items.filter((item) => item.optional && (item.kind === "builtin-tool" || item.kind === "mcp"));
   const adoptedRuntimeCapabilities = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind !== "eval" && item.layer === "runtime");
+  const coreRuntimeCapabilities = adoptedRuntimeCapabilities.filter((item) => !item.optional);
+  const adoptedOptionalCapabilityCount = optionalToolCapabilities.filter(capabilityIsActive).length;
   const unresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
   const selectedCatalogCapabilityCount = CAPABILITY_LIBRARY.filter((libraryItem) => capabilityPlan.items.some((item) => item.id === libraryItem.id && capabilityIsActive(item))).length;
-  const thinkingWords = busyTask ? createContextualThinkingWords({
-    task: busyTask,
-    idea,
-    stage: busyStage,
-    questions,
-    answers,
-    blueprint,
-    capabilities: capabilityPlan.items,
-    loopPlan,
-    issues: buildLoop.issues,
-    feedback: [...feedbackReasons, feedbackCustom, ...(personalizationHistory.at(-1)?.feedback || [])].filter(Boolean),
-    demo: skillDemo,
-  }) : [];
   const activeSkillName = stripYamlQuotes(files["SKILL.md"]?.match(/^name:\s*([^\n]+)$/m)?.[1] || "") || "generated-skill";
   const workspaceName = completedSteps.has("build") ? activeSkillName : ideaReady ? "新 Skill 草稿" : "未命名 Skill";
+
+  useEffect(() => {
+    const viewport = busyOutputViewportRef.current;
+    if (!viewport || !busyOutputText) return;
+    viewport.scrollTop = 0;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    let animationFrame = 0;
+    let interrupted = false;
+    const stopAutoScroll = () => {
+      interrupted = true;
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+    };
+    viewport.addEventListener("wheel", stopAutoScroll, { passive: true });
+    viewport.addEventListener("touchstart", stopAutoScroll, { passive: true });
+    const startDelay = window.setTimeout(() => {
+      const bottomPadding = Number.parseFloat(window.getComputedStyle(viewport).paddingBottom) || 0;
+      const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight - bottomPadding);
+      if (!maxScroll) return;
+      const startedAt = performance.now();
+      const duration = Math.min(2_750, Math.max(1_300, maxScroll * 3.125));
+      const advance = (now: number) => {
+        if (interrupted) return;
+        const progress = Math.min(1, (now - startedAt) / duration);
+        const easedProgress = 1 - Math.pow(1 - progress, 3);
+        viewport.scrollTop = Math.min(maxScroll, maxScroll * easedProgress);
+        if (progress < 1) animationFrame = window.requestAnimationFrame(advance);
+      };
+      animationFrame = window.requestAnimationFrame(advance);
+    }, 90);
+    return () => {
+      window.clearTimeout(startDelay);
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      viewport.removeEventListener("wheel", stopAutoScroll);
+      viewport.removeEventListener("touchstart", stopAutoScroll);
+    };
+  }, [busyOutputText]);
 
   useEffect(() => {
     if (!toast) return;
@@ -5986,17 +6037,12 @@ export default function Home() {
 
   function notifyGenerationLoopResult(state: GenerationLoopState) {
     const elapsedSeconds = loopStartedAt.current ? Math.max(1, Math.round((Date.now() - loopStartedAt.current) / 1_000)) : 0;
-    const title = state.status === "passed" ? "Skill 优化已完成" : state.status === "stable" ? "Skill 已保留当前最佳版本" : "Skill 优化需要查看";
-    const result = state.status === "passed"
-      ? `当前最佳版本已通过回归门控${state.lift ? `，Skill Lift ${state.lift > 0 ? "+" : ""}${state.lift}` : ""}。`
-      : state.status === "stable"
-        ? "冻结评测全部通过，但没有候选证明额外提升；已安全保留当前最佳版本。"
-      : `${state.stopReason || "Loop 已停止并保留当前最佳版本。"}`;
-    const body = `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220);
-    setCompletionNotice({ title, body });
-    document.title = `● ${title} · SkillCanvas`;
+    const copy = generationResultCopy({ outcome: state.outcome, issueCount: state.issues.length, lift: state.lift });
+    const body = `${copy.body}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220);
+    setCompletionNotice({ title: copy.title, body });
+    document.title = `● ${copy.title} · SkillCanvas`;
     if (!("Notification" in window) || window.Notification.permission !== "granted") return;
-    void deliverBrowserNotification(title, {
+    void deliverBrowserNotification(copy.title, {
       body,
       tag: "skillcanvas-generation-loop",
     });
@@ -6193,24 +6239,34 @@ export default function Home() {
     setBusyElapsed(0);
     setBusyExecutionKind("local");
     setBusyExecutionNote("正在准备当前步骤");
+    setBusyOutputText("");
+    busyOutputArrivedAt.current = 0;
     setActiveAiMode("");
     setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
     setRetryAction(retry);
   }
 
   function finishBusy() {
-    setBusyClosing(true);
     if (busyCloseTimer.current !== null) window.clearTimeout(busyCloseTimer.current);
-    busyCloseTimer.current = window.setTimeout(() => {
-      setBusyTask(null);
-      setBusyClosing(false);
-      setBusyPhaseIndex(0);
-      setBusyElapsed(0);
-      setBusyExecutionKind("local");
-      setBusyExecutionNote("正在准备当前步骤");
-      setActiveAiMode("");
-      busyCloseTimer.current = null;
-    }, 220);
+    const close = () => {
+      setBusyClosing(true);
+      busyCloseTimer.current = window.setTimeout(() => {
+        setBusyTask(null);
+        setBusyClosing(false);
+        setBusyPhaseIndex(0);
+        setBusyElapsed(0);
+        setBusyExecutionKind("local");
+        setBusyExecutionNote("正在准备当前步骤");
+        setBusyOutputText("");
+        busyOutputArrivedAt.current = 0;
+        setActiveAiMode("");
+        busyCloseTimer.current = null;
+      }, 220);
+    };
+    const visibleFor = busyOutputArrivedAt.current ? Date.now() - busyOutputArrivedAt.current : Number.POSITIVE_INFINITY;
+    const remaining = Math.max(0, 1_100 - visibleFor);
+    if (remaining) busyCloseTimer.current = window.setTimeout(close, remaining);
+    else close();
   }
 
   function showLocalBusy(note: string) {
@@ -6331,6 +6387,9 @@ export default function Home() {
           throw responseError;
         }
         settleActualUsage(data.usage || {}, data.content);
+        setBusyOutputText(data.content.slice(0, 16_000));
+        setBusyOutputRevision((revision) => revision + 1);
+        busyOutputArrivedAt.current = Date.now();
         return jsonFromText<T>(data.content);
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
@@ -7840,7 +7899,7 @@ export default function Home() {
     loopStartedAt.current = Date.now();
     setBusyPhaseIndex(4);
     showLoopBusy("Build 已通过，正在固定能力边界并启动 Optimization Loop");
-    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "static", stopReason: "正在建立能力闭环" });
+    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, outcome: "running", status: "running", phase: "static", stopReason: "正在建立能力闭环" });
     reportClientGenerationLoopEvent("generation_loop_started", { phase: "static", reason: "固定 Goal 并开始能力闭环检查" });
     const restoredCanonicalIR = parseCanonicalSkillIR(initialFiles);
     const restoredPlan = reconcileCapabilityPlanWithCanonicalIR(generationPlan, restoredCanonicalIR);
@@ -7929,6 +7988,7 @@ export default function Home() {
       const p0Evidence = bestBundleValidation.issues.filter((issue) => issue.priority === "P0").map((issue) => issue.message);
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "build-blocked",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -7944,6 +8004,7 @@ export default function Home() {
     if (!initialContractRepair.passed || !bestBundleValidation.contractReady || staticPolicy.priority === "P1") {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "build-blocked",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8003,6 +8064,7 @@ export default function Home() {
     if (heldOutCoverage.missing.length) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "evaluation-incomplete",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8018,6 +8080,7 @@ export default function Home() {
     if (trainCases.length < 1 || selectionCases.length < 2) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "evaluation-incomplete",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8123,6 +8186,8 @@ export default function Home() {
     });
     let acceptedPatches = 0;
     let rejectedPatches = 0;
+    let candidateEvalAttempts = 0;
+    let candidateEvalCompletions = 0;
     const rejectedHistory: Array<{
       round: number;
       reason: string;
@@ -8457,11 +8522,13 @@ export default function Home() {
       setGenerationLoop((current) => ({ ...current, phase: "validate", stopReason: `第 ${round} 轮：先运行冻结最终产物门禁；明显回退将不再触发诊断、复跑和匿名比较` }));
       let candidateHarness: HarnessReport;
       try {
+        candidateEvalAttempts += 1;
         candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 1 });
         if (comparisonNeedsStabilityRepeat(bestHarness, candidateHarness)) {
           reportClientGenerationLoopEvent("generation_loop_phase", { phase: "stability-repeat", round, reason: "候选首轮结果接近门槛或可能被接受，正在补充一次独立试跑" });
           candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 2, resumeFrom: candidateHarness });
         }
+        candidateEvalCompletions += 1;
       } catch {
         rejectedPatches += 1;
         rejectedHistory.push({ round, reason: "候选版本未完成全部诊断任务或独立保留任务", files: candidateChangedPaths });
@@ -8796,6 +8863,17 @@ export default function Home() {
     ].filter(Boolean).slice(0, 8);
     const state: GenerationLoopState = {
       ...DEFAULT_GENERATION_LOOP,
+      outcome: passed
+        ? "accepted"
+        : stableAtCeiling
+          ? "stable"
+          : acceptedPatches > 0
+            ? "accepted-with-issues"
+            : candidateEvalCompletions > 0
+              ? "evaluated-no-improvement"
+              : candidateEvalAttempts > 0
+                ? "evaluation-incomplete"
+                : "no-safe-change",
       status: passed ? "passed" : stableAtCeiling ? "stable" : "attention",
       phase: "complete",
       rounds: Math.min(GENERATION_GOAL_MAX_ROUNDS, acceptedPatches + rejectedPatches),
@@ -8815,6 +8893,8 @@ export default function Home() {
       closureScore: bestClosure.score,
       acceptedPatches,
       rejectedPatches,
+      candidateEvalAttempts,
+      candidateEvalCompletions,
       contractDigest: bestHarness.contract.digest,
       benchmarkCases: selectionCases.length,
       benchmarkRepeatsPerCase: Math.min(baselineHarness.benchmark.repeatsPerCase, bestHarness.benchmark.repeatsPerCase),
@@ -8929,7 +9009,7 @@ export default function Home() {
       capabilityDeltaGapIds: capabilityDelta.skillMustTeach.map((item) => item.id),
       excludedGenericKnowledge: capabilityDelta.excludedGenericKnowledge,
       userPolicies: ["evidence-policy", "boundary", "autonomy", "output-format"].map((key) => (demoAnswers as Record<string, string>)[key] || "").filter(Boolean),
-    });
+    }, idea);
     const verifyPack = async (candidate: KnowledgePack, prior?: KnowledgePack) => {
       const knowledgeClaims = knowledgeVerificationCandidates(candidate);
       if (!knowledgeClaims.length) return candidate;
@@ -9178,7 +9258,7 @@ export default function Home() {
     beginBusy("build", "compile-skill");
     setAiGenerationIssue("");
     setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "checking", phase: "contract" });
-    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "contract", stopReason: "正在固定 Goal 与能力契约" });
+    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, outcome: "running", status: "running", phase: "contract", stopReason: "正在固定目标与能力边界" });
     try {
       if (!hasRealModel) throw new Error("模型配置已缺失，请重新连接");
       // Old sessions may contain a pre-guard blueprint. Repair it before any
@@ -9336,7 +9416,7 @@ export default function Home() {
           const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
           goalLoopError = message;
           reportClientGenerationLoopEvent("generation_loop_failed", { phase: "runtime", reason: message });
-          const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
+          const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
           setGenerationLoop(failedState);
           notifyGenerationLoopResult(failedState);
         }
@@ -9344,6 +9424,7 @@ export default function Home() {
         await durableBuild?.fail(new Error(contractRepair.failureReason));
         const blockedState: GenerationLoopState = {
           ...DEFAULT_GENERATION_LOOP,
+          outcome: "build-blocked",
           status: "attention",
           phase: "complete",
           closureScore: contractRepair.closure.score,
@@ -9383,20 +9464,20 @@ export default function Home() {
       setSelectedFile("SKILL.md");
       setRetryAction(goalLoopError ? "rerun-optimization-loop" : null);
       setToast(goalLoopError
-        ? `Skill 文件已生成，但自动优化停在：${goalLoopError}`
+        ? "Skill 文件已生成并保存，但自动测试没有完成。你可以查看记录后重新测试。"
         : unresolvedBuildIssues.length
-        ? "内部编译没有收敛，已保留当前候选并自动记录失败节点"
+        ? "Skill 文件已生成并保存，但还有结构问题需要修复。"
         : repairRounds
-          ? `已完成生成、质检和 ${repairRounds} 轮定向修复`
-          : "已完成目标拆解、循环设计和生成质检");
+          ? `Skill 已生成并通过检查，系统自动修复了 ${repairRounds} 轮问题。`
+          : "Skill 已生成并通过文件检查。");
     } catch (error) {
       await durableBuild?.fail(error);
       const message = error instanceof Error ? error.message : "AI Skill 生成失败";
       reportClientGenerationLoopEvent("generation_loop_failed", { phase: message.includes("WORKFLOW_DAG") ? "workflow-dag-preflight" : "build", reason: message });
       setAiGenerationIssue(message);
       setBuildLoop((current) => ({ ...current, status: "attention", issues: [message] }));
-      notifyGenerationLoopResult({ ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: message });
-      setToast(`${message}；没有生成模板 Skill`);
+      notifyGenerationLoopResult({ ...DEFAULT_GENERATION_LOOP, outcome: "failed", status: "attention", phase: "complete", issues: [message], stopReason: message });
+      setToast("这次没有生成完成。你填写的内容已经保留，可以直接重试。");
     } finally {
       finishBusy();
     }
@@ -9433,16 +9514,17 @@ export default function Home() {
         frozen: !buildIssues.length,
       });
       setRetryAction(result.state.status === "passed" ? null : "rerun-optimization-loop");
-      setToast(result.state.status === "passed" ? "Optimization Loop 已完成并通过回归门控" : result.state.stopReason);
+      const resultCopy = generationResultCopy({ outcome: result.state.outcome, issueCount: result.state.issues.length, lift: result.state.lift });
+      setToast(resultCopy.body);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
       reportClientGenerationLoopEvent("generation_loop_failed", { phase: "runtime", reason: message });
-      const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
+      const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
       setGenerationLoop(failedState);
       notifyGenerationLoopResult(failedState);
       setAiGenerationIssue(message);
       setRetryAction("rerun-optimization-loop");
-      setToast(`${message}；当前 Skill 文件没有被覆盖`);
+      setToast("测试没有完成，当前 Skill 文件仍然保留。请查看记录后重试。");
     } finally {
       optimizationRunInFlight.current = false;
       finishBusy();
@@ -9870,6 +9952,16 @@ export default function Home() {
     if (!evalRan && !busy) void runEvaluation();
   }
 
+  function handleBuildPrimaryAction() {
+    if (busy) return;
+    if (bundleAudit.blockers.length) {
+      setToast("正在根据发现的问题重新整理生成文件；当前版本会保留到新版本通过检查。");
+      void compileSkill();
+      return;
+    }
+    enterEvaluation();
+  }
+
   function openWorkspaceStep(nextStep: StepId) {
     if (nextStep === "evaluate") {
       enterEvaluation();
@@ -10053,7 +10145,7 @@ export default function Home() {
         } catch (error) {
           const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
           reportClientGenerationLoopEvent("generation_loop_failed", { phase: "repair-handoff", reason: message });
-          setGenerationLoop((current) => ({ ...current, status: "attention", phase: "complete", issues: [message], stopReason: `文件契约已修复，但自动优化停在：${message}` }));
+          setGenerationLoop((current) => ({ ...current, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `文件契约已修复，但自动优化停在：${message}` }));
           setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "passed", phase: "frozen", frozen: true });
           setRetryAction("rerun-optimization-loop");
           setToast(`文件交付契约已自动补齐；Optimization Loop 可从当前文件继续：${message}`);
@@ -10598,6 +10690,69 @@ export default function Home() {
     setToast("SKILL.md 已复制");
   }
 
+  function commitWorkflowSteps(nextSteps: WorkflowDagStep[], message: string) {
+    const nextPlan = { ...capabilityPlan, workflowSteps: nextSteps };
+    setCapabilityPlan(nextPlan);
+    if (!completedSteps.has("build")) {
+      setToast(`${message}；生成 Skill 时会同步写入全部文件`);
+      return;
+    }
+    const currentIR = parseCanonicalSkillIR(files);
+    if (!currentIR) {
+      setToast("工作流已保存在蓝图，但现有 SkillIR 无法解析；重新生成时会完整同步");
+      return;
+    }
+    try {
+      const mutated = applySkillIRMutations(currentIR, [{ type: "workflow.replace", steps: nextSteps }]).ir;
+      const nextFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, nextPlan, loopPlan, mutated);
+      const nextAudit = auditSkillFiles(nextFiles, demoAnswers);
+      setFiles(nextFiles);
+      setBuildLoop({ status: nextAudit.blockers.length ? "attention" : "passed", phase: nextAudit.blockers.length ? "bundle" : "frozen", rounds: 0, issues: nextAudit.blockers, frozen: !nextAudit.blockers.length });
+      setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, stopReason: "Workflow 已更新并重新编译；需要重新运行真实任务评测" });
+      setEvals([]);
+      setEvalRan(false);
+      setSkillDemo(null);
+      setDemoReviewPending(false);
+      setRejectedOptimizations([]);
+      setOptimizationSession(null);
+      setCompletedSteps((current) => new Set([...current].filter((item) => item !== "evaluate" && item !== "ship")));
+      setToast(`${message}；SkillIR 与相关文件已同步，旧评测已失效`);
+    } catch (error) {
+      setToast(error instanceof Error ? `工作流已保存在蓝图；同步现有 Skill 时发现：${error.message}` : "工作流已保存在蓝图；现有 Skill 需要重新生成");
+    }
+  }
+
+  function beginWorkflowStepEdit(step: WorkflowDagStep) {
+    setWorkflowStepEditor({ stepId: step.id, draft: workflowStepDraft(step) });
+  }
+
+  function addWorkflowStep(index: number) {
+    const inserted = insertWorkflowStep(capabilityPlan.workflowSteps, index);
+    commitWorkflowSteps(inserted.steps, "已新增工作步骤");
+    const step = inserted.steps.find((item) => item.id === inserted.stepId);
+    if (step) setWorkflowStepEditor({ stepId: step.id, draft: workflowStepDraft(step) });
+  }
+
+  function saveWorkflowStep() {
+    if (!workflowStepEditor) return;
+    try {
+      const nextSteps = updateWorkflowStep(capabilityPlan.workflowSteps, workflowStepEditor.stepId, workflowStepEditor.draft);
+      commitWorkflowSteps(nextSteps, "工作步骤已更新");
+      setWorkflowStepEditor(null);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "工作步骤没有保存");
+    }
+  }
+
+  function deleteWorkflowStep(stepId: string) {
+    try {
+      commitWorkflowSteps(removeWorkflowStep(capabilityPlan.workflowSteps, stepId), "工作步骤已移除");
+      if (workflowStepEditor?.stepId === stepId) setWorkflowStepEditor(null);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "工作步骤没有移除");
+    }
+  }
+
   function renderSkillDemoCard(pendingReview: boolean) {
     if (!skillDemo) return null;
     const completedConversationTurns = demoConversation.filter((message) => message.role === "assistant").length;
@@ -10760,7 +10915,10 @@ export default function Home() {
           )}
           {step === "brief" && (
             <div className="stage-content brief-stage">
-              <h1><span className="headline-line">AI 不懂你</span><br /><span className="brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</span> 来帮你</h1>
+              <div className="brief-hero">
+                <h1><span className="headline-line">AI 不懂你</span><br /><span className="brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</span> 来帮你</h1>
+                <img className="brief-hero-illustration" src="/skillcanvas-hero-helper-emoji.png" width="1254" height="1254" alt="" aria-hidden="true" />
+              </div>
 
               <div className="idea-composer">
                 <textarea
@@ -10845,12 +11003,14 @@ export default function Home() {
           {step === "interview" && (
             <div className="stage-content interview-stage">
               <div className="stage-heading-row">
-                <div>
+                <div className="interview-heading-copy">
                   <div className="stage-kicker">让 AI 更了解你</div>
                   <h2>确认你的目标、偏好与工作方式</h2>
                   <p>按实际需求选择，或直接写下你的想法。AI 会围绕影响结果的关键选择继续细化，最多四轮。</p>
                 </div>
-                <div className="completeness-badge"><strong>{completeness}%</strong><span>需求完整度</span></div>
+                <div className="interview-heading-aside">
+                  <img className="interview-heading-pen" src="/skillcanvas-note-pen.png" width="1254" height="1254" alt="" aria-hidden="true" />
+                </div>
               </div>
 
               {sourceInsights.map((insight, index) => (
@@ -10863,28 +11023,6 @@ export default function Home() {
                   <small className="source-privacy-note">{insight.privacyNote} · 这里只保存特征和页码证据，不把完整 PDF 塞进 Skill。</small>
                 </article>
               ))}
-
-              {isFinalInterviewRound && <div className={`understanding-evidence ${interviewEvidenceOpen ? "open" : ""}`}>
-                <button className="understanding-evidence-toggle" type="button" aria-expanded={interviewEvidenceOpen} onClick={() => setInterviewEvidenceOpen((current) => !current)}>
-                  <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/file-star.svg" alt="" aria-hidden="true" /></span>
-                  <div><strong>再给AI一点材料 <b className="optional-tag">可选</b></strong><small>补充理想结果、反例或参考文件，让 AI 更了解你的标准。</small></div>
-                  <em>{contextFilledCount + sourceNames.length ? `正在参考 ${contextFilledCount + sourceNames.length} 项上下文` : "还没有示例"}</em>
-                  <i><img className={interviewEvidenceOpen ? "expanded" : ""} src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" /></i>
-                </button>
-                {interviewEvidenceOpen && (
-                  <div className="understanding-example-fields">
-                    <MaterialInput id="understanding-ideal-output" className="understanding-example-field" title="你理想的产出" tag="AI 提取结构与标准" placeholder="粘贴一份你觉得很好的方案、文章、报告、代码或其他结果……"
-                      value={contextNotes.idealOutput} onChange={(value) => setContextNotes((current) => ({ ...current, idealOutput: value }))}
-                      onUpload={(event) => void handleContextSources(event, "idealOutput")} upload={contextUploads.idealOutput} disabled={busy} />
-                    <MaterialInput id="understanding-negative-output" className="understanding-example-field" title="你不喜欢的结果" tag="AI 识别跑偏模式" placeholder="粘贴反例，或直接写下哪里让你觉得不对……"
-                      value={contextNotes.negativeOutput} onChange={(value) => setContextNotes((current) => ({ ...current, negativeOutput: value }))}
-                      onUpload={(event) => void handleContextSources(event, "negativeOutput")} upload={contextUploads.negativeOutput} disabled={busy} />
-                    <div className="understanding-evidence-action">
-                      <button type="button" onClick={regenerateCurrentInterviewRound} disabled={busy || materialsLoading}>{materialsLoading ? "等待材料解析…" : "让 AI 参考材料，重做本轮理解"}</button>
-                    </div>
-                  </div>
-                )}
-              </div>}
 
               <div className="round-navigator" aria-label="需求澄清轮次">
                 {INTERVIEW_ROUND_META.map((round, index) => (
@@ -10904,7 +11042,7 @@ export default function Home() {
               <div className="round-transition" key={`interview-round-${interviewRoundIndex}`}>
                 <div className="round-heading">
                   <div><h3>{INTERVIEW_ROUND_META[interviewRoundIndex].title}</h3></div>
-                  <strong>{currentAnsweredCount}/{questions.length}<small>本轮已回答</small></strong>
+                  <strong>{currentAnsweredCount}/{questions.length}<small>AI 已帮你选择</small></strong>
                 </div>
                 <div className="question-list">
                 {questions.map((question, index) => {
@@ -10917,9 +11055,12 @@ export default function Home() {
                     || Boolean(currentAnswer && selectedOptions.length === 0);
                   return (
                     <div className={`question-card selection-${question.selectionMode}`} key={question.id}>
-                      <span className="question-number">{String(index + 1).padStart(2, "0")}</span>
+                      <span className="question-index">
+                        <span className="question-number">{String(index + 1).padStart(2, "0")}</span>
+                        <b className="question-dimension">{question.dimension}</b>
+                      </span>
                       <span className="question-copy">
-                        <span className="question-meta"><b>{question.dimension}</b><i>{question.selectionMode === "multiple" ? "可多选" : "单选"}</i>
+                        <span className="question-meta"><i>{question.selectionMode === "multiple" ? "可多选" : "单选"}</i>
                           {question.selectionMode === "single" && <button type="button" className="question-multiple-toggle" disabled={busy} onClick={() => allowMultipleAnswers(question.id)} aria-label={`将“${question.label}”改为多选`}>我想多选</button>}
                         </span>
                         <span className="question-title-row">
@@ -10982,6 +11123,44 @@ export default function Home() {
                 </div>
 
               </div>
+              {isFinalInterviewRound && (
+                <section className="final-note-card" aria-labelledby="final-note-title">
+                  <span className="final-note-tape" aria-hidden="true" />
+                  <div className="final-note-copy">
+                    <span className="final-note-kicker">可选</span>
+                    <h3 id="final-note-title">还有什么想说的吗</h3>
+                    <p>可以补充你的背景，你不喜欢的，或者选项里面不完整的内容，或者任何你想写的</p>
+                  </div>
+                  <textarea
+                    id="final-note-input"
+                    value={contextNotes.background}
+                    maxLength={20_000}
+                    disabled={contextUploads.background?.loading}
+                    onChange={(event) => setContextNotes((current) => ({ ...current, background: event.target.value }))}
+                    placeholder="写在这里，AI 会把它和上面的选择一起理解……"
+                    aria-label="还有什么想说的吗"
+                    aria-describedby="final-note-description"
+                  />
+                  <div className="final-note-footer" id="final-note-description">
+                    <div>
+                      <FileUploadButton
+                        onChange={(event) => void handleContextSources(event, "background")}
+                        loading={contextUploads.background?.loading}
+                        disabled={busy}
+                        label="上传文件"
+                        ariaLabel="为补充内容上传文件"
+                      />
+                      <small>PDF / MD / 文本</small>
+                    </div>
+                    <small>{contextNotes.background.length.toLocaleString("en-US")} / 20,000</small>
+                  </div>
+                  {contextUploads.background?.message && (
+                    <p className={`final-note-status ${contextUploads.background.warning ? "warning" : ""}`} role="status" aria-live="polite">
+                      {contextUploads.background.message}
+                    </p>
+                  )}
+                </section>
+              )}
               <div className="stage-footer">
                 <button className="secondary-button" onClick={() => interviewRoundIndex > 0 ? setInterviewRoundIndex(interviewRoundIndex - 1) : setStep("brief")}>{interviewRoundIndex > 0 ? "返回上一轮" : "返回修改一句话"}</button>
                 <div className="adaptive-footer-actions">
@@ -11035,16 +11214,46 @@ export default function Home() {
               <section className={`loop-plan-card ${loopPlan.mode}`}>
                 <div className="loop-plan-heading">
                   <div>
-                    <span className="stage-kicker">AI 已推荐并采用一条可执行流程</span>
-                    <h3>推荐工作流：目标、子目标与循环</h3>
-                    <p>{loopPlan.reason}</p>
+                    <h3>工作流</h3>
                   </div>
-                  <span className="status-pill">✓ 已采用 · {loopPlan.label} · 最多 {loopPlan.maxRounds} 回合</span>
                 </div>
                 <div className="loop-goal">
                   <span>总目标</span>
                   <strong>{loopPlan.goal}</strong>
                 </div>
+                <section className="workflow-editor" aria-labelledby="workflow-editor-title">
+                  <div className="workflow-editor-heading">
+                    <div><span>可执行 Workflow</span><strong id="workflow-editor-title">Skill 实际会按这些步骤运行</strong></div>
+                    <small>{completedSteps.has("build") ? "修改后自动重编译 · 需重新 Eval" : "确认后写入 SkillIR 与生成文件"}</small>
+                  </div>
+                  <div className="workflow-editor-flow" aria-label="可编辑工作流">
+                    {capabilityPlan.workflowSteps.map((workflowStep, index) => (
+                      <Fragment key={workflowStep.id}>
+                        <button className="workflow-step-insert" type="button" onClick={() => addWorkflowStep(index)} aria-label={`在步骤 ${index + 1} 前新增步骤`}><span>＋</span></button>
+                        <article className={`workflow-step-card ${workflowStepEditor?.stepId === workflowStep.id ? "editing" : ""}`}>
+                          <div className="workflow-step-meta"><span>{String(index + 1).padStart(2, "0")}</span><em>{workflowStep.role === "deliver" ? "交付" : workflowStep.role === "validate" ? "验证" : workflowStep.role === "persist" ? "保存" : workflowStep.role?.startsWith("await") ? "等待确认" : "执行"}</em></div>
+                          <strong>{workflowStep.action}</strong>
+                          <p>{workflowStep.when}</p>
+                          <small>产出 · {workflowStep.output}</small>
+                          <div className="workflow-step-actions">
+                            <button type="button" onClick={() => beginWorkflowStepEdit(workflowStep)}>修改</button>
+                            <button type="button" onClick={() => deleteWorkflowStep(workflowStep.id)} disabled={capabilityPlan.workflowSteps.length <= 1}>移除</button>
+                          </div>
+                        </article>
+                      </Fragment>
+                    ))}
+                    <button className="workflow-step-insert trailing" type="button" onClick={() => addWorkflowStep(capabilityPlan.workflowSteps.length)} aria-label="在工作流末尾新增步骤"><span>＋</span></button>
+                  </div>
+                  {workflowStepEditor && (
+                    <div className="workflow-step-form" role="group" aria-label="修改工作步骤">
+                      <label><span>什么时候执行</span><input value={workflowStepEditor.draft.when} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, when: event.target.value } } : current)} /></label>
+                      <label className="wide"><span>这一步做什么</span><textarea rows={2} value={workflowStepEditor.draft.action} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, action: event.target.value } } : current)} /></label>
+                      <label><span>产生什么结果</span><input value={workflowStepEditor.draft.output} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, output: event.target.value } } : current)} /></label>
+                      <label><span>失败时怎么办</span><input value={workflowStepEditor.draft.fallback} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, fallback: event.target.value } } : current)} /></label>
+                      <div className="workflow-step-form-actions"><button type="button" onClick={() => setWorkflowStepEditor(null)}>取消</button><button type="button" onClick={saveWorkflowStep}>保存并同步</button></div>
+                    </div>
+                  )}
+                </section>
                 <div className="loop-columns">
                   <div className="loop-subgoals">
                     <div className="loop-section-title"><span>01</span><div><strong>必要子目标</strong><small>只保留完成总目标必须经过的中间状态</small></div></div>
@@ -11066,48 +11275,51 @@ export default function Home() {
                   </div>
                 </div>
               </section>
-              <section className="capability-plan-card">
-                <section className="tool-ability-picker">
+              <section className="tool-ability-picker">
                   <div className="tool-ability-heading">
                     <div><span>能力选型结果</span><h4>完成这个任务实际会用到什么</h4><p>只采用会改变输入读取、任务判断或真实交付的能力；每项都必须有触发条件、可观察产出和不可用时的降级方式。</p></div>
                     <small>{adoptedRuntimeCapabilities.length} 项运行能力已采用</small>
                   </div>
+                  <div className="capability-group-heading"><strong>核心能力</strong><span>直接决定任务结果</span></div>
                   <div className="adopted-capability-grid" aria-label="已采用的运行能力">
-                    {adoptedRuntimeCapabilities.map((item) => (
-                      <article key={item.id}>
+                    {coreRuntimeCapabilities.map((item) => (
+                      <article className={`kind-${item.kind}`} key={item.id}>
                         <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
                         <div><strong>{item.name}</strong><p>{item.reason}</p><small>何时用：{item.activationCondition || item.routingCondition}</small></div>
-                        <em>{item.recommended ? "AI 自动添加" : item.kind === "builtin-tool" || item.kind === "mcp" ? "你已添加" : "核心任务"}</em>
+                        <em>{item.kind === "llm" ? "核心推理" : CAPABILITY_KIND_META[item.kind].label}</em>
                       </article>
                     ))}
                   </div>
                   {optionalToolCapabilities.length ? (
-                    <div className="tool-ability-grid">
-                      {optionalToolCapabilities.map((item) => {
-                        const active = capabilityIsActive(item);
-                        return (
-                          <article className={`tool-ability-card ${active ? "selected" : ""}`} key={item.id}>
-                            <button type="button" className="tool-ability-toggle" aria-pressed={active} onClick={() => toggleOptionalCapability(item)}>
-                              <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
-                              <span className="tool-ability-copy"><small>{CAPABILITY_KIND_META[item.kind].label}{item.recommended ? " · AI 推荐" : " · 可选"}</small><strong>{item.name}</strong><em>{item.reason}</em></span>
-                              <span className="tool-toggle-state">{active ? "✓ 已添加" : "+ 添加能力"}</span>
-                            </button>
-                            {active && <div className="capability-contract"><span>何时用：{item.routingCondition}</span><span>输入：{item.input || "由当前任务提供"}</span><span>产出：{item.output || "可验证结果"}</span></div>}
-                            {active && item.kind === "mcp" && item.status === "requires-setup" && (
-                              <div className="mcp-setup-panel">
-                                <div><strong>确认目标 Agent 中的连接</strong><p>只有安装并授权后才会写成可调用；否则取消添加即可，不会留下发布待办。</p></div>
-                                <label><span>MCP Server 名称</span><input value={mcpDrafts[item.id] || ""} onChange={(event) => setMcpDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder={item.connection?.server || "例如：Notion MCP、GitHub MCP"} /></label>
-                                {!!item.connection?.tools.length && <small>预计使用：{item.connection.tools.join("、")}</small>}
-                                <div className="mcp-setup-actions"><button onClick={() => confirmMcpCapability(item)}>我已安装并授权</button><button onClick={() => chooseMcpFallback(item)}>取消添加</button></div>
-                              </div>
-                            )}
-                            {active && item.kind === "mcp" && item.status === "use-provided" && item.connection?.verified && (
-                              <div className="mcp-confirmed"><span>✓</span><div><strong>已确认 {item.connection.server}</strong><small>会生成调用契约、运行前检查和不可用时的替代路径。</small></div><button onClick={() => editMcpCapability(item)}>修改</button></div>
-                            )}
-                          </article>
-                        );
-                      })}
-                    </div>
+                    <section className="capability-option-section">
+                      <div className="capability-group-heading"><strong>工具与外部连接</strong><span>{adoptedOptionalCapabilityCount ? `已启用 ${adoptedOptionalCapabilityCount} 项` : "按需启用"}</span></div>
+                      <div className="tool-ability-grid">
+                        {optionalToolCapabilities.map((item) => {
+                          const active = capabilityIsActive(item);
+                          return (
+                            <article className={`tool-ability-card kind-${item.kind} ${active ? "selected" : ""}`} key={item.id}>
+                              <button type="button" className="tool-ability-toggle" aria-pressed={active} onClick={() => toggleOptionalCapability(item)}>
+                                <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
+                                <span className="tool-ability-copy"><small>{CAPABILITY_KIND_META[item.kind].label}{item.recommended ? " · AI 推荐" : " · 可选"}</small><strong>{item.name}</strong><em>{item.reason}</em></span>
+                                <span className="tool-toggle-state">{active ? "✓ 已添加" : "+ 添加能力"}</span>
+                              </button>
+                              {active && <div className="capability-contract"><span>何时用：{item.routingCondition}</span><span>输入：{item.input || "由当前任务提供"}</span><span>产出：{item.output || "可验证结果"}</span></div>}
+                              {active && item.kind === "mcp" && item.status === "requires-setup" && (
+                                <div className="mcp-setup-panel">
+                                  <div><strong>确认目标 Agent 中的连接</strong><p>只有安装并授权后才会写成可调用；否则取消添加即可，不会留下发布待办。</p></div>
+                                  <label><span>MCP Server 名称</span><input value={mcpDrafts[item.id] || ""} onChange={(event) => setMcpDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder={item.connection?.server || "例如：Notion MCP、GitHub MCP"} /></label>
+                                  {!!item.connection?.tools.length && <small>预计使用：{item.connection.tools.join("、")}</small>}
+                                  <div className="mcp-setup-actions"><button onClick={() => confirmMcpCapability(item)}>我已安装并授权</button><button onClick={() => chooseMcpFallback(item)}>取消添加</button></div>
+                                </div>
+                              )}
+                              {active && item.kind === "mcp" && item.status === "use-provided" && item.connection?.verified && (
+                                <div className="mcp-confirmed"><span>✓</span><div><strong>已确认 {item.connection.server}</strong><small>会生成调用契约、运行前检查和不可用时的替代路径。</small></div><button onClick={() => editMcpCapability(item)}>修改</button></div>
+                              )}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </section>
                   ) : <div className="tool-ability-empty"><strong>本次无需额外安装</strong><span>AI 已把完成任务必需的能力放进核心流程，没有为了显得“专业”而机械添加 MCP。你仍可从下面的能力库自行扩展。</span></div>}
                   <div className="capability-library-control">
                     <div><span>完整能力库</span><strong className="capability-library-title"><img src="/icons/tabler/plug.svg" alt="" aria-hidden="true" />添加能力</strong><p>宿主能力来自 Codex、Claude Code 等 Agent；MCP 是另行安装和授权的外部连接。Skill 只声明何时调用，不能凭空安装能力。</p></div>
@@ -11146,7 +11358,6 @@ export default function Home() {
                       </details>
                     </div>
                   )}
-                </section>
               </section>
               <div className="stage-footer">
                 <button className="secondary-button" onClick={() => setStep("interview")}>继续让 AI 了解我</button>
@@ -11159,7 +11370,7 @@ export default function Home() {
             <div className="build-stage">
               <div className="build-toolbar">
                 <div><span className="stage-kicker">专属 Skill 已生成</span><h2>真正属于你的 Skill</h2></div>
-                <div className="toolbar-actions"><button onClick={copySkill}>复制主文件</button><button className="primary-button compact" onClick={enterEvaluation} disabled={bundleAudit.blockers.length > 0 || busy}>{bundleAudit.blockers.length ? "修复后再评估" : busyTask === "evaluate" ? "正在开始评估…" : "进入评估"} <span>→</span></button></div>
+                <div className="toolbar-actions"><button onClick={copySkill}>复制主文件</button><button className="primary-button compact" onClick={handleBuildPrimaryAction} disabled={busy}>{bundleAudit.blockers.length ? "自动修复并重新生成" : busyTask === "evaluate" ? "正在开始评估…" : "进入评估"} <span>→</span></button></div>
               </div>
               <section className="build-product-overview" aria-label="Skill 生成结果摘要">
                 <div className="build-product-status">
@@ -11256,11 +11467,11 @@ export default function Home() {
               )}
               <section className={`build-loop-result ${buildLoop.status}`} aria-label="Build Loop 结果">
                 <div className="build-loop-copy">
-                  <span>BUILD LOOP · 负责生成并冻结初始架构</span>
-                  <strong>{gateOutcomes.build.verdict === "satisfied" ? "确定性结构验证完成，初始架构已冻结" : buildLoop.status === "attention" ? "Build Loop 仍有结构问题" : "正在从需求生成初始 Bundle"}</strong>
-                  <p>{gateOutcomes.build.verdict === "satisfied" ? "这只证明语法、路径与跨文件契约可复现地成立，不代表实际任务效果已经验证。" : buildLoop.issues[0] || "需求 → Capability → Bundle"}</p>
+                  <span>生成文件检查</span>
+                  <strong>{gateOutcomes.build.verdict === "satisfied" ? "文件结构检查通过" : buildLoop.status === "attention" ? "生成文件需要修复" : "正在生成并检查文件"}</strong>
+                  <p>{gateOutcomes.build.verdict === "satisfied" ? "文件结构、引用路径和步骤衔接都已检查，可以开始真实任务测试。这里只说明文件可以运行，不代表效果一定更好。" : buildLoop.issues[0] ? friendlyReleaseBlocker(buildLoop.issues[0]) : "系统正在把你的需求整理成可以运行的 Skill 文件。"}</p>
                 </div>
-                <div className="gate-evidence-strip"><span>证据类型</span><strong>本地确定性检查</strong><em>{gateOutcomes.build.sampleSize} 项 · 可复现</em></div>
+                <div className="gate-evidence-strip"><span>检查方式</span><strong>自动结构检查</strong><em>{gateOutcomes.build.sampleSize} 项 · 可重复检查</em></div>
                 <div className="build-loop-flow">
                   {BUILD_LOOP_STEPS.map((label, index) => {
                     const reachedIndex = buildLoop.frozen ? BUILD_LOOP_STEPS.length - 1 : BUILD_LOOP_PHASE_INDEX[buildLoop.phase];
@@ -11269,17 +11480,17 @@ export default function Home() {
                   })}
                 </div>
               </section>
-              <section className={`generation-loop-result ${optimizationStableAtCeiling || optimizationCompletedWithRollback ? "completed" : generationLoop.status}`} aria-label="Optimization Loop 结果">
+              <section className={`generation-loop-result ${generationCopy.tone}`} aria-label="自动测试与优化结果">
                 <div className="generation-loop-head">
-                  <div><span>{optimizationBlockedByBuild ? "BUILD CONTRACT REPAIR · 先修复再评测" : "OPTIMIZATION LOOP · 只做有证据的局部优化"}</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationStableAtCeiling ? "评测已完成，当前版本处于稳定上限" : optimizationCompletedWithRollback ? "评测已完成，已保留当前最佳版本" : optimizationBlockedByBuild ? "初始 Bundle 尚未通过契约检查" : generationLoop.status === "attention" ? "Optimization Loop 需要处理" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{optimizationStableAtCeiling ? "无 Skill 与当前版本都达到评测上限，保留任务全部通过。候选没有证明额外提升，系统已自动回滚并保留当前最佳版本。" : optimizationCompletedWithRollback ? "候选已完成真实试跑，但没有稳定优于当前版本，因此系统自动回滚候选。当前最佳版本没有被失败修改覆盖。" : generationLoop.stopReason}</p></div>
+                  <div><span>{optimizationBlockedByBuild ? "生成前检查" : "自动测试与优化"}</span><strong>{generationCopy.panelTitle}</strong><p>{generationCopy.panelBody}</p></div>
                   <div className="generation-loop-actions">
-                    <em>{gateOutcomes.optimization.verdict === "satisfied" ? "✓ 已接受" : optimizationStableAtCeiling ? "✓ 已保留最佳版" : optimizationCompletedWithRollback ? "✓ 已安全回滚" : optimizationBlockedByBuild ? "未启动" : generationLoop.status === "attention" ? "需处理" : generationLoop.status === "running" ? "执行中" : "未运行"}</em>
-                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在处理…" : optimizationBlockedByBuild ? "继续修复 Bundle" : optimizationCompletedWithRollback ? "再次尝试优化" : "重跑 Optimization Loop"}</button>}
+                    <em>{generationCopy.badge}</em>
+                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在处理…" : generationCopy.action}</button>}
                   </div>
                 </div>
                 {optimizationBlockedByBuild
-                  ? <div className="optimization-waiting-note">真实试跑尚未开始；当前只显示 Build Loop 的待修复原因，不提前展示评分、Lift 或 held-out 证据。</div>
-                  : generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>证据类型</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "重复 held-out 比较" : "单次 held-out 观察"}</strong><em>{generationLoop.benchmarkCases} 个冻结场景 · 每个版本每场景 {generationLoop.benchmarkRepeatsPerCase} 次</em></div>}
+                  ? <div className="optimization-waiting-note">真实任务测试还没有开始。先修复上面的生成文件问题，修好后系统会继续测试。</div>
+                  : generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>测试依据</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "多次独立测试" : "单次独立测试"}</strong><em>{generationLoop.benchmarkCases} 个固定场景 · 每个版本每场景 {generationLoop.benchmarkRepeatsPerCase} 次</em></div>}
                 {!optimizationBlockedByBuild && <div className="generation-loop-flow optimization-loop-flow">
                   {OPTIMIZATION_LOOP_STEPS.map((label, index) => {
                     const reachedIndex = generationLoop.status === "passed" || generationLoop.minimalityChecked
@@ -11296,16 +11507,16 @@ export default function Home() {
                   })}
                 </div>}
                 {generationLoop.status !== "idle" && !optimizationBlockedByBuild && <div className="generation-loop-metrics">
-                  <div><span>独立评分 · 普通 AI</span><strong>{generationLoop.benchmarkRuns ? generationLoop.baselineScore : "—"}</strong></div>
-                  <div><span>独立评分 · 当前 Skill</span><strong>{generationLoop.benchmarkRuns ? generationLoop.bestScore : "—"}</strong></div>
-                  <div className={generationLoop.lift > 0 ? "positive" : ""}><span>独立评分 Lift</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.lift >= 0 ? "+" : ""}${generationLoop.lift}` : "—"}</strong></div>
-                  <div><span>冻结断言通过率</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.passRate}%` : "—"}</strong></div>
-                  <div><span>冻结场景正式总分</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.baselineQualityScore} / ${generationLoop.bestQualityScore}` : "—"}</strong></div>
-                  <div><span>匿名 A/B 结果</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 胜" : generationLoop.blindWinner === "baseline" ? "普通 AI 胜" : generationLoop.blindWinner === "tie" ? "两者持平" : "—"}</strong></div>
-                  <div><span>试跑设计</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkCases} 场景 × 每版 ${generationLoop.benchmarkRepeatsPerCase} 次` : "—"}</strong></div>
-                  <div><span>重复运行稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? `Skill σ ${generationLoop.bestStddev} · 基线 σ ${generationLoop.baselineStddev ?? "—"}` : "未测（每场景仅 1 次）"}</strong></div>
+                  <div><span>未使用 Skill 的得分</span><strong>{generationLoop.benchmarkRuns ? generationLoop.baselineScore : "—"}</strong></div>
+                  <div><span>当前 Skill 的得分</span><strong>{generationLoop.benchmarkRuns ? generationLoop.bestScore : "—"}</strong></div>
+                  <div className={generationLoop.lift > 0 ? "positive" : ""}><span>使用 Skill 后提升</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.lift >= 0 ? "+" : ""}${generationLoop.lift}` : "—"}</strong></div>
+                  <div><span>关键要求通过率</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.passRate}%` : "—"}</strong></div>
+                  <div><span>对照评分（普通 AI / Skill）</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.baselineQualityScore} / ${generationLoop.bestQualityScore}` : "—"}</strong></div>
+                  <div><span>盲测结果</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 更好" : generationLoop.blindWinner === "baseline" ? "普通 AI 更好" : generationLoop.blindWinner === "tie" ? "两者接近" : "—"}</strong></div>
+                  <div><span>测试规模</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkCases} 个场景 × 每版 ${generationLoop.benchmarkRepeatsPerCase} 次` : "—"}</strong></div>
+                  <div><span>结果稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? `Skill 波动 ${generationLoop.bestStddev} · 普通 AI 波动 ${generationLoop.baselineStddev ?? "—"}` : "每个场景只测了 1 次"}</strong></div>
                 </div>}
-                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{optimizationStableAtCeiling ? `查看 ${generationLoop.issues.length} 条比较说明` : optimizationCompletedWithRollback ? `查看 ${generationLoop.issues.length} 条未采纳证据` : `查看仍需观察的 ${generationLoop.issues.length} 项`}</summary><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
+                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{generationCopy.issueLabel}</summary><p>这些是测试记录，不一定代表不同问题；同一问题可能有多条证据。</p><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
               </section>
               <div className="editor-shell">
                 <div className="file-tree">
@@ -11653,7 +11864,7 @@ export default function Home() {
             {optimizationStatus === "analyzing" && (
               <div className="optimization-loading" role="status" aria-live="polite">
                 <div className="optimization-loading-copy"><span className="coach-avatar">AI</span><div><strong>正在用多项任务寻找共性问题</strong><small>训练任务用于找问题，独立验证任务不会提供给修改 Agent</small></div><b>{optimizationElapsed}s</b></div>
-                <div className="optimization-scan"><span /></div>
+                <DotMatrixProgress tone="dark" label="正在分析评测证据" />
                 <p>系统会分别试跑训练组和验证组，只根据训练证据提出优化；验证组负责决定候选版本是否能够替换原版。</p>
                 <div className="optimization-token-usage" aria-live="polite">
                   <strong>Token 用量</strong>
@@ -11691,7 +11902,7 @@ export default function Home() {
             {optimizationActive && optimizationStatus !== "analyzing" && (
               <div className="optimization-run-state" role="status" aria-live="polite">
                 <div><span className="coach-avatar">AI</span><p><strong>{optimizationStatus === "optimizing" ? "正在生成有限修改的候选版本" : "正在进行独立验证"}</strong><small>{optimizationStatus === "optimizing" ? `本轮最多 ${OPTIMIZATION_EDIT_BUDGET} 处局部修改，不直接覆盖当前 Skill` : "使用修改 Agent 没看过的保留任务；没有严格提升就自动回滚"}</small></p><b>{optimizationElapsed}s</b></div>
-                <div className="optimization-scan"><span /></div>
+                <DotMatrixProgress tone="dark" label={optimizationStatus === "optimizing" ? "正在生成候选版本" : "正在进行独立验证"} />
                 <div className="optimization-token-usage" aria-live="polite">
                   <strong>Token 用量</strong>
                   <b>{formatAiTokens(busyTokenUsage.totalTokens)}</b>
@@ -11751,29 +11962,15 @@ export default function Home() {
               <span>{busyExecutionLabel}</span>
               <p>{busyExecutionNote}</p>
             </div>
-            <div className="ai-progress-token-usage" aria-live="polite">
-              <div>
-                <span>本次加载 Token</span>
-                <strong>{formatAiTokens(busyTokenUsage.totalTokens)}</strong>
-                <small>{busyTokenUsageStatus}</small>
-              </div>
-              <div>
-                <span>请求次数</span>
-                <strong>{busyTokenUsage.requests}</strong>
-                <small>{busyTokenUsageHint}</small>
-              </div>
-              <em>会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)} tokens</em>
+            <div className={`ai-output-stage ${busyOutputText ? "has-output" : "waiting"}`} aria-label={busyOutputText ? "模型本轮输出" : "模型正在处理"}>
+              {busyOutputText
+                ? <div className="ai-output-scroll" ref={busyOutputViewportRef} key={busyOutputRevision} tabIndex={0}><pre>{busyOutputText}</pre></div>
+                : <WaitingDotField />}
             </div>
-            <div className={`thinking-warp ${busyTask} ${busyExecutionKind}`} aria-hidden="true">
-              <span className="warp-core">AI</span>
-              {thinkingWords.map((word, index) => (
-                <i key={`${word}-${index}`} style={{ "--word-index": index, animationDelay: `${index * 170}ms` } as CSSProperties}>{word}</i>
-              ))}
-            </div>
-            <div className="ai-progress-track"><span /></div>
+            <DotMatrixProgress progress={(busyStageIndex + 0.42) / BUSY_STAGES[busyTask].stages.length} label={`总进度：${busyStage}`} />
             <div className="ai-progress-steps">
               {BUSY_STAGES[busyTask].stages.map((stageName, index) => (
-                <div className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName}>
+                <div className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName} style={{ "--stage-index": index } as CSSProperties}>
                   <i aria-hidden="true">{index < busyStageIndex ? "✓" : index === busyStageIndex ? "●" : ""}</i>
                   <span><strong>{stageName}</strong><small>{index < busyStageIndex ? "已完成" : index === busyStageIndex ? "进行中" : "待进行"}</small></span>
                   {index < BUSY_STAGES[busyTask].stages.length - 1 && <img className="progress-step-arrow" src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-right.svg" alt="" aria-hidden="true" />}

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases, recommendedHostCapabilityIds } from "../app/capability-routing.ts";
+import { HOST_FILE_WORKSPACE_CAPABILITY } from "../app/host-file-capability.ts";
 import { bindWorkflowCapabilities } from "../app/workflow-dag.ts";
 import { applyWorkflowStepPatch, inspectWorkflowPlan, repairWorkflowPlan } from "../app/workflow-plan-repair.ts";
 
@@ -48,6 +49,49 @@ test("host aliases converge without merging MCP connections or overriding disabl
   const optional = reconcileHostCapabilityAliases([alias], [{ ...node("reason", ["$request"], ["report"], "transform", ["core"]), availableCapabilityIds: [alias.id] }], catalog);
   assert.deepEqual(optional.workflowSteps[0].availableCapabilityIds, ["host-document-reading"]);
 });
+
+test("catalog routing semantics override planner drift without losing selection state", () => {
+  const polluted = {
+    ...HOST_FILE_WORKSPACE_CAPABILITY,
+    enabled: true,
+    status: "use-provided",
+    selectionSource: "ai",
+    optional: false,
+    affects: ["artifact-output", "output-contract"],
+  };
+  const result = reconcileHostCapabilityAliases([polluted], [], [HOST_FILE_WORKSPACE_CAPABILITY]);
+  assert.equal(result.items[0].enabled, true);
+  assert.equal(result.items[0].selectionSource, "ai");
+  assert.equal(result.items[0].optional, true);
+  assert.equal(result.items[0].affects, undefined);
+});
+
+for (const placement of ["draft", "review", "revise", "deliver"]) {
+  test(`restored file availability on ${placement} is rebound without losing adjustment feedback`, async () => {
+    const core = { id: "core", kind: "llm", input: "Request", output: "Plan", fallback: "Ask" };
+    const selected = reconcileHostCapabilityAliases([{
+      ...HOST_FILE_WORKSPACE_CAPABILITY,
+      enabled: true,
+      status: "use-provided",
+      selectionSource: "ai",
+      optional: false,
+      affects: ["artifact-output"],
+    }], [], [HOST_FILE_WORKSPACE_CAPABILITY]).items[0];
+    const steps = [
+      node("draft", ["$request"], ["draft_plan"], "transform", ["core"]),
+      { ...node("review", ["draft_plan"], ["$approval_required"], "await-approval", ["core"]), resumeProduces: ["$adjustment_request"] },
+      node("revise", ["draft_plan", "$adjustment_request"], ["revised_plan"], "transform", ["core"]),
+      { ...node("deliver", ["revised_plan"], ["$output"], "deliver", ["core"]), delivers: ["revised_plan"] },
+    ];
+    steps.find((step) => step.id === placement).availableCapabilityIds = [selected.id];
+    const result = await repairWorkflowPlan({ capabilities: [core, selected], workflowSteps: steps, inputs: [] }, () => assert.fail("restored availability must be repaired deterministically"));
+    assert.equal(result.attempts, 0);
+    assert.ok(!result.workflowSteps.some((step) => step.id.startsWith("step-capability-")));
+    assert.deepEqual(result.workflowSteps.find((step) => step.id === "review").resumeProduces, ["$adjustment_request"]);
+    assert.ok(result.workflowSteps.find((step) => step.id === "revise").requires.includes("$adjustment_request"));
+    assert.ok(result.workflowSteps.some((step) => step.availableCapabilityIds?.includes(selected.id)));
+  });
+}
 
 // Reconstruct the reported post-selection failure with unrelated task vocabularies.
 for (const domain of ["device-comparison", "invoice-audit", "release-summary"]) {

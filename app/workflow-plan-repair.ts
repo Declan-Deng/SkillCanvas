@@ -61,12 +61,43 @@ function scopeCheckpointReplies(steps: WorkflowDagStep[]) {
   }
   const businessProducts = new Set(steps.flatMap((step) => step.produces).filter((token) => !Object.values(WORKFLOW_TERMINALS).some((value) => value === token)));
   const occupied = new Set(steps.flatMap((step) => [...step.requires, ...step.produces, ...(step.resumeProduces || [])]));
+  const businessProducer = new Map<string, WorkflowDagStep | null>();
+  for (const step of steps) for (const token of step.produces.filter((value) => businessProducts.has(value))) {
+    businessProducer.set(token, businessProducer.has(token) ? null : step);
+  }
+  const ancestorsOf = (token: string, seen = new Set<string>()): Set<string> => {
+    if (seen.has(token)) return seen;
+    seen.add(token);
+    const producer = businessProducer.get(token);
+    if (producer) for (const dependency of producer.requires.filter((value) => businessProducts.has(value))) ancestorsOf(dependency, seen);
+    return seen;
+  };
+  const distanceToAncestor = (token: string, target: string, seen = new Set<string>()): number => {
+    if (token === target) return 0;
+    if (seen.has(token)) return Number.POSITIVE_INFINITY;
+    seen.add(token);
+    const producer = businessProducer.get(token);
+    if (!producer) return Number.POSITIVE_INFINITY;
+    const distances = producer.requires.filter((value) => businessProducts.has(value))
+      .map((value) => distanceToAncestor(value, target, new Set(seen)));
+    const nearest = distances.length ? Math.min(...distances) : Number.POSITIVE_INFINITY;
+    return Number.isFinite(nearest) ? nearest + 1 : nearest;
+  };
   const producedNames = new Map<string, Map<string, string>>();
   const consumedNames = new Map<string, Map<string, string>>();
   for (const [token, owners] of replies) {
     if (owners.length < 2 || token.startsWith("input:") || businessProducts.has(token)) continue;
     const consumers = steps.filter((step) => step.requires.includes(token));
-    const bindings = consumers.map((consumer) => ({ consumer, candidates: owners.filter((owner) => owner.id !== consumer.id && owner.requires.some((artifact) => businessProducts.has(artifact) && consumer.requires.includes(artifact))) }));
+    const bindings = consumers.map((consumer) => {
+      const dependencies = consumer.requires.filter((value) => value !== token && businessProducts.has(value));
+      const consumerContext = new Set(dependencies.flatMap((value) => [...ancestorsOf(value)]));
+      const ranked = owners.filter((owner) => owner.id !== consumer.id).map((owner) => ({ owner, distance: Math.min(...owner.requires
+        .filter((artifact) => businessProducts.has(artifact) && consumerContext.has(artifact))
+        .flatMap((artifact) => dependencies.map((dependency) => distanceToAncestor(dependency, artifact)))) }))
+        .filter((entry) => Number.isFinite(entry.distance));
+      const nearest = ranked.length ? Math.min(...ranked.map((entry) => entry.distance)) : Number.POSITIVE_INFINITY;
+      return { consumer, candidates: ranked.filter((entry) => entry.distance === nearest).map((entry) => entry.owner) };
+    });
     if (!consumers.length || bindings.some(({ candidates }) => candidates.length !== 1)) continue;
     const names = new Map(owners.map((owner) => [owner.id, `${token}:${owner.id}`]));
     if ([...names.values()].some((name) => occupied.has(name))) continue;
@@ -82,6 +113,285 @@ function scopeCheckpointReplies(steps: WorkflowDagStep[]) {
       input: step.input.replace(/\$?[a-zA-Z_][a-zA-Z0-9_.:-]*/g, (token) => incoming?.get(token) || token),
       when: step.when.replace(/\$?[a-zA-Z_][a-zA-Z0-9_.:-]*/g, (token) => incoming?.get(token) || token) };
   });
+}
+
+/** A delivery contract names the artifact being handed over. When exactly one
+ * real producer exists, bind that artifact as a dependency instead of asking
+ * a model to rediscover an already explicit edge. Ambiguous or missing
+ * products remain compiler errors and go through targeted repair. */
+function bindUnambiguousDeliveries(steps: WorkflowDagStep[]) {
+  const producers = new Map<string, WorkflowDagStep[]>();
+  for (const step of steps) for (const token of step.produces) producers.set(token, [...(producers.get(token) || []), step]);
+  return steps.map((step) => {
+    if (!["deliver", "persist"].includes(step.role || "") || !step.delivers?.length) return step;
+    const requires = [...step.requires];
+    for (const token of step.delivers) {
+      if (step.produces.includes(token) || requires.includes(token) || Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)) continue;
+      const owners = (producers.get(token) || []).filter((owner) => owner.id !== step.id);
+      if (owners.length === 1) requires.push(token);
+    }
+    return requires.length === step.requires.length ? step : { ...step, requires };
+  });
+}
+
+/** `$output` is a control terminal, never the content being handed over. If a
+ * delivery has exactly one validated (or otherwise sole) business dependency,
+ * bind that real artifact. Multiple candidates stay invalid for model repair. */
+function bindTerminalOnlyDeliveries(steps: WorkflowDagStep[]) {
+  const producers = new Map<string, WorkflowDagStep | null>();
+  for (const step of steps) for (const token of step.produces) producers.set(token, producers.has(token) ? null : step);
+  const consumed = new Set(steps.flatMap((step) => [...step.requires, ...step.mutates, ...(step.delivers || [])]));
+  return steps.map((step) => {
+    if (step.role !== "deliver" || !step.delivers?.length || step.delivers.some((token) => !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token))) return step;
+    const candidates = step.requires.filter((token) => !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)
+      && !isUserReplyToken(token) && !["$request", "$source"].includes(token) && !token.startsWith("input:") && !token.startsWith("state:"));
+    const validated = candidates.filter((token) => producers.get(token)?.role === "validate");
+    let selected = validated.length === 1 ? validated : candidates.length === 1 ? candidates : [];
+    if (!selected.length) {
+      const leaves = steps.filter((entry) => entry.id !== step.id && !["await-input", "await-approval", "deliver", "persist"].includes(entry.role || ""))
+        .flatMap((entry) => entry.produces)
+        .filter((token) => !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token) && !isUserReplyToken(token) && !token.startsWith("state:")
+          && !token.startsWith("capability:") && !consumed.has(token));
+      if (leaves.length === 1) selected = leaves;
+    }
+    if (selected.length !== 1) return step;
+    return { ...step, requires: step.requires.includes(selected[0]) ? step.requires : [...step.requires, selected[0]], delivers: selected };
+  });
+}
+
+const isWorkflowTerminal = (token: string) => Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token);
+const isControlToken = (token: string) => isWorkflowTerminal(token) || isUserReplyToken(token) || token.startsWith("state:");
+const isRawInputToken = (token: string) => ["$request", "$source"].includes(token) || token.startsWith("input:");
+
+function capabilityLooksLikeGate(capability: WorkflowPlanCapability | undefined) {
+  return Boolean(capability && (capability.kind === "eval"
+    || /(?:test|check|validate|verify|lint|quality|format|schema|测试|检查|校验|验证|质检|格式)/i
+      .test(`${capability.id} ${capability.requirement || ""} ${capability.purpose || ""} ${capability.output}`)));
+}
+
+function stepLooksLikeGate(step: WorkflowDagStep, capabilities: Map<string, WorkflowPlanCapability>) {
+  return step.role === "validate" || step.capabilityIds.some((id) => capabilityLooksLikeGate(capabilities.get(id)))
+    || /(?:test|check|validate|verify|lint|quality|format|schema|测试|检查|校验|验证|质检|格式)/i
+      .test(`${step.id} ${step.action} ${step.output}`);
+}
+
+function stepUsesDeterministicGate(step: WorkflowDagStep, capabilities: Map<string, WorkflowPlanCapability>) {
+  return step.capabilityIds.some((id) => {
+      const capability = capabilities.get(id);
+      return capability?.kind === "script" || capability?.kind === "eval"
+        || (step.id.startsWith("step-capability-") && capabilityLooksLikeGate(capability));
+    });
+}
+
+/**
+ * Close deterministic wiring omissions after capability binding. Model plans
+ * commonly describe validators in prose but omit their exact edges, or use a
+ * pause branch as the only apparent ending. This pass never invents a task
+ * operation: it only connects declared checks to an existing business
+ * artifact and creates the missing hand-off for an already produced result.
+ */
+export function stabilizeBoundWorkflowPlan(steps: WorkflowDagStep[], capabilities: WorkflowPlanCapability[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], mutates: [...step.mutates],
+    delivers: [...(step.delivers || [])], resumeProduces: [...(step.resumeProduces || [])] }));
+  const capabilityById = new Map(capabilities.map((item) => [item.id, item]));
+  const occupied = new Set(next.flatMap((step) => [...step.requires, ...step.produces, ...(step.resumeProduces || [])]));
+
+  // Independent checks may use the same generic result name. They are
+  // separate gate receipts, so give only otherwise-unconsumed collisions a
+  // stable private name instead of pretending that two nodes own one value.
+  const owners = new Map<string, WorkflowDagStep[]>();
+  for (const step of next) for (const token of step.produces) owners.set(token, [...(owners.get(token) || []), step]);
+  for (const [token, producers] of owners) {
+    if (producers.length < 2 || isWorkflowTerminal(token) || !producers.every((step) => stepUsesDeterministicGate(step, capabilityById))) continue;
+    const externalConsumers = next.filter((step) => !producers.includes(step) && step.requires.includes(token));
+    if (externalConsumers.length) continue;
+    for (const producer of producers) {
+      const scoped = `${token}:${producer.id}`;
+      if (occupied.has(scoped)) continue;
+      producer.produces = producer.produces.map((value) => value === token ? scoped : value);
+      producer.delivers = producer.delivers?.map((value) => value === token ? scoped : value);
+      occupied.add(scoped);
+    }
+  }
+
+  const rebuild = () => {
+    const producerByToken = new Map<string, WorkflowDagStep | null>();
+    const consumed = new Set(next.flatMap((step) => [...step.requires, ...step.mutates, ...(step.delivers || [])]));
+    for (const step of next) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+      producerByToken.set(token, producerByToken.has(token) ? null : step);
+    }
+    return { producerByToken, consumed };
+  };
+
+  let graph = rebuild();
+  const businessTokens = () => next.flatMap((step) => step.produces.map((token) => ({ step, token })))
+    .filter(({ token }) => !isControlToken(token) && !token.startsWith("capability:") && !isRawInputToken(token));
+  const deliveryArtifacts = () => new Set(next.flatMap((step) => ["deliver", "persist"].includes(step.role || "")
+    ? [...(step.delivers || []), ...step.requires.filter((token) => graph.producerByToken.has(token) && !stepLooksLikeGate(graph.producerByToken.get(token)!, capabilityById))]
+    : []).filter((token) => !isControlToken(token) && !isRawInputToken(token)));
+
+  // Bind validator/test inputs to the unique artifact already headed for
+  // delivery (or, failing that, the unique business leaf). Never promote an
+  // unbound placeholder to a user input.
+  for (const gate of next.filter((step) => stepUsesDeterministicGate(step, capabilityById))) {
+    const unbound = gate.requires.filter((token) => token.startsWith("unbound:"));
+    if (!unbound.length) continue;
+    const exact = businessTokens().filter(({ token, step }) => step.id !== gate.id
+      && new RegExp(`(?:^|[^a-zA-Z0-9_.:-])${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|[^a-zA-Z0-9_.:-])`).test(`${gate.input} ${gate.action}`));
+    const delivered = businessTokens().filter(({ step, token }) => step.id !== gate.id && deliveryArtifacts().has(token));
+    const leaves = businessTokens().filter(({ step, token }) => step.id !== gate.id && !graph.consumed.has(token) && !stepLooksLikeGate(step, capabilityById));
+    const candidates = exact.length === 1 ? exact : delivered.length === 1 ? delivered : leaves.length === 1 ? leaves : [];
+    if (candidates.length !== 1) continue;
+    gate.requires = [...gate.requires.filter((token) => !token.startsWith("unbound:")), candidates[0].token];
+    graph = rebuild();
+  }
+
+  // A check receipt is control evidence for hand-off, not another user
+  // deliverable. Feed every otherwise-orphaned receipt into the compatible
+  // final delivery so the check is ordered and cannot silently disappear.
+  graph = rebuild();
+  const terminalDeliveries = next.filter((step) => ["deliver", "persist"].includes(step.role || "")
+    && (step.produces.includes(WORKFLOW_TERMINALS.completed) || (step.delivers || []).length > 0));
+  for (const gate of next.filter((step) => stepUsesDeterministicGate(step, capabilityById))) {
+    const receipts = gate.produces.filter((token) => !isControlToken(token) && !graph.consumed.has(token));
+    if (!receipts.length || !terminalDeliveries.length) continue;
+    const gatesArtifact = gate.requires.filter((token) => graph.producerByToken.has(token));
+    const compatible = terminalDeliveries.filter((delivery) => gatesArtifact.some((token) => delivery.requires.includes(token) || delivery.delivers?.includes(token)));
+    const targets = compatible.length ? compatible : terminalDeliveries.length === 1 ? terminalDeliveries : [];
+    for (const delivery of targets) for (const receipt of receipts) if (!delivery.requires.includes(receipt)) delivery.requires.push(receipt);
+    graph = rebuild();
+  }
+
+  // Resolve a terminal-only hand-off from an existing business result. The
+  // local binding runs again here because capability helpers may have changed
+  // which leaf is unique.
+  const rebound = bindTerminalOnlyDeliveries(next);
+  next.splice(0, next.length, ...rebound);
+  graph = rebuild();
+
+  // A pause is a valid branch ending, but it cannot replace normal task
+  // delivery. If no completion path exists, hand off the unique/latest real
+  // artifact that the declared workflow already produced.
+  if (!next.some((step) => step.produces.includes(WORKFLOW_TERMINALS.completed))) {
+    const gateTokens = new Set(next.filter((step) => stepLooksLikeGate(step, capabilityById)).flatMap((step) => step.produces));
+    const preferred = businessTokens().filter(({ token }) => !gateTokens.has(token) && !graph.consumed.has(token));
+    const checkpointArtifacts = next.filter((step) => ["await-input", "await-approval"].includes(step.role || ""))
+      .flatMap((step) => [...(step.delivers || []), ...step.requires]).filter((token) => graph.producerByToken.has(token) && !isControlToken(token));
+    const uniqueCheckpoint = [...new Set(checkpointArtifacts)];
+    const candidates = preferred.length === 1 ? preferred
+      : uniqueCheckpoint.length === 1 ? businessTokens().filter(({ token }) => token === uniqueCheckpoint[0])
+        : businessTokens().filter(({ step, token }) => !gateTokens.has(token) && !stepLooksLikeGate(step, capabilityById));
+    const selected = candidates.at(-1);
+    if (selected) {
+      const baseId = "step-final-delivery";
+      let id = baseId, suffix = 2;
+      while (next.some((step) => step.id === id)) id = `${baseId}-${suffix++}`;
+      const semanticOwners = selected.step.capabilityIds.filter((owner) => capabilityById.get(owner)?.kind === "llm");
+      const fallbackOwners = capabilities.filter((item) => item.kind === "llm").map((item) => item.id);
+      const receipts = next.filter((step) => stepUsesDeterministicGate(step, capabilityById))
+        .flatMap((step) => step.produces).filter((token) => !isControlToken(token) && !graph.consumed.has(token));
+      next.push({ id, capabilityIds: semanticOwners.length ? semanticOwners : fallbackOwners.slice(0, 1), role: "deliver",
+        when: "已完成声明的处理与检查时", input: selected.token, action: "交付已经生成并通过检查的结果",
+        output: "向用户交付现有结果，不重新生成内容", fallback: "如果结果尚未生成或检查未通过，停止交付并说明缺口",
+        requires: [...new Set([selected.token, ...receipts])], produces: [WORKFLOW_TERMINALS.completed], mutates: [], delivers: [selected.token], resumeProduces: [] });
+    }
+  }
+  return next;
+}
+
+/** A single read operation followed by a single root semantic transform has
+ * one lossless wiring: the transform consumes every otherwise-orphaned read
+ * product. This covers planners that describe those inputs in prose but omit
+ * the exact token names. Ambiguous multi-consumer workflows remain invalid. */
+function bindUniqueReadProducts(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires] }));
+  const consumed = new Set(next.flatMap((step) => [...step.requires, ...step.mutates, ...(step.delivers || [])]));
+  for (const reader of next.filter((step) => step.role === "read")) {
+    const products = reader.produces.filter((token) => !consumed.has(token) && !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token));
+    if (!products.length) continue;
+    const candidates = next.filter((step) => step.id !== reader.id && step.role === "transform"
+      && step.capabilityIds.some((id) => reader.capabilityIds.includes(id))
+      && step.requires.every((token) => ["$request", "$source"].includes(token) || token.startsWith("input:") || isUserReplyToken(token)));
+    if (candidates.length !== 1) continue;
+    candidates[0].requires.push(...products);
+    products.forEach((token) => consumed.add(token));
+  }
+  return next;
+}
+
+/** A mutable field cannot be updated before it exists. Models occasionally
+ * mark the first assignment as mutates[], then keep using mutates[] for later
+ * revisions. Turn only the uniquely earliest writer into the initializer and
+ * wire every later writer to that state. Ambiguous parallel writers remain a
+ * compiler error instead of being ordered by array position. */
+function initializeFirstStateWrites(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], mutates: [...step.mutates] }));
+  const producers = new Map<string, string | null>();
+  for (const step of next) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    producers.set(token, producers.has(token) ? null : step.id);
+  }
+  const outgoing = new Map(next.map((step) => [step.id, new Set<string>()]));
+  for (const step of next) for (const dependency of step.requires) {
+    const producer = producers.get(dependency);
+    if (producer && producer !== step.id) outgoing.get(producer)?.add(step.id);
+  }
+  const precedes = (from: string, to: string, seen = new Set<string>()): boolean => {
+    if (seen.has(from)) return false;
+    seen.add(from);
+    return [...(outgoing.get(from) || [])].some((nextId) => nextId === to || precedes(nextId, to, seen));
+  };
+  const tokens = new Set(next.flatMap((step) => step.mutates));
+  for (const token of tokens) {
+    if (producers.has(token) || isUserReplyToken(token) || Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)) continue;
+    const writers = next.filter((step) => step.mutates.includes(token));
+    const roots = writers.filter((candidate) => !writers.some((other) => other.id !== candidate.id && precedes(other.id, candidate.id)));
+    if (roots.length !== 1 || !["transform", "read", "validate"].includes(roots[0].role || "transform")) continue;
+    const initializer = roots[0];
+    initializer.mutates = initializer.mutates.filter((value) => value !== token);
+    initializer.requires = initializer.requires.filter((value) => value !== token);
+    if (!initializer.produces.includes(token)) initializer.produces.push(token);
+    producers.set(token, initializer.id);
+    for (const writer of writers.filter((step) => step.id !== initializer.id)) {
+      if (!writer.requires.includes(token)) writer.requires.push(token);
+    }
+  }
+  return next;
+}
+
+/** If exactly one step updates a state field and exactly one terminal step
+ * reads it, an otherwise disconnected handoff has only one safe direction:
+ * update, then validate/deliver. Add an explicit completion edge so runtime
+ * ordering matches that contract. Multiple writers/readers remain untouched
+ * because joining conditional branches would be unsafe. */
+function orderUniqueStateHandoffs(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces] }));
+  const producers = new Map<string, string | null>();
+  for (const step of next) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    producers.set(token, producers.has(token) ? null : step.id);
+  }
+  const outgoing = new Map(next.map((step) => [step.id, new Set<string>()]));
+  for (const step of next) for (const dependency of step.requires) {
+    const producer = producers.get(dependency);
+    if (producer && producer !== step.id) outgoing.get(producer)?.add(step.id);
+  }
+  const precedes = (from: string, to: string, seen = new Set<string>()): boolean => {
+    if (seen.has(from)) return false;
+    seen.add(from);
+    return [...(outgoing.get(from) || [])].some((nextId) => nextId === to || precedes(nextId, to, seen));
+  };
+  for (const token of new Set(next.flatMap((step) => step.mutates))) {
+    const writers = next.filter((step) => step.mutates.includes(token));
+    const terminalReaders = next.filter((step) => step.requires.includes(token) && !step.mutates.includes(token)
+      && ["validate", "deliver", "persist"].includes(step.role || ""));
+    if (writers.length !== 1 || terminalReaders.length !== 1) continue;
+    const [writer] = writers, [reader] = terminalReaders;
+    if (precedes(writer.id, reader.id) || precedes(reader.id, writer.id)) continue;
+    const completion = `state:${token}:updated-by:${writer.id}`;
+    if (!writer.produces.includes(completion)) writer.produces.push(completion);
+    if (!reader.requires.includes(completion)) reader.requires.push(completion);
+    outgoing.get(writer.id)?.add(reader.id);
+  }
+  return next;
 }
 
 /** Lossless boundary metadata, not task invention. Bind only a unique declared
@@ -110,6 +420,11 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
       ? "persist" : owners.length && owners.every((item) => item.kind === "reference" || item.kind === "asset") ? "read" : "transform";
     return { ...step, role: step.role || before?.role || closed.role || capabilityRole as WorkflowDagStep["role"] };
   });
+  steps = initializeFirstStateWrites(steps);
+  steps = bindUniqueReadProducts(steps);
+  steps = bindTerminalOnlyDeliveries(steps);
+  steps = bindUnambiguousDeliveries(steps);
+  steps = orderUniqueStateHandoffs(steps);
   steps = scopeCheckpointReplies(steps);
   steps = scopeDeliveredVersions(steps);
   // Reply values written by models without "$" are still runtime events when
@@ -173,7 +488,23 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
 
 export function inspectWorkflowPlan(context: WorkflowPlanContext) {
   const initialInputs = ["$request", "$source", ...context.inputs.map((input) => `input:${input.id}`)];
-  const steps = closeWorkflowDagTerminals(bindWorkflowCapabilities(normalizeWorkflowPlanBindings(context), context.capabilities), initialInputs);
+  const normalized = normalizeWorkflowPlanBindings(context);
+  const bound = bindWorkflowCapabilities(normalized, context.capabilities);
+  const baseline = closeWorkflowDagTerminals(bound, initialInputs);
+  const baselineCompile = compileWorkflowDag(baseline, initialInputs, { terminalOutputs: Object.values(WORKFLOW_TERMINALS), requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed] });
+  const capabilityById = new Map(context.capabilities.map((item) => [item.id, item]));
+  const byId = new Map(baseline.map((step) => [step.id, step]));
+  const deterministicOnly = baselineCompile.issues.every((issue) => {
+    if (["missing-terminal", "invalid-terminal"].includes(issue.type)) return true;
+    const step = byId.get(issue.stepId);
+    if (!step || !stepUsesDeterministicGate(step, capabilityById)) return false;
+    return ["duplicate-producer", "unmet-dependency", "unconsumed-production", "disconnected-step"].includes(issue.type)
+      && (issue.type !== "unmet-dependency" || Boolean(issue.dependency?.startsWith("unbound:")));
+  });
+  const stabilized = baselineCompile.issues.length && deterministicOnly
+    ? stabilizeBoundWorkflowPlan(bound, context.capabilities)
+    : bound;
+  const steps = closeWorkflowDagTerminals(stabilized, initialInputs);
   const result = compileWorkflowDag(steps, initialInputs, { terminalOutputs: Object.values(WORKFLOW_TERMINALS), requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed] });
   const ids = new Set(context.capabilities.map((item) => item.id));
   const ownershipIssues = steps.flatMap((step) => !step.capabilityIds.length || step.capabilityIds.some((id) => !ids.has(id))
@@ -267,7 +598,7 @@ export async function repairWorkflowPlan(
   const originalCompile = compileWorkflowDag(originalSteps, current.initialInputs);
   const structuralProductions = new Set(originalCompile.issues.flatMap((issue) => issue.type === "duplicate-producer" && issue.dependency && current.initialInputs.includes(issue.dependency) ? [issue.dependency] : []));
   const originalArtifacts = new Set(originalSteps.flatMap((step) => [...step.produces, ...(step.resumeProduces || [])]
-    .filter((token) => !structuralProductions.has(token) && !(step.role && ["deliver", "persist"].includes(step.role) && /^\$output_(?:final|revised|draft)$/.test(token)
+    .filter((token) => !isUserReplyToken(token) && !structuralProductions.has(token) && !(step.role && ["deliver", "persist"].includes(step.role) && /^\$output_(?:final|revised|draft)$/.test(token)
       && !step.delivers?.includes(token) && !originalSteps.some((consumer) => consumer.requires.includes(token))))));
   const cyclicSteps = new Set(originalCompile.issues.filter((issue) => issue.type === "cycle").map((issue) => issue.stepId));
   let rejectionIssues: string[] = [];

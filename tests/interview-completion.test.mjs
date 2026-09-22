@@ -33,6 +33,6 @@ test("the generation handler, retry and UI share the four-round gate; extra mate
   assert.ok(handler.indexOf("if (!interviewCompletion.ready)") < handler.indexOf("beginBusy("));
   assert.ok(handler.indexOf("if (!interviewCompletion.ready)") < handler.indexOf("await runBlueprintPlanning("));
   assert.match(page, /retryAction === "build-blueprint"\) void buildBlueprint\(\)/);
-  assert.match(page, /\{isFinalInterviewRound && <div className=\{`understanding-evidence/);
+  assert.match(page, /\{isFinalInterviewRound && \(\s*<section className="final-note-card"/);
   assert.match(page, /disabled=\{busy \|\| materialsLoading \|\| !interviewReady \|\| \(isFinalInterviewRound && !interviewCompletion.ready\)\}/);
 });
