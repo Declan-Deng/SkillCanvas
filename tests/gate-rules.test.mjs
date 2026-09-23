@@ -263,6 +263,7 @@ test("operational defaults require explicit confirmation", () => {
   assert.equal(hasUnconfirmedOperationalDefaults("# supported formula: (likes + comments) / followers", "公式必须清楚，但分母尚未确认", false), false);
   assert.equal(hasUnconfirmedOperationalDefaults("默认互动率阈值：1%。", "用户确认默认互动率阈值为 1%"), false);
   assert.deepEqual(findUnconfirmedOperationalDefaults("默认互动率阈值：1%。\n默认预算：10万元。", "尚未确定"), ["默认互动率阈值：1%。", "默认预算：10万元。"]);
+  assert.deepEqual(findUnconfirmedOperationalDefaults("- Source mechanism: 外部文章说默认预算 10 万元。\n- Source support: [{\"quote\":\"默认预算 10 万元\"}]\n- Proposed action: 默认预算 10 万元。", "尚未确定"), ["- Proposed action: 默认预算 10 万元。"]);
 });
 
 test("compiler makes unconfirmed formulas visibly pending", () => {

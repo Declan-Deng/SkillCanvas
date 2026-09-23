@@ -304,6 +304,10 @@ export function findUnconfirmedOperationalDefaults(runtimeText: string, confirme
   const formulaMarker = /(?:公式|formula)\s*(?:为|是|[:：=]).*(?:\/|\*|\+|-)/i;
 
   return runtimeText.split("\n").flatMap((line) => {
+    // Provenance fields quote third-party claims for review; they are not
+    // executable instructions. Keep checking the separate Proposed action
+    // and all ordinary runtime lines for unconfirmed defaults.
+    if (/^\s*[-*]?\s*(?:Source mechanism|Source support|Sources|Evidence type|Confidence|Verification|Eval failure evidence)\s*:/i.test(line)) return [];
     const compact = line.replace(/\s+/g, "").toLowerCase();
     const formulaPending = /待确认|需要.{0,12}确认|请.{0,12}确认|确认后|用户.{0,24}确认.{0,40}后(?:才)?|候选(?:公式|规则)|仅作示例/i.test(line);
     if (checkFormula && formulaMarker.test(line) && !confirmed.includes(compact.replace(/^[#>*\-\d.)、]+/, ""))) return formulaPending ? [] : [line.trim().replace(/\s+/g, " ").slice(0, 180)];
