@@ -214,6 +214,21 @@ test("Canonical SkillIR compilation rebinds a retained operation whose prior own
   assert.deepEqual(ir.runtimeContract.workflow.find((step) => step.id === "orphan-step")?.capabilityIds, ["core-resume"]);
 });
 
+test("Canonical compilation accepts the same declared state roots as workflow preflight", () => {
+  const plan = fixturePlan();
+  plan.stateModel = { needed: true, scope: "session", fields: [{ name: "rawRecords", purpose: "当前输入", source: "user-claim", updateRule: "每轮更新" }], missingBehavior: "请求记录" };
+  plan.workflowSteps = [
+    { id: "compose", capabilityIds: ["core-resume"], role: "transform", when: "有输入", input: "$request", action: "整理记录", output: "草稿", fallback: "询问", requires: ["$request", "rawRecords"], produces: ["draft"], mutates: [] },
+    { id: "deliver", capabilityIds: ["core-resume"], role: "deliver", when: "草稿完成", input: "draft", action: "交付草稿", output: "结果", fallback: "询问", requires: ["draft"], produces: ["$output"], delivers: ["draft"], mutates: [] },
+  ];
+  const ir = compileSkillIR({
+    skillName: "stateful-workflow", idea: "根据记录整理周报", answers: { inputs: "原始材料" }, plan,
+    loop: { mode: "turn-based", goal: "交付周报", maxRounds: 2, stopConditions: [], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "根据记录整理周报", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  });
+  assert.ok(ir.runtimeContract.workflow.some((step) => step.id === "compose"));
+});
+
 test("Canonical SkillIR preserves an input-required branch beside the productive path", () => {
   const plan = fixturePlan();
   plan.workflowSteps = [
@@ -608,6 +623,16 @@ test("alternative input representations compile as one any-of source contract", 
   assert.equal(required[0].concept, "source-material");
   assert.deepEqual(required[0].representations, ["text", "structured-file"]);
   assert.match(projectSkillMarkdown({ ...compile(), inputs, tasks: [{ ...compile().tasks[0], requiredInputIds: [required[0].id], optionalInputIds: [] }] }), /支持：text、structured-file/);
+});
+
+test("alternative weekly record genres do not become separate mandatory inputs", () => {
+  const inputs = deriveTaskInputContract({
+    idea: "我要做一个每周汇报助手。",
+    answers: { inputs: "直接粘贴一周的聊天/群聊记录；会议纪要或邮件片段" },
+  });
+  assert.equal(inputs.filter((item) => item.required).length, 1);
+  assert.equal(inputs.find((item) => item.required)?.concept, "source-material");
+  assert.ok(inputs.find((item) => item.required)?.representations.includes("text"));
 });
 
 test("missing-input recovery answers remain policies rather than required materials", () => {

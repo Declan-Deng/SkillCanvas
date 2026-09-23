@@ -597,6 +597,7 @@ export type DerivedTaskInput = SkillIR["inputs"][number];
 const VAGUE_INPUT_STRATEGY = /^(?:通常|一般|有时|可能)?(?:只有)?(?:一句|简单想法)|会提供(?:文件|链接|资料|案例)|需要\s*AI\s*(?:主动)?追问|有固定模板或数据|(?:我)?不确定|请\s*AI\s*(?:帮我)?判断/i;
 const INPUT_HANDLING_POLICY = /(?:先|同时|继续|直接).{0,12}(?:标记|询问|列出|请求|处理|生成|补充)|(?:缺少|缺失|不足|混乱|无法读取).{0,24}(?:时|则|先|标记)|how.{0,16}(?:handle|recover)/i;
 const INPUT_REPRESENTATION_OPTION = /^(?:纯文本(?:粘贴)?|文本粘贴|(?:上传|提供)?\s*(?:PDF|Word|DOCX|Excel|XLSX|CSV|JSON|Markdown|MD|图片|截图|扫描件|音频|录音|视频|文档|文件)|结构化(?:表格|文件|数据)(?:（[^）]+）|\([^)]*\))?|网页链接|URL|邮件|聊天记录)(?:（[^）]+）|\([^)]*\))?$/i;
+const ALTERNATIVE_RECORD_SOURCE = /(?:记录|纪要|摘录|片段|清单|草稿|流水|日志|笔记|邮件|聊天|群聊|访谈|transcript|notes?|draft|log|email)/i;
 
 function inputRepresentations(value: string) {
   const representations: string[] = [];
@@ -748,10 +749,17 @@ export function deriveTaskInputContract(input: {
     && !/^(?:供|以便|方便).{0,20}(?:补充|确认|处理)|^(?:继续)?(?:标记|列出|询问|请求)/.test(value));
   const representationOptions = declaredAnswerInputs.filter((value) => INPUT_REPRESENTATION_OPTION.test(value));
   const mergeRepresentationOptions = representationOptions.length >= 2 && representationOptions.length === declaredAnswerInputs.length;
-  if (mergeRepresentationOptions) {
-    add("source-material", "完成任务所依据的原始材料", true, representationOptions.flatMap(inputRepresentations));
+  // A list of alternative record genres is one source contract, not a demand
+  // that the user supply every genre. Keep genuinely different roles (such as
+  // a target specification AND source material) separate.
+  const mergeAlternativeRecords = declaredAnswerInputs.length >= 2
+    && /(?:或|任选|任一|either|any of)/i.test(answers.inputs || "")
+    && declaredAnswerInputs.every((value) => ALTERNATIVE_RECORD_SOURCE.test(value))
+    && !declaredAnswerInputs.some((value) => /(?:目标规范|验收标准|决策规则|评分规则|权限|账号|密钥|target specification|acceptance criteria|credentials?)/i.test(value));
+  if (mergeRepresentationOptions || mergeAlternativeRecords) {
+    add("source-material", "完成任务所依据的原始材料", true, declaredAnswerInputs.flatMap(inputRepresentations));
   }
-  declaredAnswerInputs.filter((value) => !mergeRepresentationOptions || !representationOptions.includes(value)).forEach((value) => {
+  declaredAnswerInputs.filter((value) => !(mergeAlternativeRecords || (mergeRepresentationOptions && representationOptions.includes(value)))).forEach((value) => {
     const semanticName = semanticInputName(value);
     const concept = conceptForInput(semanticName);
     const definition = INPUT_CONCEPTS.find((item) => item.concept === concept);
@@ -1112,7 +1120,14 @@ export function compileSkillIR(input: {
   const ownerlessStep = workflowSource.find((step) => step.capabilityIds.length === 0);
   if (ownerlessStep) throw new Error(`WORKFLOW_DAG_INVALID: Workflow step ${ownerlessStep.id} 没有可执行的 capability owner`);
   if (!workflowSource.length) throw new Error("WORKFLOW_DAG_INVALID: Workflow 没有可执行步骤");
-  const workflowInitialInputs = ["$request", "$source", ...inputs.map((item) => `input:${item.id}`)];
+  // The blueprint preflight treats declared session state as runtime roots.
+  // Canonical compilation must use the same roots, otherwise a plan that
+  // passed preflight can fail later with every state field "unmet".
+  const stateRoots = input.plan.stateModel.needed && Array.isArray(input.plan.stateModel.fields)
+    ? input.plan.stateModel.fields.flatMap((field) => field && typeof field === "object" && typeof (field as { name?: unknown }).name === "string"
+      ? [(field as { name: string }).name.trim()] : []).filter(Boolean)
+    : [];
+  const workflowInitialInputs = ["$request", "$source", ...inputs.map((item) => `input:${item.id}`), ...stateRoots];
   const closedWorkflow = closeWorkflowDagTerminals(workflowSource, workflowInitialInputs);
   const workflow = assertWorkflowDag(
     closedWorkflow,

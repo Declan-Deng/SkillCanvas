@@ -410,6 +410,22 @@ test("explicit checkpoint tokens in step prose become real dependencies", () => 
   assert.ok(checked.steps.find((step) => step.id === "write-draft").requires.includes("$supplemented_inputs"));
 });
 
+test("normal workflow path does not require a reply from an optional insufficiency branch", () => {
+  const context = {
+    capabilities: [cap("core", "llm", "Weekly records", "Report")], inputs: [], workflowSteps: [
+      { ...node("read", ["$request"], ["$records_read"]), input: "$request" },
+      { ...node("ask-if-insufficient", ["$records_read"], ["$input_required"], "await-input"), resumeProduces: ["$supplemented_records"] },
+      { ...node("compose", ["$records_read", "$supplemented_records"], ["$draft"]),
+        input: "$records_read（及用户补充后的 $supplemented_records，如触发不足分支）", when: "$records_read 判定记录充足" },
+      { ...node("deliver", ["$draft"], ["$output"], "deliver"), delivers: ["$draft"] },
+    ],
+  };
+  const checked = inspectWorkflowPlan(context);
+  const compose = checked.steps.find((step) => step.id === "compose");
+  assert.ok(!compose.requires.includes("$supplemented_records"));
+  assert.match(compose.input, /若有/);
+});
+
 test("checkpoint control markers and optional file availability do not become business dependencies", async () => {
   const hostFile = {
     id: "host-file-workspace", kind: "builtin-tool", input: "用户授权范围内的文件路径和任务要求",

@@ -324,6 +324,28 @@ function bindExplicitTokenReads(steps: WorkflowDagStep[]) {
   });
 }
 
+/** A reply from an exceptional wait branch is not mandatory on the normal
+ * path. Planners sometimes put it in requires[] while describing it as
+ * "if that branch occurred" in input prose, making the normal path depend on
+ * a reply that never happened. Preserve the conditional instruction without
+ * turning the reply into a hard DAG edge. */
+function normalizeOptionalCheckpointReads(steps: WorkflowDagStep[]) {
+  const optionalReplies = new Set(steps.filter((step) => step.role === "await-input").flatMap((step) => step.resumeProduces || []));
+  return steps.map((step) => {
+    if (["await-input", "await-approval"].includes(step.role || "")) return step;
+    let input = step.input;
+    let requires = [...step.requires];
+    for (const token of requires) {
+      if (!optionalReplies.has(token) || !input.includes(token) || step.when.includes(token)) continue;
+      const nearby = input.slice(Math.max(0, input.indexOf(token) - 28), input.indexOf(token) + token.length + 28);
+      if (!/(?:如|若|如果|仅当|可选|视情况|when|if|optional)/i.test(nearby)) continue;
+      requires = requires.filter((value) => value !== token);
+      input = input.replaceAll(token, "用户在该分支补充的信息（若有）");
+    }
+    return { ...step, input, requires };
+  });
+}
+
 /**
  * Close deterministic wiring omissions after capability binding. Model plans
  * commonly describe validators in prose but omit their exact edges, or use a
@@ -563,6 +585,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
   });
   steps = bindCheckpointReplyOwnership(steps);
   steps = bindCheckpointControlEdges(steps);
+  steps = normalizeOptionalCheckpointReads(steps);
   steps = bindExplicitTokenReads(steps);
   steps = bindDeclaredStateReads(steps, context.stateFields || []);
   // Undeclared fields still need a real initializer. Declared fields already
