@@ -2607,10 +2607,17 @@ h3 {
   border-radius: 50%;
   content: "";
   height: 7px;
+  left: 50%;
   opacity: 0;
-  transform: scale(0.55);
+  position: absolute;
+  top: 50%;
+  transform: translate(-50%, -50%) scale(0.55);
   transition: opacity 130ms ease, transform 150ms var(--ease-out);
   width: 7px;
+}
+
+.question-options.single .choice-indicator img {
+  display: none;
 }
 
 .question-options.multiple .choice-indicator {
@@ -2642,7 +2649,7 @@ h3 {
 
 .question-options.single button.selected .choice-indicator::after {
   opacity: 1;
-  transform: scale(1);
+  transform: translate(-50%, -50%) scale(1);
 }
 
 .question-options.multiple button.selected .choice-indicator {

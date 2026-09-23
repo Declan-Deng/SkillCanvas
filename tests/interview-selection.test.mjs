@@ -92,5 +92,7 @@ test("interview selection uses a real icon asset instead of a font checkmark", a
   assert.match(page, /highestRoundReached \? <i className="ui-check-icon"/);
   const choiceStyles = css.slice(css.indexOf(".choice-indicator"), css.indexOf(".question-options button .choice-label"));
   assert.doesNotMatch(choiceStyles, /content:\s*["']✓["']/);
+  assert.match(choiceStyles, /\.question-options\.single \.choice-indicator img\s*\{[^}]*display:\s*none;/s);
+  assert.match(choiceStyles, /\.question-options\.single \.choice-indicator::after\s*\{[^}]*left:\s*50%;[^}]*position:\s*absolute;[^}]*top:\s*50%;[^}]*translate\(-50%, -50%\)/s);
   assert.match(icon, /<path d="M5 12l5 5l10 -10"/);
 });
