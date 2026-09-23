@@ -402,6 +402,15 @@ textarea:focus-visible {
   width: 38px;
 }
 
+.ui-check-icon {
+  background: currentColor;
+  display: inline-block;
+  height: 20px;
+  -webkit-mask: url("/icons/tabler/check.svg") center / contain no-repeat;
+  mask: url("/icons/tabler/check.svg") center / contain no-repeat;
+  width: 20px;
+}
+
 .step-item.done:not(.active) .step-index {
   background: #e5f4ee;
   border-color: #72cdb6;
@@ -2230,6 +2239,11 @@ h3 {
   color: white;
 }
 
+.round-navigator .ui-check-icon {
+  height: 19px;
+  width: 19px;
+}
+
 .round-transition {
   animation: round-content-enter 220ms var(--ease-out) both;
 }
@@ -2575,13 +2589,13 @@ h3 {
   background: var(--paper);
   border: 1.5px solid #b8bdb9;
   display: inline-flex;
-  flex: 0 0 15px;
-  height: 15px;
+  flex: 0 0 17px;
+  height: 17px;
   justify-content: center;
   margin-right: 4px;
   position: relative;
   transition: background 140ms ease, border-color 140ms ease, transform 130ms var(--ease-out);
-  width: 15px;
+  width: 17px;
 }
 
 .question-options.single .choice-indicator {
@@ -2604,15 +2618,22 @@ h3 {
 }
 
 .question-options.multiple .choice-indicator::after {
-  color: white;
-  content: "✓";
-  font-size: 12.5px;
-  font-style: normal;
-  font-weight: 850;
-  line-height: 1;
+  content: none;
+}
+
+.choice-indicator img {
+  height: 12px;
   opacity: 0;
-  transform: scale(0.7);
-  transition: opacity 130ms ease, transform 150ms var(--ease-out);
+  pointer-events: none;
+  transform: scale(0.55) rotate(-8deg);
+  transition: opacity 130ms ease, transform 160ms var(--ease-out);
+  width: 12px;
+}
+
+.question-options.multiple button.selected .choice-indicator img {
+  filter: brightness(0) invert(1);
+  opacity: 1;
+  transform: scale(1) rotate(0);
 }
 
 .question-options button.selected .choice-indicator {
@@ -2626,11 +2647,6 @@ h3 {
 
 .question-options.multiple button.selected .choice-indicator {
   background: var(--green);
-}
-
-.question-options.multiple button.selected .choice-indicator::after {
-  opacity: 1;
-  transform: scale(1);
 }
 
 .question-options button:active .choice-indicator {

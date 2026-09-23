@@ -1,8 +1,9 @@
+import { optionConflictsWithPriorEvidence } from "./discovery-preview.ts";
+
 /**
  * Detect goals that name only a generic assistant/improvement, without a
- * concrete task, input, domain, or deliverable. In that state an attractive
- * first option is still only a hypothesis: the UI must not silently turn it
- * into a confirmed task by preselecting it.
+ * concrete task, input, domain, or deliverable. The preview can use this to
+ * label its concrete recommendation as a working hypothesis rather than fact.
  */
 export function goalNeedsTaskDiscovery(value: string) {
   const text = String(value || "").trim().toLowerCase();
@@ -13,3 +14,28 @@ export function goalNeedsTaskDiscovery(value: string) {
   return genericGoal || text.replace(/[\s，。,.!?！？、]/g, "").length < 8;
 }
 
+/**
+ * Pick a concrete, reversible working recommendation for beginner interviews.
+ * "Ask AI to decide" remains an escape hatch for the user, but choosing it by
+ * default makes the AI appear to have avoided the decision it was asked to
+ * help with. Providers may still return that option (or omit a recommendation),
+ * so recover to the first evidence-compatible concrete option.
+ */
+export function pickRecommendedInterviewOption(
+  options: string[],
+  requested: unknown,
+  priorEvidence: string,
+  unsureOption: string,
+) {
+  const requestedOption = typeof requested === "string" ? requested.trim() : "";
+  if (
+    requestedOption
+    && requestedOption !== unsureOption
+    && options.includes(requestedOption)
+    && !optionConflictsWithPriorEvidence(requestedOption, priorEvidence)
+  ) return requestedOption;
+
+  return options.find((option) => option !== unsureOption && !optionConflictsWithPriorEvidence(option, priorEvidence))
+    || options.find((option) => option !== unsureOption)
+    || (options.includes(unsureOption) ? unsureOption : undefined);
+}
