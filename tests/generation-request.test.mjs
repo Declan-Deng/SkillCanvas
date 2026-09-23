@@ -38,4 +38,5 @@ test("build/repair have progress-aware bounded attempts and a longer shared clie
     assert.ok(generationClientBudget(mode) > first.totalMs + second.totalMs);
   }
   assert.equal(generationClientBudget("ping"), null);
+  assert.equal(generationClientBudget("capability-delta"), 132_000);
 });

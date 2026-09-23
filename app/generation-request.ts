@@ -6,6 +6,9 @@ export function generationAttemptBudget(mode: string, attempt: number) {
 }
 
 export function generationClientBudget(mode: string) {
+  // Capability-gap analysis can produce a long structured response. Treat it
+  // like other substantive model stages, rather than the generic 60s default.
+  if (mode === "capability-delta") return 132_000;
   const first = generationAttemptBudget(mode, 1);
   const second = generationAttemptBudget(mode, 2);
   return first && second ? first.totalMs + second.totalMs + 15_000 : null;
