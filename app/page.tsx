@@ -4587,7 +4587,9 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
     });
   }
 
-  if (reusableArtifact && !items.some((item) => item.kind === "asset" && capabilityIsActive(item))) {
+  // This compiler-owned asset is a CSV file. A reusable prose or Markdown
+  // layout belongs in the Skill contract, not an unrelated CSV runtime step.
+  if (reusableArtifact && requestedAssetExtensions.has(".csv") && !items.some((item) => item.kind === "asset" && capabilityIsActive(item))) {
     items.splice(Math.max(1, items.findIndex((item) => item.kind === "eval")), 0, {
       id: "reusable-output-template",
       kind: "asset",

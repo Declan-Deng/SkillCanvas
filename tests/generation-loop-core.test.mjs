@@ -64,6 +64,8 @@ test("artifact delivery and reusable assets require direct user evidence", () =>
   assert.equal(artifactDeliveryRequested("创建一个技能，读取 PDF 并分析其中的文本"), false);
   assert.equal(reusableOutputAssetRequested("将排序规则写入技能包，后续直接使用"), false);
   assert.equal(reusableOutputAssetRequested("保存这次确认的 CSV 表头和输出格式，以后复用"), true);
+  assert.equal(reusableOutputAssetRequested("固定模板格式：本周工作 / 下周计划，分条目 Markdown，以后每周照做"), false);
+  assert.equal(reusableOutputAssetRequested("把确认后的模板保存为 Markdown 模板文件，以后复用"), true);
 });
 
 test("capability closure requires implementation, runtime routing, and executable eval coverage", () => {
