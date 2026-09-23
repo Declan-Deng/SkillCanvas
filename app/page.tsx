@@ -2050,15 +2050,16 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
     : productiveCheckpoint ? ["在没有核心材料时虚构具体产出", "把尚未到达的后续决策与当前核心输入合并成一轮问题"]
     : hasHumanCheckpoint ? ["在关键决策值缺失时假装该值已经确认或擅自选择默认值"]
     : [];
+  const missingDecisionFixture = executableProductiveCheckpoint
+    ? "本用例没有提供优先级规则等关键决策的具体取值；“每次确认规则”只是协作要求，不是本次规则值。先用上述材料完成并交付不依赖该值的可逆草稿，再只询问一个最小必要问题；不得把缺失值说成已经确认。"
+    : productiveCheckpoint ? "本用例没有携带核心输入材料，也没有提供后续决策值。先只请求当前执行必需的核心材料；不要把尚未到达的后续决策合并进同一轮问题。收到材料后，先交付不依赖后续决策的可逆部分。"
+    : hasHumanCheckpoint ? "本用例没有提供优先级规则等关键决策的具体取值；“每次确认规则”只是协作要求，不是本次规则值。只暂停依赖该值的步骤，并只询问一个最小必要问题；不得把缺失值说成已经确认。" : "";
   const executionFixture = [
     `这是本次实际任务：${concreteTask}。`,
     triggerExample && triggerExample !== concreteTask ? `用户原话示例：${triggerExample}。` : "",
     `本次输入契约：${inputs}。`,
     representativeInput ? `本用例携带的代表性输入材料如下，必须实际处理这些内容：\n${representativeInput}` : "",
-    executableProductiveCheckpoint
-      ? "本用例没有提供优先级规则等关键决策的具体取值；“每次确认规则”只是协作要求，不是本次规则值。先用上述材料完成并交付不依赖该值的可逆草稿，再只询问一个最小必要问题；不得把缺失值说成已经确认。"
-      : productiveCheckpoint ? "本用例没有携带核心输入材料，也没有提供后续决策值。先只请求当前执行必需的核心材料；不要把尚未到达的后续决策合并进同一轮问题。收到材料后，先交付不依赖后续决策的可逆部分。"
-      : hasHumanCheckpoint ? "本用例没有提供优先级规则等关键决策的具体取值；“每次确认规则”只是协作要求，不是本次规则值。只暂停依赖该值的步骤，并只询问一个最小必要问题；不得把缺失值说成已经确认。" : "",
+    missingDecisionFixture,
     confirmedCorrection ? `此前真实任务预演中，用户已经明确纠正：${confirmedCorrection}。本轮必须继续遵守。` : "",
     `内容处理权限：${contentPolicy}。`,
     "请执行当前步骤并交付可观察结果；不要只复述工作流或返回空模板。",
@@ -2097,23 +2098,31 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
   [...semanticCapabilities, ...groundingCapabilities, ...integrationCapabilities].forEach((item) => {
     const expectedArtifacts = artifactsForCapability(item);
     const evalFamily = familyForCapability(item);
+    // A file writer cannot be proven by the pre-approval pause fixture. Give
+    // its focused integration case a separate, explicitly approved test turn;
+    // this is synthetic Eval state, never permission for the live workflow.
+    const approvedArtifactCase = evalFamily === "integration" && capabilityOwnsArtifacts(item)
+      && hasHumanCheckpoint && executionFixtureReady;
+    const capabilityFixture = approvedArtifactCase
+      ? `${executionFixture.replace(missingDecisionFixture, "")} 隔离评测前置回合：用户已补齐当前任务的必要输入，并对已展示的草稿明确回复“确认，请按草稿写入并交付文件”。这一确认仅属于本测试用例；现在验证真实文件写入及可检查的交付路径。`
+      : executionFixture;
     evals.push({
       id: `core-${item.id}`,
       eval_family: evalFamily,
       category: "core_capability",
       should_trigger: true,
-      prompt: `${executionFixture} 本用例重点验证：${item.requirement}。${evalFamily === "integration" ? `本用例明确满足激活条件：${item.activationCondition || item.routingCondition}。` : ""}`,
-      context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", workflow_checkpoint: executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", capability_scope: item.scope || normalizeCapabilityScope(item), activation_condition: item.activationCondition || item.routingCondition, routing_condition: item.routingCondition, input_contract: item.input, output_contract: item.output },
+      prompt: `${capabilityFixture} 本用例重点验证：${item.requirement}。${evalFamily === "integration" ? `本用例明确满足激活条件：${item.activationCondition || item.routingCondition}。` : ""}`,
+      context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", workflow_checkpoint: approvedArtifactCase ? "required-value-provided" : executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", capability_scope: item.scope || normalizeCapabilityScope(item), activation_condition: item.activationCondition || item.routingCondition, routing_condition: item.routingCondition, input_contract: item.input, output_contract: item.output },
       capability_ids: [item.id],
       expected: {
         behaviors: [
           ...(item.evaluationCriteria.length ? item.evaluationCriteria.filter((criterion) => !(productiveCheckpoint && /确认|用户预期|主观|审批|规则|决策|选择/i.test(criterion))) : [item.output]),
           "完成当前实际任务并交付至少一个符合输出契约的可检查结果",
           ...(item.kind === "reference" ? ["把适用的专业规则用于当前结果，而不是只复述规则或分析过程"] : []),
-          ...checkpointBehaviors,
+          ...(approvedArtifactCase ? ["仅在本用例已经明确确认后写入真实文件，并返回可检查的文件路径"] : checkpointBehaviors),
           ...correctionBehaviors,
         ],
-        must_not: ["只描述将如何完成而不产生真实结果", "只分析、只列步骤或只提出问题而不交付当前可完成的结果", "使用与当前分支无关的资源", ...checkpointMustNot, ...correctionMustNot],
+        must_not: ["只描述将如何完成而不产生真实结果", "只分析、只列步骤或只提出问题而不交付当前可完成的结果", "使用与当前分支无关的资源", ...(approvedArtifactCase ? ["把本用例提供的明确确认误判为缺失，或把确认推广到其他真实会话"] : checkpointMustNot), ...correctionMustNot],
         artifacts: expectedArtifacts,
       },
       graders: evalFamily === "integration"

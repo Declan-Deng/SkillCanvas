@@ -10,6 +10,8 @@ import { normalizePlannedDemoTurns } from "../app/demo-episode.ts";
 import { completedNumericDecisionFixture, confirmedCorrectionEvalEvidence, productiveCheckpointRequested } from "../app/workflow-compiler.ts";
 import { compileSkillIR, bindSkillIREvals, ensureSkillIREvalCoverage, projectEvalBank, reconcileSkillIRContentPermission, reconcileSkillIRActionPermissions, reconcileSkillIRInputResolutions, reconcileSkillIRSourceEvidence } from "../app/skill-ir.ts";
 import { reconcileRuntimeInputResources } from "../app/bundle-resource-repair.ts";
+import { capabilityOwnsArtifacts, caseProvidesCapabilityEvidence } from "../app/skill-pipeline-core.ts";
+import { evalCaseIsRunnable } from "../app/skill-ir.ts";
 import { capabilities, workflow } from "./fixtures/blueprint.mjs";
 
 const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
@@ -25,7 +27,7 @@ const dependencies = {
   // simple text-only plan. Prompt construction and Canonical projection run.
   reconcileCapabilityPlanContentPermission: (plan) => plan,
   confirmedContentPolicy: () => "按用户材料执行",
-  capabilityOwnsArtifacts: () => false,
+  capabilityOwnsArtifacts,
   normalizeCapabilityScope: () => "task-specific",
 };
 const compiled = ts.transpileModule(functions.join("\n"), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
@@ -69,6 +71,32 @@ test("every synthesized negative/permission fixture retains the full task rather
   }
 });
 
+test("file-delivery Eval has its own approved turn while semantic Eval still waits for approval", () => {
+  const plan = structuredClone(capabilities.capabilityPlan);
+  plan.outputContract = { mode: "artifact", format: "Markdown", requiredSections: ["报告"], artifactPatterns: ["outputs/*.md"], validation: ["文件存在"] };
+  const writer = {
+    ...structuredClone(plan.items[0]), id: "host-file-workspace", kind: "builtin-tool", name: "读取与编辑工作区文件",
+    affects: ["artifact-output", "output-contract"], output: "真实存在的 Markdown 文件",
+    activationCondition: "用户确认后写入文件", requirement: "创建并交付 Markdown 文件",
+    evaluationCriteria: ["文件路径可检查"],
+  };
+  plan.items.push(writer);
+  const bank = JSON.parse(createSpecificEvals("weekly-report", "整理每周汇报", {
+    inputs: "一周工作记录", __previewInput: "周一完成接口联调；周三确认下周发布窗口。",
+    "delivery-checkpoint": "先给我看草稿，等我确认后再定稿",
+  }, workflow.loopPlan, plan));
+  const semantic = bank.evals.find((item) => item.id === "core-core");
+  const file = bank.evals.find((item) => item.id === "core-host-file-workspace");
+  assert.equal(semantic.context.workflow_checkpoint, "productive-partial-delivery");
+  assert.match(semantic.prompt, /不得把缺失值说成已经确认/);
+  assert.equal(file.context.workflow_checkpoint, "required-value-provided");
+  assert.equal(evalCaseIsRunnable(file), true);
+  assert.deepEqual(file.expected.artifacts, ["outputs/*.md"]);
+  assert.match(file.prompt, /隔离评测前置回合：用户已补齐/);
+  assert.doesNotMatch(file.prompt, /本用例没有提供优先级规则等关键决策/);
+  assert.equal(caseProvidesCapabilityEvidence(file, writer), true);
+});
+
 test("literal, mixed and unbalanced punctuation inside input is not proof of a truncated model response", () => {
   const prompts = [
     '请将字符 “ 替换为直角引号，并保留其余内容。',
@@ -94,7 +122,7 @@ test("Demo normalization keeps complete executable input, including the text aft
 });
 
 test("legacy Eval banks are migrated before P0/P1 repair and cannot hide behind a restored frozen version", () => {
-  assert.equal(EVAL_COMPILER_VERSION, "2.9");
+  assert.equal(EVAL_COMPILER_VERSION, "2.10");
   assert.match(source, /evalNeedsRebuild = parsed\.version !== EVAL_COMPILER_VERSION/);
   assert.match(source, /restoreFrozenBundleExactly = savedEvalVersion === EVAL_COMPILER_VERSION/);
   const loop = source.slice(source.indexOf("async function runOptimizationLoop("));
