@@ -346,6 +346,21 @@ function normalizeOptionalCheckpointReads(steps: WorkflowDagStep[]) {
   });
 }
 
+/** A clarification checkpoint is a real pause even when the model forgot its
+ * control output. Only infer the pause for a side-effect-free, output-less
+ * step whose own condition/action explicitly concerns missing user input. */
+function closeOutputlessClarifications(steps: WorkflowDagStep[]) {
+  return steps.map((step) => {
+    if (step.produces.length || step.mutates.length || step.delivers?.length
+      || ["deliver", "persist", "validate", "await-approval"].includes(step.role || "")) return step;
+    const asksUser = /(?:询问|请|要求|请求|等待|澄清|确认).{0,24}(?:用户|本人|本周重点|补充|回复)|(?:ask|request|clarify|confirm).{0,24}(?:user|weekly focus|input|reply)/i.test(`${step.action} ${step.output}`)
+      || /(?:resolve|clarify|ask)-.{0,35}(?:focus|input|missing)/i.test(step.id);
+    const missingValue = /(?:缺少|未提供|不明确|不确定|尚未|未确认|需要补充|missing|unclear|unknown|not provided)/i.test(`${step.when} ${step.action} ${step.fallback}`);
+    if (!asksUser || !missingValue) return step;
+    return { ...step, role: "await-input" as const, produces: [WORKFLOW_TERMINALS.inputRequired] };
+  });
+}
+
 /**
  * Close deterministic wiring omissions after capability binding. Model plans
  * commonly describe validators in prose but omit their exact edges, or use a
@@ -583,6 +598,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
       ? "persist" : owners.length && owners.every((item) => item.kind === "reference" || item.kind === "asset") ? "read" : "transform";
     return { ...step, role: step.role || before?.role || closed.role || capabilityRole as WorkflowDagStep["role"] };
   });
+  steps = closeOutputlessClarifications(steps);
   steps = bindCheckpointReplyOwnership(steps);
   steps = bindCheckpointControlEdges(steps);
   steps = normalizeOptionalCheckpointReads(steps);

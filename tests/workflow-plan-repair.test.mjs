@@ -426,6 +426,20 @@ test("normal workflow path does not require a reply from an optional insufficien
   assert.match(compose.input, /若有/);
 });
 
+test("an output-less request for missing weekly focus becomes a real pause terminal", () => {
+  const context = {
+    capabilities: [cap("core", "llm", "Weekly records", "Report")], inputs: [], workflowSteps: [
+      { ...node("read", ["$request"], ["records"]), input: "$request" },
+      { ...node("step-resolve-weekly-focus", ["records"], [], "transform"), when: "缺少本周重点时", action: "询问用户补充本周重点，等待回复", output: "本周重点", fallback: "未回复时暂停" },
+      { ...node("deliver", ["records"], ["$output"], "deliver"), delivers: ["records"] },
+    ],
+  };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  assert.equal(checked.steps.find((step) => step.id === "step-resolve-weekly-focus")?.role, "await-input");
+  assert.ok(checked.steps.find((step) => step.id === "step-resolve-weekly-focus")?.produces.includes("$input_required"));
+});
+
 test("checkpoint control markers and optional file availability do not become business dependencies", async () => {
   const hostFile = {
     id: "host-file-workspace", kind: "builtin-tool", input: "用户授权范围内的文件路径和任务要求",

@@ -227,6 +227,8 @@ test("Canonical compilation accepts the same declared state roots as workflow pr
     requirements: [{ id: "goal", requirement: "根据记录整理周报", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
   });
   assert.ok(ir.runtimeContract.workflow.some((step) => step.id === "compose"));
+  assert.equal(validateCanonicalSkillIR(ir).issues.some((issue) => /rawRecords/.test(issue)), false);
+  assert.equal(auditSkillIRFiles(projectSkillIRFiles(ir)).some((issue) => /rawRecords/.test(issue)), false);
 });
 
 test("Canonical SkillIR preserves an input-required branch beside the productive path", () => {
@@ -633,6 +635,13 @@ test("alternative weekly record genres do not become separate mandatory inputs",
   assert.equal(inputs.filter((item) => item.required).length, 1);
   assert.equal(inputs.find((item) => item.required)?.concept, "source-material");
   assert.ok(inputs.find((item) => item.required)?.representations.includes("text"));
+  const mixed = deriveTaskInputContract({
+    idea: "我要做一个每周汇报助手。",
+    answers: { inputs: "零散流水记录：按天或按时间随手记的短句，需要先归并成事项；已有草稿：我已经写了一版，只需要按周报类型调整语气和格式" },
+  });
+  assert.equal(mixed.filter((item) => item.required).length, 1);
+  assert.equal(mixed.find((item) => item.required)?.concept, "source-material");
+  assert.equal(mixed.some((item) => /需要先归|成事项|调整语气|^格式$/.test(item.name)), false);
 });
 
 test("missing-input recovery answers remain policies rather than required materials", () => {

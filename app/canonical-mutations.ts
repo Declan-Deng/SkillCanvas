@@ -1,4 +1,4 @@
-import { auditUserEvidencePolarity, bindSkillIREvals, normalizeKnowledgeAssessment, projectEvalBank, reconcileSkillIRStateLoops, reconcileSkillIRUserEvidence, skillIRDigest, type SkillIR, type SkillIRCapability, type SkillIRRequirement } from "./skill-ir.ts";
+import { auditUserEvidencePolarity, bindSkillIREvals, declaredWorkflowStateRoots, normalizeKnowledgeAssessment, projectEvalBank, reconcileSkillIRStateLoops, reconcileSkillIRUserEvidence, skillIRDigest, type SkillIR, type SkillIRCapability, type SkillIRRequirement } from "./skill-ir.ts";
 import { requirementEvidence } from "./user-evidence.ts";
 import { bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, normalizeWorkflowDagSteps, WORKFLOW_TERMINALS } from "./workflow-dag.ts";
 import { hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
@@ -382,7 +382,7 @@ export function validateCanonicalSkillIR(ir: SkillIR) {
   if (JSON.stringify(ir.knowledgeAssessment) !== JSON.stringify(normalizedKnowledge)) issues.push("knowledgeAssessment 与 Canonical Domain Evidence 覆盖情况不一致");
   const dag = compileWorkflowDag(
     normalizeWorkflowDagSteps(ir.runtimeContract?.workflow),
-    ["$request", "$source", ...ir.inputs.map((item) => `input:${item.id}`)],
+    ["$request", "$source", ...ir.inputs.map((item) => `input:${item.id}`), ...declaredWorkflowStateRoots(ir.stateRequirement)],
     {
       terminalOutputs: Object.values(WORKFLOW_TERMINALS),
       requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed],

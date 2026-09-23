@@ -585,14 +585,23 @@ function splitCapabilityInputCandidates(value: string) {
 }
 
 function splitDeclaredInputCandidates(value: string) {
-  return unique(splitList(value).flatMap((item) => splitTopLevel(item, new Set(["，", ","])).flatMap((part) => (
-    /[（(【[]/.test(part)
-      ? [part]
-      : part.split(/\s*(?:并且|并|以及|与|和)\s*/i)
-  )).map((part) => part.trim()).filter(Boolean))).slice(0, 12);
+  // Interview option text contains clauses such as "需要先归并成事项" and
+  // "调整语气和格式". Splitting on every Chinese 并/和 creates fictitious
+  // mandatory materials. Only a second explicit submission verb separates
+  // two input roles inside one answer.
+  return unique(splitList(value).flatMap((item) => /[（(【[]/.test(item)
+    ? [item]
+    : item.split(/(?:[，,]\s*)?并(?=(?:上传|提供|粘贴|输入|附上|导入|发送|给出|读取|提交))/i)
+  ).map((part) => part.trim()).filter(Boolean)).slice(0, 12);
 }
 
 export type DerivedTaskInput = SkillIR["inputs"][number];
+
+export function declaredWorkflowStateRoots(stateModel: Record<string, unknown> | undefined) {
+  if (!stateModel?.needed || !Array.isArray(stateModel.fields)) return [];
+  return stateModel.fields.flatMap((field) => field && typeof field === "object" && typeof (field as { name?: unknown }).name === "string"
+    ? [(field as { name: string }).name.trim()] : []).filter(Boolean);
+}
 
 const VAGUE_INPUT_STRATEGY = /^(?:通常|一般|有时|可能)?(?:只有)?(?:一句|简单想法)|会提供(?:文件|链接|资料|案例)|需要\s*AI\s*(?:主动)?追问|有固定模板或数据|(?:我)?不确定|请\s*AI\s*(?:帮我)?判断/i;
 const INPUT_HANDLING_POLICY = /(?:先|同时|继续|直接).{0,12}(?:标记|询问|列出|请求|处理|生成|补充)|(?:缺少|缺失|不足|混乱|无法读取).{0,24}(?:时|则|先|标记)|how.{0,16}(?:handle|recover)/i;
@@ -753,7 +762,7 @@ export function deriveTaskInputContract(input: {
   // that the user supply every genre. Keep genuinely different roles (such as
   // a target specification AND source material) separate.
   const mergeAlternativeRecords = declaredAnswerInputs.length >= 2
-    && /(?:或|任选|任一|either|any of)/i.test(answers.inputs || "")
+    && !/(?:同时提供|全部提供|均需提供|都要提供|各一份|both required)/i.test(answers.inputs || "")
     && declaredAnswerInputs.every((value) => ALTERNATIVE_RECORD_SOURCE.test(value))
     && !declaredAnswerInputs.some((value) => /(?:目标规范|验收标准|决策规则|评分规则|权限|账号|密钥|target specification|acceptance criteria|credentials?)/i.test(value));
   if (mergeRepresentationOptions || mergeAlternativeRecords) {
@@ -1123,10 +1132,7 @@ export function compileSkillIR(input: {
   // The blueprint preflight treats declared session state as runtime roots.
   // Canonical compilation must use the same roots, otherwise a plan that
   // passed preflight can fail later with every state field "unmet".
-  const stateRoots = input.plan.stateModel.needed && Array.isArray(input.plan.stateModel.fields)
-    ? input.plan.stateModel.fields.flatMap((field) => field && typeof field === "object" && typeof (field as { name?: unknown }).name === "string"
-      ? [(field as { name: string }).name.trim()] : []).filter(Boolean)
-    : [];
+  const stateRoots = declaredWorkflowStateRoots(input.plan.stateModel);
   const workflowInitialInputs = ["$request", "$source", ...inputs.map((item) => `input:${item.id}`), ...stateRoots];
   const closedWorkflow = closeWorkflowDagTerminals(workflowSource, workflowInitialInputs);
   const workflow = assertWorkflowDag(
@@ -2045,7 +2051,7 @@ export function auditSkillIRFiles(files: Record<string, string>) {
   if (!ir.runtimeContract?.workflow?.length) issues.push("Canonical SkillIR 缺少可投影的 Runtime Workflow");
   const dag = compileWorkflowDag(
     normalizeWorkflowDagSteps(ir.runtimeContract?.workflow),
-    ["$request", "$source", ...ir.inputs.map((item) => `input:${item.id}`)],
+    ["$request", "$source", ...ir.inputs.map((item) => `input:${item.id}`), ...declaredWorkflowStateRoots(ir.stateRequirement)],
     {
       terminalOutputs: Object.values(WORKFLOW_TERMINALS),
       requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed],
