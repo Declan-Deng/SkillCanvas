@@ -4506,7 +4506,6 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
   const reusableArtifact = reusableOutputAssetRequested(reusableOutputEvidence);
   const outputRequest = [idea, answers["output-format"], plan.outputContract.format].filter(Boolean).join("；");
   const userRequiresArtifact = artifactDeliveryRequested(outputRequest);
-  items = removeUnrequestedOptionalArtifactOwnership(items, userRequiresArtifact);
   let items = plan.items.map((item) => item.kind === "script" && /(?:LLM|大模型|模型).{0,12}(?:手动)?(?:计算|处理|生成)|手动计算/i.test(item.fallback)
     ? {
       ...item,
@@ -4531,6 +4530,7 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
       items.push({ ...catalogItem, status: "use-provided", enabled: true, recommended: true, selectionSource: "ai" });
     }
   }
+  items = removeUnrequestedOptionalArtifactOwnership(items, userRequiresArtifact);
   const explicitAssetNeed = reusableArtifact || /品牌资产|素材包|logo|字体文件|图片素材|provided asset/i.test(taskEvidence);
   const requestedAssetExtensions = new Set(inferArtifactPatterns(`${answers["output-format"] || ""}；${plan.outputContract.format}`)
     .flatMap((pattern) => pattern.toLowerCase().match(/\.(?:pdf|docx?|pptx?|xlsx?|csv|json|html?|md|png|jpe?g)\b/g) || []));

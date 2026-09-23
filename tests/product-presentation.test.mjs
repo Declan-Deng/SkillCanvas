@@ -80,6 +80,14 @@ test("blueprint stays borderless and capability selection has one surface", () =
   assert.match(page, /<section className="tool-ability-picker">/);
 });
 
+test("task capability normalization initializes the item list before rewriting it", () => {
+  const start = page.indexOf("function ensureTaskCapabilities");
+  const end = page.indexOf("function ", start + 20);
+  const body = page.slice(start, end > start ? end : undefined);
+  assert.ok(body.indexOf("let items =") >= 0);
+  assert.ok(body.indexOf("let items =") < body.indexOf("items = removeUnrequestedOptionalArtifactOwnership"));
+});
+
 test("workflow recommendation keeps the decision and removes redundant explanation", () => {
   assert.doesNotMatch(page, /AI 已推荐并采用一条可执行流程/);
   assert.doesNotMatch(page, /<p>\{loopPlan\.reason\}<\/p>/);
