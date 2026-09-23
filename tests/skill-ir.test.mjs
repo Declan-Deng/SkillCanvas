@@ -361,7 +361,7 @@ test("compiler deterministically scopes contradictory ask-first and autonomous r
   assert.match(projected, /其余不依赖该信息的可逆工作可以自主继续/);
 });
 
-test("compiler makes repeated confirmation and analysis-only completion impossible", () => {
+test("compiler prevents repeated confirmation and scopes final-output checks to the delivery branch", () => {
   const ir = compile();
   ir.runtimeContract.instructionPriority = [];
   ir.runtimeContract.completionChecks = [];
@@ -371,9 +371,11 @@ test("compiler makes repeated confirmation and analysis-only completion impossib
   const reconciled = reconcileSkillIRActionPermissions(ir);
   const projected = projectSkillMarkdown(reconciled);
   assert.match(projected, /never ask the user to confirm information or authority they already provided/i);
-  assert.match(projected, /analysis, a plan, or questions alone do not complete the workflow/i);
+  assert.match(projected, /Once the delivery branch's prerequisites are met, produce and check the actual task result/i);
   assert.deepEqual(reconciled.outputs[0].requiredSections, ["可检查的主要结果"]);
-  assert.ok(reconciled.outputs[0].validation.some((item) => /实际结果已经生成/.test(item)));
+  assert.ok(reconciled.outputs[0].validation.some((item) => /仅在交付分支的必需输入与确认均已满足时，检查实际结果已经生成/.test(item)));
+  assert.ok(reconciled.outputs[0].validation.some((item) => /缺失时先列出具体缺口或可审阅草稿并暂停/.test(item)));
+  assert.doesNotMatch(projected, /- 实际结果已经生成；不能只返回分析、计划、规则复述或待确认问题/);
 });
 
 test("projection repairs generated action conflicts but preserves conflicting user evidence for clarification", () => {

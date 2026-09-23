@@ -2041,19 +2041,19 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
   const correctionBehaviors = confirmedCorrection ? [`落实用户在真实任务预演中确认的纠正：${confirmedCorrection}`] : [];
   const correctionMustNot = confirmedCorrection ? ["重新采用用户已在真实任务预演中否定或纠正的方案"] : [];
   const checkpointBehaviors = executableProductiveCheckpoint
-    ? ["关键决策值缺失时先交付不依赖该值的可用草稿，再提出一个最小必要问题；值已提供时不得重复询问"]
+    ? ["待确认内容缺失时先展示不依赖确认的可用草稿，再逐项列出当前缺口；收到真实答复前不执行依赖确认的步骤"]
     : productiveCheckpoint ? ["核心输入缺失时只请求当前执行必需的材料；收到材料后先完成不依赖后续决策的部分，到达决策检查点时再询问一个最小必要问题"]
-    : hasHumanCheckpoint ? ["只暂停依赖缺失决策值的步骤，并提出一个最小必要问题；值已提供时不得重复询问"]
+    : hasHumanCheckpoint ? ["只暂停确实依赖用户确认的步骤，明确列出待确认项；用户已确认时不得重复询问"]
     : [];
   const checkpointMustNot = executableProductiveCheckpoint
-    ? ["在关键决策值缺失时假装该值已经确认或擅自选择默认值", "只提问而不交付任何可逆的已完成部分"]
+    ? ["在待确认内容尚未得到真实答复时假装已经确认或擅自选择默认值", "只提问而不交付任何可逆的已完成部分"]
     : productiveCheckpoint ? ["在没有核心材料时虚构具体产出", "把尚未到达的后续决策与当前核心输入合并成一轮问题"]
-    : hasHumanCheckpoint ? ["在关键决策值缺失时假装该值已经确认或擅自选择默认值"]
+    : hasHumanCheckpoint ? ["在尚未得到真实确认时假装已经确认或擅自选择默认值"]
     : [];
   const missingDecisionFixture = executableProductiveCheckpoint
-    ? "本用例没有提供优先级规则等关键决策的具体取值；“每次确认规则”只是协作要求，不是本次规则值。先用上述材料完成并交付不依赖该值的可逆草稿，再只询问一个最小必要问题；不得把缺失值说成已经确认。"
+    ? "本用例尚未提供工作流后续确认节点所需的真实答复。先用上述材料完成并展示不依赖确认的可逆草稿，再逐项列出当前确实存在的缺口并暂停相应后续步骤；不得把尚未收到的答复说成已经确认。"
     : productiveCheckpoint ? "本用例没有携带核心输入材料，也没有提供后续决策值。先只请求当前执行必需的核心材料；不要把尚未到达的后续决策合并进同一轮问题。收到材料后，先交付不依赖后续决策的可逆部分。"
-    : hasHumanCheckpoint ? "本用例没有提供优先级规则等关键决策的具体取值；“每次确认规则”只是协作要求，不是本次规则值。只暂停依赖该值的步骤，并只询问一个最小必要问题；不得把缺失值说成已经确认。" : "";
+    : hasHumanCheckpoint ? "本用例尚未提供工作流后续确认节点所需的真实答复。先处理不依赖确认的部分，到达确认节点时明确列出待确认项并暂停相应后续步骤；不得把尚未收到的答复说成已经确认。" : "";
   const executionFixture = [
     `这是本次实际任务：${concreteTask}。`,
     triggerExample && triggerExample !== concreteTask ? `用户原话示例：${triggerExample}。` : "",

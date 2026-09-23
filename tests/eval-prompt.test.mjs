@@ -88,7 +88,8 @@ test("file-delivery Eval has its own approved turn while semantic Eval still wai
   const semantic = bank.evals.find((item) => item.id === "core-core");
   const file = bank.evals.find((item) => item.id === "core-host-file-workspace");
   assert.equal(semantic.context.workflow_checkpoint, "productive-partial-delivery");
-  assert.match(semantic.prompt, /不得把缺失值说成已经确认/);
+  assert.match(semantic.prompt, /不得把尚未收到的答复说成已经确认/);
+  assert.doesNotMatch(semantic.prompt, /优先级规则|每次确认规则/);
   assert.equal(file.context.workflow_checkpoint, "required-value-provided");
   assert.equal(evalCaseIsRunnable(file), true);
   assert.deepEqual(file.expected.artifacts, ["outputs/*.md"]);
@@ -122,7 +123,7 @@ test("Demo normalization keeps complete executable input, including the text aft
 });
 
 test("legacy Eval banks are migrated before P0/P1 repair and cannot hide behind a restored frozen version", () => {
-  assert.equal(EVAL_COMPILER_VERSION, "2.10");
+  assert.equal(EVAL_COMPILER_VERSION, "2.11");
   assert.match(source, /evalNeedsRebuild = parsed\.version !== EVAL_COMPILER_VERSION/);
   assert.match(source, /restoreFrozenBundleExactly = savedEvalVersion === EVAL_COMPILER_VERSION/);
   const loop = source.slice(source.indexOf("async function runOptimizationLoop("));
