@@ -1908,7 +1908,10 @@ function friendlyProductRisk(branch: RiskBranch) {
 
 function firstTaskExample(answers: Record<string, string>, fallback: string) {
   const trigger = answers["trigger-language"]?.trim();
-  return answers.__previewTask?.trim() || answers["real-task"]?.trim() || trigger || fallback;
+  // A generated preview is weaker evidence than the owner's later confirmed
+  // task/trigger. Never let an early example reintroduce rejected recipients
+  // or actions into the frozen evaluation task.
+  return answers["real-task"]?.trim() || trigger || answers.__previewTask?.trim() || fallback;
 }
 
 function reconcileGeneratedScriptCapabilityClaims(plan: CapabilityPlan, files: Record<string, string>): CapabilityPlan {
