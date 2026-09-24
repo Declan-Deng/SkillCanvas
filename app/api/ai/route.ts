@@ -1421,18 +1421,19 @@ export async function POST(request: Request) {
             });
           }
           writeAiDiagnostic("warn", { event: "ai_content_invalid_json", requestId, mode: body.mode, attempt, elapsedMs: Date.now() - startedAt, outputChars: content.length, reason: `finish=${choice?.finish_reason || "unknown"}; ${diagnoseModelJsonFailure(content)}` }, tenant.tenantId);
-          // The client already executes and grades in three-case chunks and can
-          // split only the failed chunk into singles. Replaying the same malformed
-          // payload here charged for a second large response before that safer
-          // recovery path could run.
+          // Execution has a client-side split-to-singles recovery path. Grading
+          // does too for multi-case chunks, but an already-single grading case
+          // has no smaller fallback, so give malformed JSON one fresh attempt.
           if (body.mode === "knowledge-compile") {
             return Response.json({ error: "本批专业规则结构不完整；已保留来源，将拆小当前批次", code: "AI_INVALID_JSON", requestId, usage: blueprintUsage }, { status: 502 });
           }
-          if (attempt === 1 && !["eval-grade", "eval-execute"].includes(body.mode)) {
+          if (attempt === 1 && body.mode !== "eval-execute") {
             retryReason = "invalid-json";
             continue;
           }
-          return Response.json({ error: "模型连续两次返回的内容格式都不完整，请重试当前步骤或切换模型", requestId }, { status: 502 });
+          return Response.json({ error: attempt === 1
+            ? "模型返回的内容格式不完整，请重试当前步骤或切换模型"
+            : "模型连续两次返回的内容格式都不完整，请重试当前步骤或切换模型", requestId }, { status: 502 });
         }
 
         writeAiDiagnostic("warn", {
