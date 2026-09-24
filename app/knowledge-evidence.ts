@@ -84,6 +84,35 @@ export function hasVerifiedKnowledgeSupport(value: Record<string, unknown>) {
     }));
 }
 
+/** Report the actual deterministic veto, not only the model's prose verdict. */
+export function knowledgeVerificationFailures(value: Record<string, unknown>) {
+  const claim = knowledgeClaim(value);
+  const verification = value.verification as KnowledgeVerification | undefined;
+  const checks = knowledgeSupportChecks(value);
+  const failures: string[] = [];
+  if (!claim.decision || !claim.action || !claim.appliesWhen || !claim.gapIds.length) failures.push("缺少决策、动作、适用条件或能力缺口");
+  const unsupported = knowledgeGroundingGaps(value);
+  if (unsupported.length) failures.push(`来源未支持具体标签或数值：${unsupported.join("、")}`);
+  if (!claim.sourceSupport.length || claim.sourceSupport.some((support) => !support.url || !support.quote)) failures.push("缺少可定位的来源片段");
+  if (verification?.fingerprint !== knowledgeClaimFingerprint(value)) failures.push("核验结果与候选版本不一致");
+  if (!verification?.sourceSupported) failures.push("来源未支持完整表述");
+  if (!verification?.deltaRelevant) failures.push("未证实能补足对应能力缺口");
+  if (!verification?.categoryValid) failures.push("知识类别不匹配");
+  if (!verification?.notGeneric) failures.push("仍属于泛化建议");
+  if (!verification?.notUserPolicy) failures.push("把用户设定误当成外部知识");
+  if (verificationAdmitsUnsupportedInference(verification?.reason || "")) failures.push("核验说明承认存在未获来源支持的推断");
+  if (!Array.isArray(verification?.verifiedGapIds) || claim.gapIds.some((id) => !verification.verifiedGapIds.includes(id))) failures.push("部分能力缺口未获核验");
+  if (!Array.isArray(verification?.supportChecks) || verification.supportChecks.length !== checks.length
+    || checks.some((check) => {
+      const receipts = verification.supportChecks.filter((item) => item.id === check.id);
+      return receipts.length !== 1 || !receipts[0].reason?.trim()
+        || verificationAdmitsUnsupportedInference(receipts[0].reason)
+        || !Array.isArray(receipts[0].sourceIndexes) || !receipts[0].sourceIndexes.length
+        || receipts[0].sourceIndexes.some((index) => !Number.isInteger(index) || index < 0 || index >= claim.sourceSupport.length);
+    })) failures.push("逐句来源核验凭据缺失或无效");
+  return failures;
+}
+
 /** A yes vote cannot override its own explanation that a claim is unsourced.
  * This is a consistency veto, not a substitute for semantic source review. */
 export function verificationAdmitsUnsupportedInference(reason: string) {

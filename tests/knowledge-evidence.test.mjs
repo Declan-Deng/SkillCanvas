@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { applyKnowledgeVerification, knowledgeVerificationCandidates, knowledgeVerificationContext, normalizeKnowledgePack, normalizeKnowledgePlan, normalizeRetrievedSources, mergeKnowledgePacks, renderKnowledgeEvalContract, restoreKnowledgePack, knowledgePackIsPublishable, knowledgePackNeedsExpansion } from "../app/knowledge-research.ts";
-import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport } from "../app/knowledge-evidence.ts";
+import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport, knowledgeVerificationFailures } from "../app/knowledge-evidence.ts";
 import { deriveDomainEvidence } from "../app/evidence-gates.ts";
 import { normalizeKnowledgeAssessment, projectDomainPlaybook } from "../app/skill-ir.ts";
 
@@ -66,6 +66,26 @@ test("excluded advice and user policy are rejected, including semantic paraphras
   assert.equal(review(compile(), { notGeneric: false }).atoms.length, 0);
   assert.equal(review(compile(), { notUserPolicy: false }).atoms.length, 0);
   assert.equal(review(compile(), { verifiedGapIds: [] }).atoms.length, 0);
+});
+
+test("a candidate spanning several gaps retains only independently verified gap bindings", () => {
+  const broaderPlan = { ...plan, capabilityDeltaGapIds: ["retry-scope", "audit-trail"] };
+  const pending = compile([{ ...atom, gapIds: ["retry-scope", "audit-trail"] }], { plan: broaderPlan });
+  const narrowed = review(pending, { verifiedGapIds: ["retry-scope"] });
+  assert.equal(narrowed.atoms.length, 1);
+  assert.deepEqual(narrowed.atoms[0].gapIds, ["retry-scope"]);
+  assert.equal(hasVerifiedKnowledgeSupport(narrowed.atoms[0]), true);
+  assert.deepEqual(narrowed.evidenceCoverage.missingGapIds, ["audit-trail"]);
+  assert.equal(review(pending, { verifiedGapIds: [], sourceSupported: false }).atoms.length, 0);
+});
+
+test("rejection explains the actual failed gate even when model prose sounds positive", () => {
+  const pending = compile();
+  const rejected = review(pending, { sourceSupported: false, reason: "来源明确支持该动作" });
+  assert.equal(rejected.atoms.length, 0);
+  assert.match(rejected.rejected.join(" "), /来源未支持完整表述/);
+  const candidate = knowledgeVerificationCandidates(pending)[0];
+  assert.ok(knowledgeVerificationFailures({ ...pending.atoms[0], verification: { fingerprint: candidate.fingerprint, sourceSupported: false } }).includes("来源未支持完整表述"));
 });
 
 test("distinct exceptions remain distinct branches instead of being concatenated", () => {

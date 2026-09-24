@@ -1,4 +1,4 @@
-import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport, isExcludedKnowledge, knowledgeClaimFingerprint, knowledgeDecisionKey, knowledgeSupportChecks, knowledgeGroundingGaps, type KnowledgeSourceSupport, type KnowledgeVerification } from "./knowledge-evidence.ts";
+import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport, isExcludedKnowledge, knowledgeClaimFingerprint, knowledgeDecisionKey, knowledgeSupportChecks, knowledgeGroundingGaps, knowledgeVerificationFailures, type KnowledgeSourceSupport, type KnowledgeVerification } from "./knowledge-evidence.ts";
 import { rankedSourcePassages, sourcePassages, type EvidencePassage } from "./knowledge-passages.ts";
 
 export type ResearchProviderId = "disabled" | "firecrawl" | "searxng";
@@ -925,9 +925,20 @@ export function applyKnowledgeVerification(pack: KnowledgePack, raw: unknown, pr
         sourceIndexes: Array.isArray(check.sourceIndexes) ? check.sourceIndexes.filter((index): index is number => typeof index === "number") : [],
       })),
     };
-    const verified = { ...atom, verification };
+    // A claim may be relevant to several planned gaps while the independent
+    // reviewer verifies only some of them. Keep that supported subset instead
+    // of discarding the whole source-backed rule. No wording or evidence is
+    // changed, and every other verification gate still applies.
+    const supportedGapIds = atom.gapIds.filter((id) => verification.verifiedGapIds.includes(id));
+    const narrowed = result.fingerprint === knowledgeClaimFingerprint(atom)
+      && supportedGapIds.length > 0 && supportedGapIds.length < atom.gapIds.length
+      ? { ...atom, gapIds: supportedGapIds }
+      : atom;
+    if (narrowed !== atom) verification.fingerprint = knowledgeClaimFingerprint(narrowed);
+    const verified = { ...narrowed, verification };
     if (hasVerifiedKnowledgeSupport(verified)) return [verified];
-    rejected.push(`「${atom.title}」未采用：${verification.reason}`);
+    const failures = knowledgeVerificationFailures(verified);
+    rejected.push(`「${atom.title}」未采用：${failures.slice(0, 3).join("；") || "核验未通过"}；核验说明：${verification.reason}`);
     return [];
   });
   const distinct = atoms.filter((atom) => {

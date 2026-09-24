@@ -9201,9 +9201,7 @@ export default function Home() {
         beforeCount: pack.diagnostics.candidateCount,
         afterCount: pack.atoms.length,
         blockers: pack.rejected.slice(-8),
-        reason: pack.diagnostics.validatorRejectedCount
-          ? `首轮 ${pack.diagnostics.candidateCount} 条候选中有 ${pack.diagnostics.validatorRejectedCount} 条未通过本地编译校验`
-          : `首轮形成 ${pack.atoms.length} 条可追溯规则`,
+        reason: `首轮累计提出 ${pack.diagnostics.candidateCount} 条候选（含分批与重复），保留 ${pack.atoms.length} 条；另有 ${pack.diagnostics.validatorRejectedCount} 条未采用或去重记录`,
       });
       const densityGate = knowledgePackNeedsExpansion(pack);
       if (densityGate.needsExpansion && !compilationIncomplete) {
