@@ -572,6 +572,49 @@ function orderUniqueStateHandoffs(steps: WorkflowDagStep[]) {
   return next;
 }
 
+/** Alternative draft versions may each update the same declared final state.
+ * When each pure content producer has its own explicit terminal handoff, the
+ * final state belongs to that handoff, not to a speculative draft that may
+ * never be chosen. Move only this internal commit to the matching delivery;
+ * never order the alternatives or change an externally writing tool step. */
+function commitAlternativeStateAtDelivery(steps: WorkflowDagStep[], capabilities: WorkflowPlanCapability[], stateFields: string[]) {
+  const declared = new Set(stateFields);
+  if (!declared.size) return steps;
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], mutates: [...step.mutates] }));
+  const kinds = new Map(capabilities.map((item) => [item.id, item.kind]));
+  const terminalDeliveries = next.filter((step) => ["deliver", "persist"].includes(step.role || "")
+    && (step.produces.includes(WORKFLOW_TERMINALS.completed) || Boolean(step.delivers?.length)));
+  for (const state of declared) {
+    const writers = next.filter((step) => step.mutates.includes(state) && !terminalDeliveries.includes(step));
+    if (writers.length < 2 || writers.some((step) => step.role !== "transform"
+      || !step.capabilityIds.length || step.capabilityIds.some((id) => kinds.get(id) !== "llm")
+      || step.input.includes(state) || step.when.includes(state))) continue;
+    // If another operation reads this state before handoff, moving its write
+    // would change runtime behavior. Leave that graph for explicit repair.
+    if (next.some((step) => !writers.includes(step) && !terminalDeliveries.includes(step)
+      && step.requires.includes(state))) continue;
+    const bindings = writers.map((writer) => {
+      const products = writer.produces.filter((token) => !isControlToken(token) && token !== state);
+      const matches = terminalDeliveries.filter((delivery) => products.some((token) =>
+        delivery.requires.includes(token) || delivery.delivers?.includes(token)));
+      return { writer, delivery: matches.length === 1 ? matches[0] : undefined };
+    });
+    if (bindings.some(({ delivery }) => !delivery)
+      || new Set(bindings.map(({ delivery }) => delivery!.id)).size !== bindings.length) continue;
+    // These are distinct completion branches. Keep the artifact-producing
+    // steps and their real dependencies; only defer the shared final-state
+    // update until the selected artifact is actually handed over.
+    for (const { writer, delivery } of bindings) {
+      writer.mutates = writer.mutates.filter((token) => token !== state);
+      writer.requires = writer.requires.filter((token) => token !== state);
+      if (!delivery!.mutates.includes(state)) delivery!.mutates.push(state);
+      if (!delivery!.requires.includes(state)) delivery!.requires.push(state);
+    }
+  }
+  return next;
+}
+
+
 /** Lossless boundary metadata, not task invention. Bind only a unique declared
  * input or an actual parent capability. Derived data still needs a producer. */
 export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, previous: WorkflowDagStep[] = []) {
@@ -616,6 +659,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
   steps = bindTerminalOnlyDeliveries(steps);
   steps = bindUnambiguousDeliveries(steps);
   steps = bindUniqueDeliveryCompanions(steps, context.capabilities);
+  steps = commitAlternativeStateAtDelivery(steps, context.capabilities, context.stateFields || []);
   steps = orderUniqueStateHandoffs(steps);
   steps = scopeCheckpointReplies(steps);
   steps = scopeDeliveredVersions(steps);

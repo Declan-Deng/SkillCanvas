@@ -507,6 +507,47 @@ test("alternative terminal deliveries may close the same declared state without 
   assert.equal(repaired.attempts, 0);
 });
 
+test("alternative draft branches commit their shared final state only at their own handoffs", async () => {
+  const context = {
+    capabilities: [cap("core", "llm", "Weekly records", "Weekly report")], inputs: [],
+    stateFields: ["finalReport"], workflowSteps: [
+      node("categorize-records", ["$request"], ["categoryStructure"]),
+      { ...node("draft-report", ["categoryStructure", "finalReport"], ["draftReport"]), input: "categoryStructure", mutates: ["finalReport"] },
+      { ...node("await-structure-feedback", ["categoryStructure"], ["$input_required"], "await-input"), resumeProduces: ["$feedback"] },
+      node("revise-structure", ["categoryStructure", "$feedback"], ["revisedStructure"]),
+      { ...node("draft-report-revised", ["revisedStructure", "finalReport"], ["revisedReport"]), input: "revisedStructure", mutates: ["finalReport"] },
+      { ...node("deliver-original", ["draftReport"], ["$output"], "deliver"), delivers: ["draftReport"] },
+      { ...node("deliver-revised", ["revisedReport"], ["$output"], "deliver"), delivers: ["revisedReport"] },
+    ],
+  };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  assert.ok(checked.steps.filter((step) => step.id.startsWith("draft-report")).every((step) => !step.mutates.includes("finalReport")));
+  assert.ok(checked.steps.filter((step) => step.id.startsWith("deliver-")).every((step) => step.mutates.includes("finalReport") && step.requires.includes("finalReport")));
+  assert.ok(!checked.steps.find((step) => step.id === "draft-report-revised").requires.includes("draftReport"), "alternative branch must not run an unchosen draft first");
+  assert.deepEqual(normalizeWorkflowPlanBindings({ ...context, workflowSteps: checked.steps }), checked.steps);
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("alternative branch state commit must not call the model"));
+  assert.equal(repaired.attempts, 0);
+});
+
+test("shared delivery or intermediate state reads do not silently suppress unordered writes", () => {
+  const base = {
+    capabilities: [cap("core", "llm", "Source", "Report")], inputs: [], stateFields: ["finalReport"], workflowSteps: [
+      { ...node("draft-a", ["$request"], ["draftA"]), mutates: ["finalReport"] },
+      { ...node("draft-b", ["$request"], ["draftB"]), mutates: ["finalReport"] },
+      { ...node("deliver", ["draftA", "draftB"], ["$output"], "deliver"), delivers: ["draftA", "draftB"] },
+    ],
+  };
+  assert.ok(inspectWorkflowPlan(base).issues.some((issue) => issue.includes("未排序的读写/写写冲突")));
+  const withReader = structuredClone(base);
+  withReader.workflowSteps.splice(2, 0, node("inspect-state", ["finalReport"], ["inspection"]));
+  withReader.workflowSteps[3].requires.push("inspection");
+  assert.ok(inspectWorkflowPlan(withReader).issues.some((issue) => issue.includes("未排序的读写/写写冲突")));
+  const explicitStateRead = structuredClone(base);
+  explicitStateRead.workflowSteps[0].input = "finalReport";
+  assert.ok(inspectWorkflowPlan(explicitStateRead).issues.some((issue) => issue.includes("未排序的读写/写写冲突")));
+});
+
 test("invalid root producers can be corrected without deleting real task outputs", async () => {
   const draft = node("draft", ["input:material"], ["$draft"]);
   const bad = { ...node("wait", [], ["input:material", "$input_required"], "await-input"), resumeProduces: [] };
