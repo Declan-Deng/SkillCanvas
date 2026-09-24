@@ -374,7 +374,8 @@ test("compiler prevents repeated confirmation and scopes final-output checks to 
   assert.match(projected, /Once the delivery branch's prerequisites are met, produce and check the actual task result/i);
   assert.deepEqual(reconciled.outputs[0].requiredSections, ["可检查的主要结果"]);
   assert.ok(reconciled.outputs[0].validation.some((item) => /仅在交付分支的必需输入与确认均已满足时，检查实际结果已经生成/.test(item)));
-  assert.ok(reconciled.outputs[0].validation.some((item) => /缺失时先列出具体缺口或可审阅草稿并暂停/.test(item)));
+  assert.ok(reconciled.outputs[0].validation.some((item) => /缺失时列出具体缺口并展示不依赖缺口的安全中间结果/.test(item)));
+  assert.ok(reconciled.outputs[0].validation.some((item) => /若用户要求补齐后再成稿，不得提前要求或生成完整草稿/.test(item)));
   assert.doesNotMatch(projected, /- 实际结果已经生成；不能只返回分析、计划、规则复述或待确认问题/);
 });
 

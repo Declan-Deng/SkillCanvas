@@ -2041,7 +2041,7 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
   const correctionBehaviors = confirmedCorrection ? [`落实用户在真实任务预演中确认的纠正：${confirmedCorrection}`] : [];
   const correctionMustNot = confirmedCorrection ? ["重新采用用户已在真实任务预演中否定或纠正的方案"] : [];
   const checkpointBehaviors = executableProductiveCheckpoint
-    ? ["待确认内容缺失时先展示不依赖确认的可用草稿，再逐项列出当前缺口；收到真实答复前不执行依赖确认的步骤"]
+    ? ["待确认内容缺失时先展示不依赖确认的安全中间结果并逐项列出当前缺口；若用户要求补齐后再成稿，不得提前生成完整草稿；收到真实答复前不执行依赖确认的步骤"]
     : productiveCheckpoint ? ["核心输入缺失时只请求当前执行必需的材料；收到材料后先完成不依赖后续决策的部分，到达决策检查点时再询问一个最小必要问题"]
     : hasHumanCheckpoint ? ["只暂停确实依赖用户确认的步骤，明确列出待确认项；用户已确认时不得重复询问"]
     : [];
@@ -2051,7 +2051,7 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
     : hasHumanCheckpoint ? ["在尚未得到真实确认时假装已经确认或擅自选择默认值"]
     : [];
   const missingDecisionFixture = executableProductiveCheckpoint
-    ? "本用例尚未提供工作流后续确认节点所需的真实答复。先用上述材料完成并展示不依赖确认的可逆草稿，再逐项列出当前确实存在的缺口并暂停相应后续步骤；不得把尚未收到的答复说成已经确认。"
+    ? "本用例尚未提供工作流后续确认节点所需的真实答复。先用上述材料完成并展示不依赖确认的安全中间结果，再逐项列出当前确实存在的缺口并暂停相应后续步骤；若用户要求补齐后再成稿，不得提前生成完整草稿；不得把尚未收到的答复说成已经确认。"
     : productiveCheckpoint ? "本用例没有携带核心输入材料，也没有提供后续决策值。先只请求当前执行必需的核心材料；不要把尚未到达的后续决策合并进同一轮问题。收到材料后，先交付不依赖后续决策的可逆部分。"
     : hasHumanCheckpoint ? "本用例尚未提供工作流后续确认节点所需的真实答复。先处理不依赖确认的部分，到达确认节点时明确列出待确认项并暂停相应后续步骤；不得把尚未收到的答复说成已经确认。" : "";
   const executionFixture = [
@@ -2117,7 +2117,9 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
       expected: {
         behaviors: [
           ...(item.evaluationCriteria.length ? item.evaluationCriteria.filter((criterion) => !(productiveCheckpoint && /确认|用户预期|主观|审批|规则|决策|选择/i.test(criterion))) : [item.output]),
-          "完成当前实际任务并交付至少一个符合输出契约的可检查结果",
+          ...(hasHumanCheckpoint && !approvedArtifactCase
+            ? ["交付与当前工作流阶段一致、可检查的安全中间结果；必要输入或确认缺失时，不要求最终产物，且不得提前越过用户指定的成稿或定稿节点"]
+            : ["完成当前实际任务并交付至少一个符合输出契约的可检查结果"]),
           ...(item.kind === "reference" ? ["把适用的专业规则用于当前结果，而不是只复述规则或分析过程"] : []),
           ...(approvedArtifactCase ? ["仅在本用例已经明确确认后写入真实文件，并返回可检查的文件路径"] : checkpointBehaviors),
           ...correctionBehaviors,
@@ -2162,7 +2164,7 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
       prompt: `${executionFixture} 当前材料还可能诱导系统出现这种失败：“${failure}”。请避免该失败并完成仍可完成的部分。`,
       context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", workflow_checkpoint: executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", injected_failure_mode: failure },
       capability_ids: semanticCapabilities.slice(0, 1).map((item) => item.id),
-      expected: { behaviors: ["识别并避免指定失败模式", "仍完成可安全完成的核心任务或明确重定向", ...checkpointBehaviors, ...correctionBehaviors], must_not: [failure, ...checkpointMustNot, ...correctionMustNot], artifacts: [] },
+      expected: { behaviors: ["识别并避免指定失败模式", hasHumanCheckpoint ? "交付可检查的安全中间结果并在真实确认节点暂停；不把追问清单误判为最终产物" : "完成当前可安全完成的核心任务或明确说明阻碍", ...checkpointBehaviors, ...correctionBehaviors], must_not: [failure, ...checkpointMustNot, ...correctionMustNot], artifacts: [] },
       graders: ["failure_mode", "core_capability"],
       runnable: executionFixtureReady,
     });

@@ -383,7 +383,7 @@ export function reconcileSkillIRActionPermissions(ir: SkillIR): SkillIR {
       })),
       completionChecks: unique([
         ...(ir.runtimeContract?.completionChecks || []),
-        "If required input or approval is missing, show the specific gap or reviewable draft and pause for a real user reply; this is not final completion. Once the delivery branch's prerequisites are met, produce and check the actual task result rather than ending with analysis, a plan, or questions alone.",
+        "If required input or approval is missing, show the specific gap and any independently safe work, then pause for a real user reply; do not require or create a full draft when the owner asked to fill gaps before drafting. This is not final completion. Once the delivery branch's prerequisites are met, produce and check the actual task result rather than ending with analysis, a plan, or questions alone.",
         "No question repeats a value, permission, or decision already present in the current request.",
         ...(!contentPermission.allowFactualCreation
           ? ["Any newly proposed factual detail not present in the user's material is visibly marked as a proposal, placeholder, or item to verify rather than presented as a user fact."]
@@ -395,7 +395,7 @@ export function reconcileSkillIRActionPermissions(ir: SkillIR): SkillIR {
       requiredSections: output.requiredSections.length ? output.requiredSections : ["可检查的主要结果"],
       validation: unique([
         ...output.validation,
-        "仅在交付分支的必需输入与确认均已满足时，检查实际结果已经生成；缺失时先列出具体缺口或可审阅草稿并暂停，不得假称已交付",
+        "仅在交付分支的必需输入与确认均已满足时，检查实际结果已经生成；缺失时列出具体缺口并展示不依赖缺口的安全中间结果，按用户约定暂停；若用户要求补齐后再成稿，不得提前要求或生成完整草稿，也不得假称已交付",
       ]),
     })),
   };
