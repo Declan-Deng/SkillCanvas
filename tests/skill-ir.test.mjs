@@ -119,11 +119,11 @@ test("knowledge sufficiency is recomputed from canonical four-category evidence"
   });
 });
 
-function compile() {
+function compile(extraAnswers = {}) {
   return compileSkillIR({
     skillName: "tailor-resume",
     idea: "根据 JD 修改简历",
-    answers: { inputs: "目标 JD；真实经历", "trigger-language": "根据这个 JD 修改简历" },
+    answers: { inputs: "目标 JD；真实经历", "trigger-language": "根据这个 JD 修改简历", ...extraAnswers },
     plan: fixturePlan(),
     loop: { mode: "hybrid", goal: "交付岗位匹配的简历", maxRounds: 3, stopConditions: ["核心检查通过"], escalationConditions: ["缺少 JD"], scopes: [] },
     requirements: [
@@ -1113,6 +1113,28 @@ test("permission consistency audit and information dependencies use the same use
 
   files["evals/graders.json"] = JSON.stringify({ graders: [{ id: "grounding", rubric: "新增的量化内容不得因此扣分，也不得套用通用真实性禁令" }] });
   assert.equal(auditSkillIRFiles(files).some((item) => item.includes("USER_PERMISSION_EVAL_CONFLICT")), false);
+});
+
+test("scoped user limits survive IR projection without becoming a false runtime conflict", () => {
+  const answers = {
+    "evidence-policy": "可以自由补写经历和业绩内容，但数字必须标注让我确认",
+    "real-task": "不能自行编造数字和百分比",
+  };
+  const ir = bindSkillIREvals(reconcileSkillIRContentPermission(compile(answers), answers),
+    JSON.stringify({ evals: [{ id: "core-1", eval_family: "capability", capability_ids: ["core-resume"] }] }));
+  ir.informationDependencies = [{ field: "业绩数字", source_required: "用户确认", source_available: false,
+    inventable: false, missing_behavior: "标为待确认" }];
+  const files = {
+    "SKILL.md": `${projectSkillMarkdown(ir)}\n- 不得编造未经确认的数字。`,
+    "evals/skill-ir.json": JSON.stringify(ir),
+    "evals/capability-manifest.json": JSON.stringify(projectCapabilityManifest(ir)),
+    "evals/evals.json": projectEvalBank(ir),
+  };
+  let issues = auditSkillIRFiles(files);
+  assert.equal(issues.some((item) => /USER_PERMISSION_(?:RUNTIME|IR)_CONFLICT/.test(item)), false);
+  files["SKILL.md"] += "\n- 不得新增经历。";
+  issues = auditSkillIRFiles(files);
+  assert.ok(issues.some((item) => item.includes("USER_PERMISSION_RUNTIME_CONFLICT")));
 });
 
 test("generic input compiler models task specifications, source material, and promised examples", () => {

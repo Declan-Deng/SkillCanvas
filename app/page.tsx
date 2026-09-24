@@ -145,7 +145,6 @@ import {
   finalMinimalityPass,
   hardNegativePrompts,
   hasContentPermissionConflict,
-  isUnconfirmedGenericFactRestriction,
   reconcileContentPermissionText,
   realisticFailureFixtures,
   reconcileValidationVisibility,
@@ -1523,6 +1522,7 @@ function createCanonicalSkillIR(input: {
       allowCreativeExpansion: contentPolicyAllowsExpansion(input.answers),
       allowFactualCreation: contentPolicyAllowsFactualCreation(input.answers),
       explicitRestriction: contentPolicyExplicitlyRestrictsExpansion(input.answers),
+      restrictedFactualScopes: resolveContentPermission(input.answers).restrictedFactualScopes,
       missingBehavior: activePlan.stateModel.missingBehavior || "标注缺失并请求最少必要信息",
     }),
     domainEvidence: deriveDomainEvidence(files["evals/knowledge-contract.json"] || files["references/domain-playbook.md"] || "", userEvidence, sourceEvidence),
@@ -3389,12 +3389,14 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
       && stored.allowCreativeExpansion === expected.allowCreativeExpansion
       && stored.allowFactualCreation === expected.allowFactualCreation
       && stored.explicitRestriction === expected.explicitRestriction
+      && JSON.stringify(stored.allowedFactualScopes || []) === JSON.stringify(expected.allowedFactualScopes || [])
+      && JSON.stringify(stored.restrictedFactualScopes || []) === JSON.stringify(expected.restrictedFactualScopes || [])
       && allText.includes(expected.sourceText));
   } catch {
     canonicalPermissionPreserved = Boolean(contentPolicy && allText.includes(contentPolicy));
   }
   if (!canonicalPermissionPreserved) blockers.push("没有保留用户确认的内容改动范围");
-  if (contentPolicyAllowsFactualCreation(answers) && !contentPolicyExplicitlyRestrictsExpansion(answers) && contentPolicyRuntimeText.split("\n").some(isUnconfirmedGenericFactRestriction)) blockers.push("内容限制与用户确认的事实补写权限冲突");
+  if (hasContentPermissionConflict(contentPolicyRuntimeText, resolveContentPermission(answers))) blockers.push("内容限制与用户确认的事实补写权限冲突");
   blockers.push(...confirmedPersonalizationConflicts(files));
   if (files["references/requirements.md"] || files["references/capability-plan.json"]) blockers.push("构建期需求或能力计划被混入运行时 references");
   if (/(?:analy[sz]e|research|研究|分析|诊断|评估)/i.test(description) && !/(?:explicit fact|user claim|inference|hypothesis|unknown|明确事实|用户陈述|推断|假设|未知)/i.test(skill)) blockers.push("分析型 Skill 没有区分事实、用户陈述、推断、假设与未知");

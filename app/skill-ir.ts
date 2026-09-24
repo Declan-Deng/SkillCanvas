@@ -1,6 +1,8 @@
 import {
   authoritativeAnswerEvidenceText,
   hasContentPermissionConflict,
+  isFactualScopeAuthorized,
+  isFactualScopeRestricted,
   reconcileContentPermissionText,
   resolveContentPermission,
   normalizeAnswerEvidence,
@@ -387,6 +389,9 @@ export function reconcileSkillIRActionPermissions(ir: SkillIR): SkillIR {
         "No question repeats a value, permission, or decision already present in the current request.",
         ...(!contentPermission.allowFactualCreation
           ? ["Any newly proposed factual detail not present in the user's material is visibly marked as a proposal, placeholder, or item to verify rather than presented as a user fact."]
+          : []),
+        ...(contentPermission.restrictedFactualScopes?.length
+          ? [`For the owner's restricted factual scopes (${contentPermission.restrictedFactualScopes.join(", ")}), preserve the stated confirmation or no-invention boundary even when other content may be expanded.`]
           : []),
       ]),
     },
@@ -2145,7 +2150,11 @@ export function auditSkillIRFiles(files: Record<string, string>) {
   }
   if (contentPermission.allowFactualCreation) {
     const dependencies = Array.isArray(ir.informationDependencies) ? ir.informationDependencies as Array<Record<string, unknown>> : [];
-    if (dependencies.some((item) => /事实|数字|经历|业绩/i.test(String(item.field || "")) && item.inventable === false)) issues.push("[USER_PERMISSION_IR_CONFLICT] Information Dependency 把用户已明确允许补写的内容标记为不可生成");
+    if (dependencies.some((item) => {
+      const field = String(item.field || "");
+      return /事实|数字|数据|经历|业绩|成果|结论/i.test(field) && item.inventable === false
+        && isFactualScopeAuthorized(field, contentPermission) && !isFactualScopeRestricted(field, contentPermission);
+    })) issues.push("[USER_PERMISSION_IR_CONFLICT] Information Dependency 把用户已明确允许补写的内容标记为不可生成");
   }
   const manifestIR = manifest.skill_ir && typeof manifest.skill_ir === "object" ? manifest.skill_ir as Record<string, unknown> : {};
   if (manifestIR.path !== "evals/skill-ir.json") issues.push("Capability Manifest 没有声明 Canonical SkillIR 路径");

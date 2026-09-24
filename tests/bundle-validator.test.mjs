@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { validateBundleContentCoherence, validateBundleStructure } from "../app/bundle-validator.ts";
+import { resolveContentPermission } from "../app/evidence-gates.ts";
 
 function baseBundle() {
   return {
@@ -155,4 +156,15 @@ test("P1 gate blocks regressed generated Skills with generic delta, bypassed kno
   assert.equal(codes.has("UNSUPPORTED_FACT_CREATION"), true);
   assert.equal(codes.has("INCOMPLETE_PROMPT"), true);
   assert.equal(codes.has("BOILERPLATE_INPUT_OVERLAP"), true);
+});
+
+test("source-evidence creation gate respects the user's factual scope", () => {
+  const files = baseBundle();
+  files["evals/skill-ir.json"] = JSON.stringify({ controlModel: { contentPermission: resolveContentPermission({
+    "evidence-policy": "可以自由补写经历，但数字必须标注让我确认",
+  }) } });
+  files["references/source-evidence.md"] = "# 资料\n\n- 可以编造未经确认的数据。";
+  assert.ok(validateBundleContentCoherence(files).some((issue) => issue.code === "UNSUPPORTED_FACT_CREATION"));
+  files["references/source-evidence.md"] = "# 资料\n\n- 可以编造新经历。";
+  assert.equal(validateBundleContentCoherence(files).some((issue) => issue.code === "UNSUPPORTED_FACT_CREATION"), false);
 });

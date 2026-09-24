@@ -2,6 +2,7 @@ import { auditSkillIRFiles } from "./skill-ir.ts";
 import { hasUnscopedActionPermissionConflict } from "./action-permission.ts";
 import { capabilityDeltaGapIsDefensible, type CapabilityDeltaGap } from "./capability-delta.ts";
 import { danglingPromptDelimiter } from "./eval-prompt.ts";
+import { isFactualScopeAuthorized, type ContentPermission } from "./evidence-gates.ts";
 
 export type BundleIssuePriority = "P0" | "P1";
 export type BundleIssueCategory = "P0_EXECUTION_BLOCKER" | "P1_CONTRACT_BLOCKER";
@@ -344,9 +345,11 @@ function validateCanonicalSkillValue(files: Record<string, string>, issues: Bund
     const permission = ir.controlModel && typeof ir.controlModel === "object"
       ? (ir.controlModel as Record<string, unknown>).contentPermission
       : null;
-    const factualCreationAllowed = Boolean(permission && typeof permission === "object" && (permission as Record<string, unknown>).allowFactualCreation === true);
-    if (!factualCreationAllowed && UNSUPPORTED_FACT_CREATION_SIGNAL.test(files["references/source-evidence.md"] || "")) {
-      pushIssue(issues, "UNSUPPORTED_FACT_CREATION", "references/source-evidence.md", "来源证据允许编造未确认事实，但 Canonical content permission 明确禁止 factual creation");
+    const sourceEvidence = files["references/source-evidence.md"] || "";
+    const unsupportedCreation = sourceEvidence.split(/\n|[。；;]/).some((line) => UNSUPPORTED_FACT_CREATION_SIGNAL.test(line)
+      && !isFactualScopeAuthorized(line, (permission || { allowFactualCreation: false }) as ContentPermission));
+    if (unsupportedCreation) {
+      pushIssue(issues, "UNSUPPORTED_FACT_CREATION", "references/source-evidence.md", "来源证据允许编造未确认事实，但该类内容未经用户授权或仍需用户确认");
     }
   } catch { /* JSON parsing reports its own P0 issue. */ }
 }

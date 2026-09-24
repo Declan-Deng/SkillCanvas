@@ -11,6 +11,7 @@ import {
   deriveDomainEvidence,
   finalMinimalityPass,
   hasContentPermissionConflict,
+  isFactualScopeAuthorized,
   hardNegativePrompts,
   reconcileContentPermissionText,
   realisticFailureFixtures,
@@ -29,7 +30,7 @@ test("generic no-fabrication prose is removed without deleting the user's actual
   assert.doesNotMatch(reconciled, /fabricat/i);
 });
 
-test("permission reconciliation removes broad Chinese and English restriction variants", () => {
+test("permission reconciliation removes only restrictions inside the authorized scope", () => {
   const permission = resolveContentPermission({ "evidence-policy": "可以随意润色扩写增加经历，帮我更厉害就行" });
   const original = [
     "- 保持结构清楚，但不允许在没有依据时新增具体经历。",
@@ -38,7 +39,8 @@ test("permission reconciliation removes broad Chinese and English restriction va
   ].join("\n");
   assert.equal(hasContentPermissionConflict(original, permission), true);
   const reconciled = reconcileContentPermissionText(original, permission);
-  assert.doesNotMatch(reconciled, /不允许.*新增|must\s+not\s+invent/i);
+  assert.doesNotMatch(reconciled, /不允许.*新增/i);
+  assert.match(reconciled, /Must not invent numbers/);
   assert.match(reconciled, /保持结构清楚/);
   assert.match(reconciled, /保持用户喜欢的简洁表达/);
   assert.equal(hasContentPermissionConflict(reconciled, permission), false);
@@ -63,6 +65,51 @@ test("reasonable prose supplementation does not authorize invented facts", () =>
   const groundedRule = "不得编造事实、数据、责任人和时间；拿不准的地方先标出来问用户";
   assert.equal(hasContentPermissionConflict(groundedRule, permission), false);
   assert.equal(reconcileContentPermissionText(groundedRule, permission), groundedRule);
+});
+
+test("mixed permission keeps prose supplementation while requiring confirmation for numbers and outcomes", () => {
+  const permission = resolveContentPermission({
+    "evidence-policy": "可合理补写动作和结果，但数字和成果要标出来让我确认",
+    "output-boundary": "不能自己编造数字、百分比或成果结论",
+  });
+  assert.equal(permission.allowCreativeExpansion, true);
+  assert.equal(permission.allowFactualCreation, false);
+  assert.deepEqual(permission.restrictedFactualScopes, ["numbers", "outcomes"]);
+  const rule = "不得编造未确认的数字、百分比或成果结论";
+  assert.equal(hasContentPermissionConflict(rule, permission), false);
+  assert.equal(reconcileContentPermissionText(rule, permission), rule);
+  const commaVariant = resolveContentPermission({ "evidence-policy": "可以合理补写动作和结果，数字和成果要标出来让我确认" });
+  assert.equal(commaVariant.allowFactualCreation, false);
+  assert.deepEqual(commaVariant.restrictedFactualScopes, ["numbers", "outcomes"]);
+  const dependencies = buildInformationDependencies({
+    fields: ["补写动作", "业绩数字", "成果结论"], availableInputs: "", sourceEvidence: "",
+    allowCreativeExpansion: permission.allowCreativeExpansion,
+    allowFactualCreation: permission.allowFactualCreation,
+    explicitRestriction: permission.explicitRestriction,
+    restrictedFactualScopes: permission.restrictedFactualScopes,
+    missingBehavior: "按用户要求处理",
+  });
+  assert.equal(dependencies.find((item) => item.field === "补写动作")?.inventable, true);
+  assert.equal(dependencies.find((item) => item.field === "业绩数字")?.inventable, false);
+  assert.equal(dependencies.find((item) => item.field === "成果结论")?.inventable, false);
+});
+
+test("a scoped numeric restriction does not cancel a separate authorization to create experiences", () => {
+  const permission = resolveContentPermission({
+    "evidence-policy": "可以自由补写经历和业绩内容，但数字必须标注让我确认",
+    "real-task": "不能自行编造数字和百分比",
+  });
+  assert.equal(permission.allowFactualCreation, true);
+  assert.equal(permission.explicitRestriction, false);
+  assert.ok(permission.sourceKeys.includes("real-task"));
+  assert.equal(isFactualScopeAuthorized("新增经历", permission), true);
+  assert.equal(isFactualScopeAuthorized("量化数字", permission), false);
+  assert.equal(hasContentPermissionConflict("不得编造未经确认的数字", permission), false);
+  assert.equal(hasContentPermissionConflict("不得新增经历", permission), true);
+  assert.equal(hasContentPermissionConflict(permission.sourceText, permission), false);
+  const reconciled = reconcileContentPermissionText("不得新增经历。数字必须标注让我确认。", permission);
+  assert.doesNotMatch(reconciled, /不得新增经历/);
+  assert.match(reconciled, /数字必须标注让我确认/);
 });
 
 test("creative content permission never authorizes fake citations or tool receipts", () => {
