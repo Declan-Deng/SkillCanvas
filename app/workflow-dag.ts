@@ -231,6 +231,7 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
   }
   const routed = new Set(steps.flatMap((step) => [...step.capabilityIds, ...(step.availableCapabilityIds || [])]));
   const missing = capabilities.filter((item) => !routed.has(item.id));
+  const autoAddedOptional = new Set<string>();
   for (const item of missing) {
     if (item.kind === "reference" && item.affects?.includes("runtime-workflow")) {
       const consumers = steps.filter((step) => step.capabilityIds.some((id) => capabilities.some((capability) => capability.id === id && capability.kind === "llm")) && !pauseTerminalForStep(step));
@@ -270,6 +271,7 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
       role: persist ? "persist" : item.kind === "reference" ? "read" : "transform",
     };
     steps.push({ ...step, delivers: [] });
+    if (isOptionalToolAvailability(item)) autoAddedOptional.add(step.id);
     needsBinding.add(step.id);
   }
   for (const step of steps.filter((entry) => needsBinding.has(entry.id))) {
@@ -356,7 +358,16 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
     });
     folded.add(helper.id);
   }
-  return bindOwnerlessWorkflowSteps(steps.filter((step) => !folded.has(step.id)), capabilities);
+  // Optional availability is not a scheduled operation. When no real consumer
+  // can absorb an auto-created helper, retaining its fake output makes an
+  // otherwise valid workflow fail as an orphan. Required tools and any helper
+  // whose product is actually consumed remain strict graph operations.
+  const unusedOptional = new Set(steps.filter((helper) => autoAddedOptional.has(helper.id)
+    && !folded.has(helper.id) && !helper.mutates.length && !helper.delivers?.length && !helper.resumeProduces?.length
+    && !steps.some((consumer) => consumer.id !== helper.id && helper.produces.some((token) => [
+      ...consumer.requires, ...consumer.mutates, ...(consumer.delivers || []),
+    ].includes(token)))).map((helper) => helper.id));
+  return bindOwnerlessWorkflowSteps(steps.filter((step) => !folded.has(step.id) && !unusedOptional.has(step.id)), capabilities);
 }
 
 /** Compile a real DAG. Dependencies may be satisfied only by declared initial

@@ -472,6 +472,24 @@ test("checkpoint control markers and optional file availability do not become bu
   assert.equal(repaired.attempts, 0);
 });
 
+test("unused optional file capability cannot create an orphan workflow step", async () => {
+  const file = {
+    id: "host-file-workspace", kind: "builtin-tool", input: "用户授权的文件", output: "可验证的文件内容",
+    requirement: "按需读取或修改文件", purpose: "处理真实文件", fallback: "未授权时不操作文件",
+    optional: true, scope: "conditional", affects: ["output-contract"],
+  };
+  const context = { capabilities: [cap("core", "llm", "Weekly records", "Weekly report"), file], inputs: [], workflowSteps: [
+    node("validate", ["$request"], ["draft"], "validate"),
+    { ...node("deliver", ["draft"], ["$output"], "deliver"), delivers: ["draft"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, true, checked.issues.join("; "));
+  assert.ok(!checked.steps.some((step) => step.id === "step-capability-host-file-workspace"));
+  const repaired = await repairWorkflowPlan(context, () => assert.fail("unused optional capability must not trigger model repair"));
+  assert.equal(repaired.attempts, 0);
+  assert.ok(repaired.workflowSteps.some((step) => step.id === "deliver"));
+});
+
 test("alternative terminal deliveries may close the same declared state without a fake cross-branch edge", async () => {
   const context = {
     capabilities: [cap("core", "llm", "Brief", "Draft")], inputs: [], stateFields: ["draftDelivered"], workflowSteps: [

@@ -116,6 +116,26 @@ test("foundation semantic omissions are repaired at the API boundary, never retu
   assert.deepEqual(result.usage, { promptTokens: 200, completionTokens: 100, estimated: false });
 });
 
+test("foundation API owns six fixed slots despite duplicate IDs and an extra model section", async (t) => {
+  const malformed = structuredClone(foundation);
+  malformed.sections[3].id = malformed.sections[2].id;
+  malformed.sections.push({ ...malformed.sections[3], content: "Additional boundary evidence" });
+  let calls = 0;
+  t.mock.method(globalThis, "fetch", async () => {
+    calls += 1;
+    return Response.json({ choices: [{ message: { content: JSON.stringify(malformed) }, finish_reason: "stop" }] });
+  });
+  const { default: worker } = await import("../dist/server/index.js");
+  const response = await worker.fetch(new Request("http://localhost/api/ai", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ mode: "blueprint-foundation", ...input.modelIdentity, apiKey: "test-only-not-real", ...input.foundationInput }) }), { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } }, { waitUntil() {}, passThroughOnException() {} });
+  const result = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(result));
+  assert.equal(calls, 1, "fixed metadata must not spend a model repair request");
+  const parsed = JSON.parse(result.content);
+  assert.deepEqual(parsed.sections.map((section) => section.id), foundation.sections.map((section) => section.id));
+  assert.match(parsed.sections[3].content, /Additional boundary evidence/);
+  assert.equal(parsed.sections[3].status, "attention");
+});
+
 test("capability API accepts all 18 inapplicable fields in one request but repairs an actual missing script path", async (t) => {
   const nullable = capabilitiesWithInapplicableNulls();
   const script = structuredClone(nullable);

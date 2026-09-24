@@ -1,4 +1,4 @@
-export const foundation = { sections: Array.from({ length: 6 }, (_, index) => ({ id: `section-${index}`, index: String.fromCharCode(65 + index), title: `Requirement ${index}`, description: "Confirmed evidence", content: "Keep supplied facts; ask before final delivery, not before drafting.", status: "ready" })) };
+export const foundation = { sections: ["goal", "understanding", "working-style", "boundary", "output", "eval"].map((id, index) => ({ id, index: String.fromCharCode(65 + index), title: `Requirement ${index}`, description: "Confirmed evidence", content: "Keep supplied facts; ask before final delivery, not before drafting.", status: "ready" })) };
 export const capabilities = { capabilityPlan: {
   summary: "Create a source-grounded report",
   outcomeModel: { ultimateGoal: "Deliver report", controllableOutcomes: ["Report"], uncontrollableOutcomes: [], observableIndicators: ["Sources linked"] },
