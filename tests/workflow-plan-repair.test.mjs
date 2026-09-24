@@ -10,6 +10,54 @@ const node = (id, requires, produces, role = "transform", capabilityIds = ["core
   input: requires.join(", "), action: id, output: produces.join(", "), fallback: "Ask for the missing input; do not invent it", mutates: [],
 });
 
+for (const role of ["await-input", "await-approval"]) for (const placement of ["requires", "input", "when", "all"]) {
+  test(`completion aliases bind atomically: ${role}, ${placement}, with reference metadata omitted`, async () => {
+    const terminal = role === "await-input" ? "$input_required" : "$approval_required";
+    const context = { inputs: [], capabilities: [cap("core", "llm", "Records", "Report"), {
+      id: "reference-weekly-report-structure", kind: "reference", input: "Report context", output: "Writing guidance",
+      fallback: "State unavailable", activationCondition: "When writing a weekly report",
+    }], workflowSteps: [
+      node("draft", ["$request"], ["$draft", "$output_metadata"]),
+      { ...node("show", ["$draft", "$output_metadata"], ["$output"], "deliver"), delivers: ["$draft"] },
+      { ...node("reply", placement === "requires" || placement === "all" ? ["$output"] : ["$draft"], [terminal], role),
+        input: placement === "input" || placement === "all" ? "Review $output with $output_metadata" : "$draft",
+        when: placement === "when" || placement === "all" ? "After $output is shown" : "When feedback is requested",
+        resumeProduces: ["$feedback"] },
+      node("revise", ["$draft", "$feedback"], ["$revised"]),
+      { ...node("finish", ["$revised"], ["$output"], "deliver"), delivers: ["$revised"] },
+    ] };
+    const before = structuredClone(context);
+    const result = await repairWorkflowPlan(context, () => assert.fail("deterministic serialization repair needs no model"));
+    assert.equal(result.attempts, 0);
+    assert.deepEqual(context, before);
+    const checkpoint = result.workflowSteps.find((step) => step.id === "reply");
+    assert.ok(checkpoint.requires.includes("$draft"));
+    assert.ok(!checkpoint.requires.includes("$output"));
+    assert.ok(!checkpoint.requires.includes("$revised"));
+    assert.deepEqual(checkpoint.resumeProduces, ["$feedback"]);
+    if (placement === "input" || placement === "all") assert.match(checkpoint.input, /\$output_metadata/);
+    assert.equal(result.workflowSteps.length, context.workflowSteps.length);
+    assert.ok(result.workflowSteps.find((step) => step.id === "draft").capabilityIds.includes("reference-weekly-report-structure"));
+    const next = inspectWorkflowPlan({ ...context, workflowSteps: result.workflowSteps });
+    assert.equal(next.valid, true, next.issues.join("; "));
+    assert.deepEqual(next.steps, result.workflowSteps);
+  });
+}
+
+test("ambiguous delivered artifacts are not guessed from completion prose", () => {
+  const context = { inputs: [], capabilities: [cap("core", "llm", "Records", "Reports")], workflowSteps: [
+    node("draft", ["$request"], ["$a", "$b"]),
+    { ...node("show-a", ["$a"], ["$output"], "deliver"), delivers: ["$a"] },
+    { ...node("show-b", ["$b"], ["$output"], "deliver"), delivers: ["$b"] },
+    { ...node("reply", [], ["$input_required"], "await-input"), input: "Review $output", resumeProduces: ["$feedback"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, false);
+  const reply = checked.steps.find((step) => step.id === "reply");
+  assert.equal(reply.input, "Review $output");
+  assert.ok(!reply.requires.includes("$output"));
+});
+
 test("live orphan validation is connected by a small delivery patch without losing the real confirmation", async () => {
   const context = { capabilities: [cap("core", "llm", "Source", "Report")], inputs: [], workflowSteps: [
     node("extract", ["$request"], ["parameters"]),

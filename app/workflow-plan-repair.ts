@@ -290,7 +290,10 @@ function bindCheckpointControlEdges(steps: WorkflowDagStep[]) {
     if (!["await-input", "await-approval"].includes(step.role || "")) return step;
     const pause = step.role === "await-approval" ? WORKFLOW_TERMINALS.approvalRequired : WORKFLOW_TERMINALS.inputRequired;
     let requires = step.requires.filter((token) => token !== pause);
-    if (requires.includes(WORKFLOW_TERMINALS.completed)) {
+    let input = step.input;
+    let when = step.when;
+    const mentionsCompletion = (text: string) => (text.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || []).includes(WORKFLOW_TERMINALS.completed);
+    if (requires.includes(WORKFLOW_TERMINALS.completed) || mentionsCompletion(input) || mentionsCompletion(when)) {
       const replies = new Set(step.resumeProduces || []);
       const upstreamArtifacts = steps.filter((candidate) => candidate.id !== step.id
         && ["deliver", "persist"].includes(candidate.role || "")
@@ -300,11 +303,18 @@ function bindCheckpointControlEdges(steps: WorkflowDagStep[]) {
         .filter((token) => !isControlToken(token) && !isRawInputToken(token));
       const uniqueArtifacts = [...new Set(upstreamArtifacts)];
       if (uniqueArtifacts.length === 1) {
-        requires = requires.map((token) => token === WORKFLOW_TERMINALS.completed ? uniqueArtifacts[0] : token);
+        const artifact = uniqueArtifacts[0];
+        requires = [...new Set([...requires.filter((token) => token !== WORKFLOW_TERMINALS.completed), artifact])];
+        // Update both representations atomically. Exact tokens only: a
+        // business value named $output_metadata is not a completion marker.
+        const replaceCompletion = (text: string) => text.replace(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g,
+          (token) => token === WORKFLOW_TERMINALS.completed ? artifact : token);
+        input = replaceCompletion(input);
+        when = replaceCompletion(when);
       }
     }
-    return requires.length === step.requires.length && requires.every((token, index) => token === step.requires[index])
-      ? step : { ...step, requires };
+    return input === step.input && when === step.when && requires.length === step.requires.length && requires.every((token, index) => token === step.requires[index])
+      ? step : { ...step, requires, input, when };
   });
 }
 
@@ -319,7 +329,7 @@ function bindExplicitTokenReads(steps: WorkflowDagStep[]) {
   }
   return steps.map((step) => {
     const mentioned = (`${step.input} ${step.when}`.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || [])
-      .filter((token) => owners.get(token) && owners.get(token)?.id !== step.id && !step.requires.includes(token));
+      .filter((token) => !isWorkflowTerminal(token) && owners.get(token) && owners.get(token)?.id !== step.id && !step.requires.includes(token));
     return mentioned.length ? { ...step, requires: [...step.requires, ...new Set(mentioned)] } : step;
   });
 }

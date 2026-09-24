@@ -233,7 +233,10 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
   const missing = capabilities.filter((item) => !routed.has(item.id));
   const autoAddedOptional = new Set<string>();
   for (const item of missing) {
-    if (item.kind === "reference" && item.affects?.includes("runtime-workflow")) {
+    if (item.kind === "reference") {
+      // A reference is guidance consumed by a semantic operation regardless
+      // of optional affects metadata. Its activation/fallback contract stays
+      // on the capability; do not manufacture an unused data-producing task.
       const consumers = steps.filter((step) => step.capabilityIds.some((id) => capabilities.some((capability) => capability.id === id && capability.kind === "llm")) && !pauseTerminalForStep(step));
       if (consumers.length) {
         // Reference reading is part of its consumer's operation, not a
