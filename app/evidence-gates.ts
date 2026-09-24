@@ -149,6 +149,24 @@ export function hasContentPermissionConflict(text: string, permission: ContentPe
         && isFactualScopeAuthorized(clause, permission)));
 }
 
+export function contentPermissionConflictLocations(
+  files: Record<string, string>,
+  permission: ContentPermission,
+  includeScripts = false,
+) {
+  if (!permission.allowFactualCreation || permission.explicitRestriction) return [];
+  return Object.entries(files).flatMap(([path, content]) => {
+    // Uploaded/source material is evidence, not a runtime instruction. Its
+    // quoted wording must remain intact and cannot revoke an owner's choice.
+    if (path === "references/source-evidence.md") return [];
+    const runtimeDocument = path === "SKILL.md" || /^references\/.*\.(?:md|txt|json|ya?ml)$/i.test(path);
+    if (!runtimeDocument && !(includeScripts && path.startsWith("scripts/"))) return [];
+    return content.split("\n").flatMap((line, index) => hasContentPermissionConflict(line, permission)
+      ? [{ path, line: index + 1, excerpt: line.trim().slice(0, 180) }]
+      : []);
+  });
+}
+
 function isPreservedNegativeEvidence(line: string, permission: ContentPermission) {
   return (permission.negativeExamples || []).some((quote) => line.trim() === quote
     || line.trim() === negativeExampleStatement(quote)

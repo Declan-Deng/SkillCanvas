@@ -138,6 +138,7 @@ import {
   buildRequirementProvenance,
   confirmedAnswerEvidenceText,
   contentGroundingRubric,
+  contentPermissionConflictLocations,
   contentPolicyEvalExpectations,
   deriveDomainEvidence,
   deriveScopeProvenance,
@@ -3358,7 +3359,6 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
     .filter(([path]) => path.startsWith("scripts/"))
     .map(([, content]) => content)
     .join("\n");
-  const contentPolicyRuntimeText = `${narrativeRuntimeText}\n${scriptRuntimeText}`;
   if (hasUnsafeDynamicExecution(scriptRuntimeText)) blockers.push("业务脚本使用了不安全的动态执行（eval、exec、os.system 或 shell=True）");
   if (hasUnboundedFormulaParser(scriptRuntimeText)) blockers.push("自定义公式解析没有表达式长度上限，超长输入可能耗尽资源");
   scripts.forEach((path) => {
@@ -3396,7 +3396,11 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
     canonicalPermissionPreserved = Boolean(contentPolicy && allText.includes(contentPolicy));
   }
   if (!canonicalPermissionPreserved) blockers.push("没有保留用户确认的内容改动范围");
-  if (hasContentPermissionConflict(contentPolicyRuntimeText, resolveContentPermission(answers))) blockers.push("内容限制与用户确认的事实补写权限冲突");
+  const permissionConflicts = contentPermissionConflictLocations(files, resolveContentPermission(answers), true);
+  if (permissionConflicts.length) {
+    const first = permissionConflicts[0];
+    blockers.push(`内容限制与用户确认的事实补写权限冲突：${first.path}:${first.line}`);
+  }
   blockers.push(...confirmedPersonalizationConflicts(files));
   if (files["references/requirements.md"] || files["references/capability-plan.json"]) blockers.push("构建期需求或能力计划被混入运行时 references");
   if (/(?:analy[sz]e|research|研究|分析|诊断|评估)/i.test(description) && !/(?:explicit fact|user claim|inference|hypothesis|unknown|明确事实|用户陈述|推断|假设|未知)/i.test(skill)) blockers.push("分析型 Skill 没有区分事实、用户陈述、推断、假设与未知");
@@ -4279,9 +4283,10 @@ function allowedP1MutationTypes(issues: PipelineIssue[]) {
   if (allMatch(/OUTPUT|ARTIFACT|PRODUCER|输出|产物/i)) return ["output.add", "output.update", "output.remove", "capability.update", "task.update"];
   if (allMatch(/STATE|PERSIST|状态|持久/i)) return ["state.update", "requirement.update", "constraint.update"];
   if (allMatch(/PERMISSION|CONTENT|权限|补写|扩写|编造/i)) return [
-    "requirement.add", "requirement.update",
+    "requirement.add", "requirement.update", "requirement.remove",
     "constraint.add", "constraint.update", "constraint.remove",
     "capability.update", "input.update", "risk-branch.update", "state.update",
+    "domain-evidence.remove",
   ];
   return [
     "identity.update",
@@ -5812,7 +5817,7 @@ export default function Home() {
     const compilerFixable = bundleAudit.blockers.some((blocker) => (
       blocker === "总目标为空、过短或仍是占位内容"
       || blocker === "没有保留用户确认的内容改动范围"
-      || blocker === "内容限制与用户确认的事实补写权限冲突"
+      || blocker.startsWith("内容限制与用户确认的事实补写权限冲突")
       || blocker.includes("[USER_PERMISSION_IR_CONFLICT]")
       || blocker.includes("[USER_PERMISSION_RUNTIME_CONFLICT]")
       || blocker.includes("[USER_PERMISSION_EVAL_CONFLICT]")
@@ -7633,7 +7638,39 @@ export default function Home() {
     let projectionRebuildAttempted = false;
     let evalCoverageRepairAttempted = false;
     let capabilityDeltaRepairAttempted = false;
+    let contentPermissionRepairAttempted = false;
     while (validation.executionReady && state.issues.length && rounds < BUILD_REPAIR_MAX_ROUNDS) {
+      // The owner-approved content boundary is compiler-owned. Reconcile its
+      // canonical source and reproject before asking a model to guess which
+      // generated sentence caused a broad permission conflict.
+      const permissionIssue = (issue: PipelineIssue) => /USER_PERMISSION_RUNTIME_CONFLICT|UNCONFIRMED_CONTENT_RESTRICTION|内容限制与用户确认的事实补写权限冲突/.test(issue.evidence);
+      if (!contentPermissionRepairAttempted && state.issues.some(permissionIssue)) {
+        contentPermissionRepairAttempted = true;
+        const sourceIR = parseCanonicalSkillIR(currentFiles);
+        if (sourceIR) {
+          try {
+            const candidateFiles = finalizeSkillFiles(currentFiles, idea, input.answers, input.sourceText, input.generationPlan, loopPlan, sourceIR);
+            const candidateValidation = await validateBundle(candidateFiles);
+            const candidateState = collectP1ContractState(candidateFiles, input.answers, input.generationPlan, candidateValidation);
+            const progress = contractRepairProgress(state.issues, candidateState.issues);
+            const permissionReduced = candidateState.issues.filter(permissionIssue).length < state.issues.filter(permissionIssue).length;
+            const accepted = candidateValidation.executionReady && progress.improved && permissionReduced;
+            reportClientGenerationLoopEvent("generation_loop_candidate", {
+              phase: "contract-repair", round: rounds, accepted,
+              updatedPaths: accepted ? ["evals/skill-ir.json", "SKILL.md", "references/"] : [],
+              reason: accepted ? `已按用户授权范围重建运行规则；${progress.reason}` : `权限规则重建未解决阻塞：${progress.reason}`,
+            });
+            if (accepted) {
+              currentFiles = candidateFiles;
+              validation = candidateValidation;
+              state = candidateState;
+              continue;
+            }
+          } catch (error) {
+            rejectedAttempts.push(`权限规则重建失败：${error instanceof Error ? error.message : "未知原因"}`);
+          }
+        }
+      }
       // A compiler projection cannot be fixed by model-authored file edits.
       // Repair it locally once, even when independent semantic blockers also
       // exist. Never spend the model budget retrying a broken compiler.
@@ -7795,7 +7832,9 @@ export default function Home() {
       }
       const blockers = state.issues.map((issue) => `${issue.type} · ${issue.files.join("、") || "bundle"} · ${issue.evidence}`);
       const allowedMutationTypes = allowedP1MutationTypes(state.issues);
+      const contentPermissionConflicts = contentPermissionConflictLocations(currentFiles, resolveContentPermission(input.answers), true).slice(0, 8);
       const evidencePaths = [...new Set([
+        ...contentPermissionConflicts.map((item) => item.path),
         "SKILL.md",
         "evals/capability-manifest.json",
         ...state.issues.flatMap((issue) => issue.files),
@@ -7829,6 +7868,7 @@ export default function Home() {
             warnings: state.audit.warnings,
             contractAttempt: rounds + 1,
             allowedMutationTypes,
+            contentPermissionConflicts,
             missingResources: currentIR ? missingBundleResources(currentIR, currentFiles) : [],
           },
           canonicalTargets: { ...canonicalMutationTargetCatalog(currentFiles), allowedMutationTypes },

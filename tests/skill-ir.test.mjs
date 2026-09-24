@@ -346,6 +346,28 @@ test("owner content permission is canonical and removes conflicting generator de
   assert.doesNotMatch(JSON.stringify(reconciled), /禁止编造经历|不把未知当作事实|禁止编造量化数据/);
 });
 
+test("canonical reconciliation removes lower-priority permission restrictions before runtime projection", () => {
+  const answers = { "evidence-policy": "可以自由补写经历和量化数据" };
+  const ir = compile(answers);
+  ir.requirements.push({
+    ...ir.requirements[0], id: "research-default-no-invention", provenance: "source_grounded",
+    source: "research", statement: "不得新增经历", originalQuote: undefined, evidenceKind: undefined,
+  });
+  ir.requirements.push({
+    ...ir.requirements[0], id: "owner-permission-paraphrase", provenance: "user_explicit",
+    source: "interview.evidence-policy", statement: "可以补写经历，但不得新增经历",
+    originalQuote: answers["evidence-policy"], evidenceKind: "explicit_authorization",
+  });
+  ir.domainEvidence = [{ id: "research-rule", decision: "事实保护", knowledge: "旧模板建议不补写经历", rule: "不得新增经历" }];
+  const reconciled = reconcileSkillIRContentPermission(ir, answers);
+  assert.equal(reconciled.requirements.some((item) => item.id === "research-default-no-invention"), false);
+  assert.equal(reconciled.requirements.find((item) => item.id === "owner-permission-paraphrase")?.originalQuote, answers["evidence-policy"]);
+  assert.doesNotMatch(reconciled.requirements.find((item) => item.id === "owner-permission-paraphrase")?.statement || "", /不得新增经历/);
+  assert.equal(reconciled.domainEvidence.length, 0);
+  assert.doesNotMatch(projectSkillMarkdown(reconciled), /不得新增经历/);
+  assert.match(projectSkillMarkdown(reconciled), /可以自由补写经历和量化数据/);
+});
+
 test("compiler deterministically scopes contradictory ask-first and autonomous runtime branches", () => {
   const ir = compile();
   const contradictory = "缺少信息时必须先询问用户确认，同时无需确认直接自主继续完成";

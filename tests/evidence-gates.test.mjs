@@ -7,6 +7,7 @@ import {
   confirmedAnswerEvidenceText,
   contentGroundingRubric,
   contentPolicyEvalExpectations,
+  contentPermissionConflictLocations,
   downgradeUngroundedHardConstraints,
   deriveDomainEvidence,
   finalMinimalityPass,
@@ -56,6 +57,19 @@ test("permission conflict detection covers failure modes, grounding rubrics, and
     assert.equal(hasContentPermissionConflict(conflict, permission), true, conflict);
   }
   assert.equal(hasContentPermissionConflict("新增的量化内容不得因此扣分，也不得套用通用真实性禁令", permission), false);
+});
+
+test("permission diagnostics identify executable clauses without treating uploaded source text as instructions", () => {
+  const permission = resolveContentPermission({ "evidence-policy": "可以自由补写经历和量化数据" });
+  const files = {
+    "SKILL.md": "# Skill\n- 不得新增经历。",
+    "references/source-evidence.md": "用户上传的旧范文写着：不得新增经历。",
+    "references/output-contract.md": "- 不得编造量化数据。",
+  };
+  assert.deepEqual(contentPermissionConflictLocations(files, permission).map(({ path, line }) => ({ path, line })), [
+    { path: "SKILL.md", line: 2 },
+    { path: "references/output-contract.md", line: 1 },
+  ]);
 });
 
 test("reasonable prose supplementation does not authorize invented facts", () => {

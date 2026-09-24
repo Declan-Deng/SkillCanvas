@@ -1,6 +1,7 @@
 import {
   authoritativeAnswerEvidenceText,
   hasContentPermissionConflict,
+  contentPermissionConflictLocations,
   isFactualScopeAuthorized,
   isFactualScopeRestricted,
   reconcileContentPermissionText,
@@ -268,7 +269,37 @@ export function reconcileSkillIRContentPermission(ir: SkillIR, answers: Record<s
     }
     return value;
   };
-  const reconciled = permission.explicitRestriction ? ir : visit(ir);
+  const visited = permission.explicitRestriction ? ir : visit(ir);
+  // Evidence quotations are immutable, but a model-authored interpretation of
+  // that evidence is not. Earlier reconciliation skipped every requirement
+  // object, allowing lower-priority source/domain claims to reintroduce a
+  // blanket prohibition after the user's permission had been compiled.
+  const reconciled = permission.allowFactualCreation && !permission.explicitRestriction
+    ? {
+      ...visited,
+      requirements: visited.requirements.flatMap((item) => {
+        if (item.provenance === "user_explicit" || item.provenance === "user_example") {
+          const ownerQuote = item.originalQuote || item.statement;
+          // Preserve the owner's words. Only a conflicting model paraphrase
+          // may be corrected, and only when the quote itself is unambiguous.
+          if (!hasContentPermissionConflict(item.statement, permission)
+            || hasContentPermissionConflict(ownerQuote, permission)) return [item];
+          return [{ ...item, statement: reconcileContentPermissionText(item.statement, permission).trim() || ownerQuote }];
+        }
+        const statement = reconcileContentPermissionText(item.statement, permission).trim();
+        return statement ? [{ ...item, statement }] : [];
+      }),
+      // A verified external rule can inform the task, but cannot supersede a
+      // user's confirmed content authority. Remove conflicting rule atoms
+      // rather than rewriting their evidence and pretending it was verified.
+      domainEvidence: visited.domainEvidence.filter((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+        const rule = item as Record<string, unknown>;
+        return !hasContentPermissionConflict([
+          rule.decision, rule.knowledge, rule.rule, rule.applies_when, rule.exception,
+        ].filter((value) => typeof value === "string").join("\n"), permission);
+      }),
+    } : visited;
   return {
     ...reconciled,
     controlModel: { ...reconciled.controlModel, contentPermission: permission, contentPermissionEvidenceFingerprint: permissionEvidenceFingerprint(reconciled) },
@@ -2114,15 +2145,12 @@ export function auditSkillIRFiles(files: Record<string, string>) {
     if (!output.producerCapabilityIds.some((id) => capabilityIds.has(id))) issues.push(`输出 ${output.id} 没有真实文件生产能力`);
   });
   const contentPermission = contentPermissionFromIR(ir);
-  const runtimeInstructions = Object.entries(files)
-    .filter(([path]) => path === "SKILL.md" || /^references\/.*\.(?:md|txt|json|ya?ml)$/i.test(path))
-    .map(([, value]) => value)
-    .join("\n");
-  const runtimePermissionConflict = hasContentPermissionConflict(runtimeInstructions, contentPermission);
-  if (runtimePermissionConflict) {
+  const runtimePermissionConflicts = contentPermissionConflictLocations(files, contentPermission);
+  if (runtimePermissionConflicts.length) {
+    const first = runtimePermissionConflicts[0];
     issues.push(contentPermission.allowFactualCreation
-      ? "[USER_PERMISSION_RUNTIME_CONFLICT] 运行规则收紧了用户明确确认的内容补写或新增权限"
-      : "[UNCONFIRMED_CONTENT_RESTRICTION] 运行规则加入了用户没有选择的‘禁止补写或禁止新增事实’限制");
+      ? `[USER_PERMISSION_RUNTIME_CONFLICT] ${first.path}:${first.line} 的运行规则收紧了用户明确确认的内容补写或新增权限`
+      : `[UNCONFIRMED_CONTENT_RESTRICTION] ${first.path}:${first.line} 的运行规则加入了用户没有选择的内容限制`);
   }
   const evaluationPermissionClaims: string[] = [...(ir.evaluationPlan.failureModes || [])];
   try {
