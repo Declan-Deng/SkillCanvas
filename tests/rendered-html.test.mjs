@@ -288,6 +288,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /mode === "optimization-research"/);
   assert.match(route, /compactSkillBundleForOptimization/);
   assert.match(route, /attempt === 1 && body\.mode !== "eval-execute"/);
+  assert.match(route, /"eval-grade", "eval-compare"\]\.includes\(body\.mode\)/);
   assert.match(route, /BASELINE MODE/);
   assert.match(route, /Obey the supplied mutation budget exactly/);
   assert.match(page, /DEFAULT_MUTATION_BUDGET/);

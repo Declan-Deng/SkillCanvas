@@ -45,6 +45,13 @@ test("planning punctuation repair preserves all values and nested container type
   }
 });
 
+test("blind comparison punctuation recovery keeps complete evidence and never invents a case", () => {
+  const comparison = { winner: "A", confidence: 0.7, rubric: { criteria: [{ id: "accuracy", label: "准确性", kind: "content" }] }, caseResults: [{ caseId: "case-1", winner: "A", evidence: "case-1 follows the checkpoint" }] };
+  const raw = JSON.stringify(comparison);
+  assert.deepEqual(JSON.parse(normalizeModelJsonContent(raw.slice(0, -1), { repairContainers: true })), comparison);
+  assert.equal(normalizeModelJsonContent(raw.slice(0, raw.indexOf('"case-1"') + 5), { repairContainers: true }), "");
+});
+
 test("planning recovery cannot fabricate truncated strings, keys, numbers, or list values", () => {
   for (const raw of ['{"items":["unfinished', '{"summary":', '{"maxRounds":1e', '{"items":[{"id":"core"},', '{"items":[{"id":"core"}],"loopPlan":']) {
     assert.equal(normalizeModelJsonContent(raw, { repairContainers: true }), "", raw);

@@ -1284,10 +1284,12 @@ export async function POST(request: Request) {
           }, { status: 502 });
         }
         if (content) {
-          // Recover missing punctuation only for structured planning payloads
-          // and never when the provider explicitly reports token truncation.
-          const repairedPlanningMode = ["blueprint-plan", "blueprint-capabilities", "blueprint-workflow", "workflow-repair"].includes(body.mode);
-          const normalizedContent = normalizeModelJsonContent(content, { repairContainers: repairedPlanningMode && choice?.finish_reason !== "length" });
+          // Some providers stop after the final complete field but omit only
+          // closing container punctuation. Recover punctuation, never missing
+          // values; the client still checks exact eval case and rubric coverage.
+          // Explicit token-limit truncation remains a hard failure.
+          const recoverableStructuredMode = ["blueprint-plan", "blueprint-capabilities", "blueprint-workflow", "workflow-repair", "eval-grade", "eval-compare"].includes(body.mode);
+          const normalizedContent = normalizeModelJsonContent(content, { repairContainers: recoverableStructuredMode && choice?.finish_reason !== "length" });
           if (normalizedContent) {
             let responseContent = normalizedContent;
             if (body.mode === "blueprint-foundation" || body.mode === "blueprint-capabilities" || body.mode === "blueprint-workflow") {
