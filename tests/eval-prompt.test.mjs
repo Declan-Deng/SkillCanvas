@@ -37,7 +37,8 @@ const longTask = `请分析以下完整要求：“${"竞品的选品、渠道�
 
 test("confirmed task wording overrides an earlier preview example in Eval fixtures", () => {
   assert.equal(firstTaskExample({ __previewTask: "替我发送周报给主管", "trigger-language": "帮我整理周报，发送由我决定" }, "整理周报"), "帮我整理周报，发送由我决定");
-  assert.equal(firstTaskExample({ __previewTask: "替我发送周报给主管", "trigger-language": "整理周报", "real-task": "只生成周报文件" }, "整理周报"), "只生成周报文件");
+  assert.equal(firstTaskExample({ __previewTask: "替我发送周报给主管", "trigger-language": "帮我整理这周周报", "real-task": "以聊天记录为主，需要它提炼接口依赖" }, "整理周报"), "帮我整理这周周报");
+  assert.equal(firstTaskExample({ __previewTask: "替我发送周报给主管", "real-task": "只生成周报文件" }, "整理周报"), "只生成周报文件");
 });
 
 test("long quoted tasks and materials survive the production Eval compiler and canonical projection", () => {
@@ -130,7 +131,7 @@ test("Demo normalization keeps complete executable input, including the text aft
 });
 
 test("legacy Eval banks are migrated before P0/P1 repair and cannot hide behind a restored frozen version", () => {
-  assert.equal(EVAL_COMPILER_VERSION, "2.13");
+  assert.equal(EVAL_COMPILER_VERSION, "2.14");
   assert.match(source, /evalNeedsRebuild = parsed\.version !== EVAL_COMPILER_VERSION/);
   assert.match(source, /restoreFrozenBundleExactly = savedEvalVersion === EVAL_COMPILER_VERSION/);
   const loop = source.slice(source.indexOf("async function runOptimizationLoop("));
