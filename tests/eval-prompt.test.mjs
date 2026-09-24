@@ -143,9 +143,9 @@ test("legacy Eval banks are migrated before P0/P1 repair and cannot hide behind 
 test("permission reconciliation and final freeze never rewrite Eval prompts, material, counterexamples or assertions", () => {
   const task = "检查产品材料并生成报告";
   const sample = evidence.realisticFailureFixtures(task)[0].prompt;
-  // This is the exact deterministic failure mechanism: the old generic
-  // runtime rewriter deletes the disavowed quotation and its closing quote.
-  assert.match(evidence.reconcileContentPermissionText(sample, evidence.resolveContentPermission({})), /采用“$/);
+  // Without permission to create new facts, there is no content-permission
+  // conflict to reconcile, so the quoted counterexample stays intact.
+  assert.equal(evidence.reconcileContentPermissionText(sample, evidence.resolveContentPermission({})), sample);
   for (const answers of [{}, { "evidence-policy": "可以扩写并新增内容" }, { "evidence-policy": "只润色，不新增事实" }]) {
     const plan = capabilities.capabilityPlan;
     const ir = compileSkillIR({ skillName: "inspect-product", idea: task, answers, plan, loop: workflow.loopPlan, requirements: [] });

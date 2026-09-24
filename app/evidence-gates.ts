@@ -90,7 +90,11 @@ export function isUnconfirmedGenericFactRestriction(line: string) {
 
 export function hasContentPermissionConflict(text: string, permission: ContentPermission) {
   if (isPreservedNegativeEvidence(text, permission)) return false;
-  return !permission.explicitRestriction && text.split("\n").some((line) => !isPreservedNegativeEvidence(line, permission) && isUnconfirmedGenericFactRestriction(line));
+  // Creative or structural supplementation is not permission to fabricate
+  // facts. A no-fabrication rule conflicts only with an explicit authorization
+  // to create factual content, not with ordinary editing or reasonable prose.
+  return permission.allowFactualCreation && !permission.explicitRestriction
+    && text.split("\n").some((line) => !isPreservedNegativeEvidence(line, permission) && isUnconfirmedGenericFactRestriction(line));
 }
 
 function isPreservedNegativeEvidence(line: string, permission: ContentPermission) {
@@ -128,7 +132,7 @@ export function contentPolicyEvalExpectations(permission: ContentPermission) {
  * it. Keep all unrelated content on the same line so a stray clause in a Goal
  * or description cannot erase the user's actual task contract. */
 export function reconcileContentPermissionText(text: string, permission: ContentPermission) {
-  if (permission.explicitRestriction || isPreservedNegativeEvidence(text, permission)) return text;
+  if (!permission.allowFactualCreation || permission.explicitRestriction || isPreservedNegativeEvidence(text, permission)) return text;
   const stripClause = (line: string) => line
     .replace(/(?:[,;，；]\s*)?(?:but\s+)?(?:do\s+not|don't|never|must\s+not|should\s+not|cannot|can't|avoid)\s+(?:fabricat\w*|invent\w*|add(?:ing)?)[^.。;；\n]*(?:[.。;；]|$)/gi, "")
     .replace(/(?:[,;，；]\s*)?(?:but\s+)?no\s+(?:fabricated|invented)\s+(?:facts?|numbers?|data|dates?|history|experience|qualifications?|achievements?)[^.。;；\n]*(?:[.。;；]|$)/gi, "")

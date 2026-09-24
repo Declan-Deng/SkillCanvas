@@ -3394,7 +3394,7 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
     canonicalPermissionPreserved = Boolean(contentPolicy && allText.includes(contentPolicy));
   }
   if (!canonicalPermissionPreserved) blockers.push("没有保留用户确认的内容改动范围");
-  if (contentPolicyAllowsExpansion(answers) && !contentPolicyExplicitlyRestrictsExpansion(answers) && contentPolicyRuntimeText.split("\n").some(isUnconfirmedGenericFactRestriction)) blockers.push("内容限制与用户确认的润色或扩写权限冲突");
+  if (contentPolicyAllowsFactualCreation(answers) && !contentPolicyExplicitlyRestrictsExpansion(answers) && contentPolicyRuntimeText.split("\n").some(isUnconfirmedGenericFactRestriction)) blockers.push("内容限制与用户确认的事实补写权限冲突");
   blockers.push(...confirmedPersonalizationConflicts(files));
   if (files["references/requirements.md"] || files["references/capability-plan.json"]) blockers.push("构建期需求或能力计划被混入运行时 references");
   if (/(?:analy[sz]e|research|研究|分析|诊断|评估)/i.test(description) && !/(?:explicit fact|user claim|inference|hypothesis|unknown|明确事实|用户陈述|推断|假设|未知)/i.test(skill)) blockers.push("分析型 Skill 没有区分事实、用户陈述、推断、假设与未知");
@@ -5810,7 +5810,7 @@ export default function Home() {
     const compilerFixable = bundleAudit.blockers.some((blocker) => (
       blocker === "总目标为空、过短或仍是占位内容"
       || blocker === "没有保留用户确认的内容改动范围"
-      || blocker === "内容限制与用户确认的润色或扩写权限冲突"
+      || blocker === "内容限制与用户确认的事实补写权限冲突"
       || blocker.includes("[USER_PERMISSION_IR_CONFLICT]")
       || blocker.includes("[USER_PERMISSION_RUNTIME_CONFLICT]")
       || blocker.includes("[USER_PERMISSION_EVAL_CONFLICT]")

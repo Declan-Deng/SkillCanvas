@@ -56,6 +56,15 @@ test("permission conflict detection covers failure modes, grounding rubrics, and
   assert.equal(hasContentPermissionConflict("新增的量化内容不得因此扣分，也不得套用通用真实性禁令", permission), false);
 });
 
+test("reasonable prose supplementation does not authorize invented facts", () => {
+  const permission = resolveContentPermission({ "evidence-policy": "拿不准的地方先标出来问我，其余可以合理补全" });
+  assert.equal(permission.allowCreativeExpansion, true);
+  assert.equal(permission.allowFactualCreation, false);
+  const groundedRule = "不得编造事实、数据、责任人和时间；拿不准的地方先标出来问用户";
+  assert.equal(hasContentPermissionConflict(groundedRule, permission), false);
+  assert.equal(reconcileContentPermissionText(groundedRule, permission), groundedRule);
+});
+
 test("creative content permission never authorizes fake citations or tool receipts", () => {
   const permission = resolveContentPermission({ "evidence-policy": "基于行业惯例和公开数据合理补全，并注明假设" });
   assert.equal(permission.allowFactualCreation, true);

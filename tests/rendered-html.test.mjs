@@ -126,7 +126,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /DEFAULT_CAPABILITY_PLAN/);
   assert.match(page, /function createExpandedGoal\(/);
   assert.match(page, /body = reconcileConfirmedContentPolicy\(body, answers\);\s*body = ensureMeaningfulGoal\(body, createExpandedGoal/);
-  assert.match(page, /compilerFixable.*总目标为空、过短或仍是占位内容.*内容限制与用户确认的润色或扩写权限冲突/s);
+  assert.match(page, /compilerFixable.*总目标为空、过短或仍是占位内容.*内容限制与用户确认的事实补写权限冲突/s);
   assert.match(page, /compilerFixable.*USER_PERMISSION_IR_CONFLICT.*USER_PERMISSION_RUNTIME_CONFLICT.*USER_PERMISSION_EVAL_CONFLICT.*UNCONFIRMED_CONTENT_RESTRICTION/s);
   assert.match(page, /function reconcileCapabilityPlanContentPermission\(/);
   assert.match(page, /allMatch\(\/PERMISSION[\s\S]*"capability\.update"[\s\S]*"input\.update"[\s\S]*"risk-branch\.update"/);
@@ -688,7 +688,7 @@ test("P0 Execution Gate compiles every generated Python file before contract opt
   assert.ok(result.issues.some((issue) => issue.priority === "P0" && issue.code === "PYTHON_COMPILE_ERROR" && issue.path === "evals/artifact_checker.py"));
 });
 
-test("preserves a confirmed permissive content policy instead of injecting generic restrictions", async () => {
+test("distinguishes creative expansion from permission to invent facts", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const start = page.indexOf("function confirmedContentPolicy");
   const end = page.indexOf("function reconcileKnowledgePackContentPermission");
@@ -698,9 +698,11 @@ test("preserves a confirmed permissive content policy instead of injecting gener
     .replaceAll(": string", "");
   const reconcile = new Function("resolveContentPermission", "reconcileContentPermissionText", `${executable}; return reconcileConfirmedContentPolicy;`)(resolveContentPermission, reconcileContentPermissionText);
   const generated = "## Rules\n\n- 禁止编造真实事实、数字、日期、成就。\n- 不虚构经历、数据或资质。\n- 若用户要求编造，礼貌拒绝并解释真实性原则。\n- 保持结构清楚。";
-  const permissive = reconcile(generated, { "evidence-policy": "可以适当润色、修改和合理扩写" });
-  assert.doesNotMatch(permissive, /禁止编造|不虚构|真实性原则/);
-  assert.match(permissive, /保持结构清楚/);
+  const creativeOnly = reconcile(generated, { "evidence-policy": "可以适当润色、修改和合理扩写" });
+  assert.match(creativeOnly, /禁止编造真实事实/);
+  const factualCreation = reconcile(generated, { "evidence-policy": "可以自由补充量化数据和经历" });
+  assert.doesNotMatch(factualCreation, /禁止编造|不虚构|真实性原则/);
+  assert.match(factualCreation, /保持结构清楚/);
   const restrictive = reconcile(generated, { "evidence-policy": "只润色表达，不新增事实，不编造数字" });
   assert.match(restrictive, /禁止编造真实事实/);
   const englishConflict = reconcile("## Rules\n\n- Do not fabricate specific facts, numbers, or proprietary names.\n- You may expand existing content, but do not invent concrete facts.\n- 不把来源没有支持的具体事实补写成确定结论。", { "evidence-policy": "可以随意润色扩写增加经历，帮我更厉害就行" });
