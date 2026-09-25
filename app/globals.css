@@ -1275,20 +1275,7 @@ h3 {
   isolation: isolate;
   transition: transform 160ms var(--ease-out);
 }
-.idea-composer:has(.start-button) { overflow: visible; }
 .start-button-label { position: relative; z-index: 1; display: inline-flex; align-items: center; gap: 12px; }
-.start-button::before {
-  content: "";
-  position: absolute;
-  inset: -22px -28px;
-  z-index: -1;
-  border-radius: 50%;
-  background: radial-gradient(ellipse at center, rgba(255, 91, 54, .58) 0%, rgba(255, 107, 65, .32) 38%, rgba(255, 126, 83, .12) 60%, rgba(255, 126, 83, 0) 76%);
-  opacity: 0;
-  transform: scale(.97);
-  transition: opacity 160ms ease, transform 160ms var(--ease-out);
-  pointer-events: none;
-}
 .start-button-light {
   position: absolute; inset: 0; overflow: hidden; border-radius: inherit;
   background: linear-gradient(135deg, rgba(255, 188, 137, .26), rgba(255, 119, 74, .18));
@@ -1299,16 +1286,13 @@ h3 {
   background: radial-gradient(circle, rgba(255, 235, 201, .42), rgba(255, 216, 173, .17) 40%, transparent 70%);
   pointer-events: none;
 }
-.start-button:focus-visible:not(:disabled)::before { opacity: 1; transform: scale(1.025); }
 .start-button:focus-visible:not(:disabled) .start-button-light { opacity: 1; }
 @media (hover: hover) and (pointer: fine) {
   .primary-button.start-button:hover:not(:disabled) { background: var(--coral); transform: scale(1.03); }
   .primary-button.start-button:hover:active:not(:disabled) { transform: scale(.975); }
-  .start-button:hover:not(:disabled)::before { opacity: 1; transform: scale(1.025); }
   .start-button:hover:not(:disabled) .start-button-light { opacity: 1; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .start-button::before { transform: none !important; transition: opacity 160ms ease; }
   .primary-button.start-button:hover:not(:disabled),
   .primary-button.start-button:active:not(:disabled) { transform: none; }
   .start-button-spot { display: none; }
