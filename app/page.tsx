@@ -1,6 +1,7 @@
 "use client";
 
 import { classifyUserEvidence, describeUserEvidence, requirementEvidence } from "./user-evidence";
+import { StartButton } from "./start-button";
 import { repairWorkflowPlan } from "./workflow-plan-repair";
 import { interviewCompletionGate } from "./interview-completion";
 import { EVAL_COMPILER_VERSION, providerRepairNeedsUserAction } from "./eval-prompt";
@@ -11005,9 +11006,9 @@ export default function Home() {
                 />
                 <div className="composer-footer">
                   <FileUploadButton onChange={handleSources} loading={sourcesLoading} disabled={busy} label="添加你的资料" />
-                  <button className="primary-button" onClick={startInterview} disabled={busy || materialsLoading}>
+                  <StartButton onClick={startInterview} disabled={busy || materialsLoading}>
                     {materialsLoading ? "等待资料解析" : busy ? "AI 正在先做一次…" : hasRealModel ? "Let‘s Start！" : "连接模型后开始 AI 理解"}<span>→</span>
-                  </button>
+                  </StartButton>
                 </div>
                 {(sourcesLoading || sourceReceipt) && (
                   <div className={`source-upload-receipt ${sourcesLoading ? "reading" : sourceReceipt?.tone || "ready"}`} role="status" aria-live="polite">
