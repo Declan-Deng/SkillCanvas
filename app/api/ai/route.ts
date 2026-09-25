@@ -16,7 +16,7 @@ import { WORKFLOW_REPAIR_PROMPT } from "../../workflow-plan-repair";
 import { BLUEPRINT_LEGACY_PROMPT, assertBlueprintStage, blueprintStagePrompt, blueprintRepairPrompt } from "../../blueprint-planner";
 import { BlueprintStageError, normalizeBlueprintStage, applyBlueprintFieldRepairs, type BlueprintRepair } from "../../blueprint-contract";
 
-type AIMode = "ping" | "models" | "source-analysis" | "capability-delta" | "knowledge-plan" | "knowledge-compile" | "knowledge-verify" | "preview" | "interview" | "blueprint" | "blueprint-foundation" | "blueprint-plan" | "blueprint-capabilities" | "blueprint-workflow" | "workflow-repair" | "build" | "repair" | "eval-execute" | "eval-grade" | "eval-compare" | "optimization-diagnose" | "optimization-patch-plan" | "optimization-research" | "demo" | "demo-chat" | "evaluate" | "personalize" | "optimization-evidence" | "optimization-plan" | "optimize" | "evaluate-dimension";
+type AIMode = "ping" | "models" | "source-analysis" | "capability-delta" | "knowledge-plan" | "knowledge-compile" | "knowledge-verify" | "preview" | "interview" | "blueprint" | "blueprint-foundation" | "blueprint-plan" | "blueprint-capabilities" | "blueprint-workflow" | "workflow-repair" | "build" | "repair" | "eval-execute" | "eval-grade" | "eval-compare" | "optimization-diagnose" | "optimization-patch-plan" | "optimization-research" | "demo" | "demo-chat" | "demo-inspiration" | "evaluate" | "personalize" | "optimization-evidence" | "optimization-plan" | "optimize" | "evaluate-dimension";
 type Provider = "deepseek" | "openai" | "compatible";
 
 type RequestBody = {
@@ -28,7 +28,7 @@ type RequestBody = {
   [key: string]: unknown;
 };
 
-const MODES = new Set<AIMode>(["ping", "models", "source-analysis", "capability-delta", "knowledge-plan", "knowledge-compile", "knowledge-verify", "preview", "interview", "blueprint", "blueprint-foundation", "blueprint-plan", "blueprint-capabilities", "blueprint-workflow", "workflow-repair", "build", "repair", "eval-execute", "eval-grade", "eval-compare", "optimization-diagnose", "optimization-patch-plan", "optimization-research", "demo", "demo-chat", "evaluate", "personalize", "optimization-evidence", "optimization-plan", "optimize", "evaluate-dimension"]);
+const MODES = new Set<AIMode>(["ping", "models", "source-analysis", "capability-delta", "knowledge-plan", "knowledge-compile", "knowledge-verify", "preview", "interview", "blueprint", "blueprint-foundation", "blueprint-plan", "blueprint-capabilities", "blueprint-workflow", "workflow-repair", "build", "repair", "eval-execute", "eval-grade", "eval-compare", "optimization-diagnose", "optimization-patch-plan", "optimization-research", "demo", "demo-chat", "demo-inspiration", "evaluate", "personalize", "optimization-evidence", "optimization-plan", "optimize", "evaluate-dimension"]);
 const PROVIDERS = new Set<Provider>(["deepseek", "openai", "compatible"]);
 const MAX_OUTPUT_TOKENS: Record<AIMode, number> = {
   ping: 64,
@@ -56,6 +56,7 @@ const MAX_OUTPUT_TOKENS: Record<AIMode, number> = {
   "optimization-research": 2_800,
   demo: 5_500,
   "demo-chat": 3_200,
+  "demo-inspiration": 1_200,
   evaluate: 3_600,
   personalize: 7_000,
   "optimization-evidence": 7_000,
@@ -232,7 +233,7 @@ function promptFor(mode: AIMode, body: RequestBody, compactRetry = false) {
     user: JSON.stringify({ goal: body.idea, outputContract: body.outputContract, userEvidence: annotateInterviewEvidence(body.answers), dag: body.workflowRepair }),
   };
   if (mode === "blueprint-capabilities" || mode === "blueprint-workflow") return blueprintStagePrompt(mode, body);
-  const isDemoPipeline = mode === "demo" || mode === "demo-chat" || mode === "evaluate";
+  const isDemoPipeline = mode === "demo" || mode === "demo-chat" || mode === "demo-inspiration" || mode === "evaluate";
   const isGenerationPipeline = mode === "optimization-evidence" || mode === "optimization-diagnose" || mode === "optimization-patch-plan" || mode === "optimization-research";
   const isOptimizerReasoning = mode === "optimization-diagnose" || mode === "optimization-patch-plan";
   const isBlueprintStage = mode === "blueprint-foundation" || mode === "blueprint-plan";
@@ -912,6 +913,24 @@ Rules:
     };
   }
 
+  if (mode === "demo-inspiration") {
+    return {
+      system: `You generate exactly one plausible next user message for an ongoing visible trial of an Agent Skill. The message will be shown as AI-generated and then sent automatically to the Skill, so it must be useful, safe, and directly sendable.
+
+Return valid JSON only with this shape: {"message":"one concise first-person user message in Chinese","purpose":"one short Chinese explanation of what this turn tests"}.
+
+Rules:
+- Continue the current task and preserve the owner's confirmed goal, preferences, permissions, and collaboration boundaries. Do not start a different scenario.
+- Inspect the latest assistant reply. If it is waiting for missing information or confirmation, answer those concrete questions with ordinary, internally consistent synthetic test details. If it already delivered a result, request one meaningful revision, correction, edge case, or next action that reveals whether the Skill follows its workflow.
+- Write as the test user in first person. The message must be concise, specific, and usable without editing. Do not prefix it with “AI 建议”, quote it, or explain the generation process inside the message.
+- Never use vague filler such as “继续”, praise the result, score the Skill, discuss implementation files, or ask the assistant to inspect itself.
+- Do not invent an upload, external lookup, private user history, real-world approval, credential, or completed external action. Any synthetic details must stay visibly within this trial and must not be presented as facts about the real owner.
+- Do not bypass a required approval, safety boundary, or unavailable-tool fallback. Use only information visible in the supplied context.
+- Prefer a turn that helps expose a real behavior difference rather than cosmetic wording changes.`,
+      user: `Owner's goal:\n${idea}\n\nConfirmed understanding:\n${answers}\n\nApproved capabilities:\n${capabilityPlan}\n\nApproved loop:\n${loopPlan}\n\nCurrent Skill bundle:\n${skill}\n\nOriginal Demo:\n${demo}\n\nRecent conversation:\n${conversation || "No additional turns yet"}`,
+    };
+  }
+
   if (mode === "personalize") {
     return {
       system: `You are the iteration editor in a bounded Skill personalization loop. The owner has seen a concrete Demo and selected specific mismatches. Modify the actual Skill bundle so a fresh, comparable task is more likely to match those expectations.
@@ -1403,6 +1422,24 @@ export async function POST(request: Request) {
                   continue;
                 }
                 return Response.json({ error: "模型连续两次没有完成可续跑的 Demo Episode；当前 Skill 已保留，请重试本步骤", requestId }, { status: 502 });
+              }
+            }
+            if (body.mode === "demo-inspiration") {
+              try {
+                const payload = JSON.parse(responseContent) as { message?: unknown; purpose?: unknown };
+                const nextMessage = typeof payload.message === "string" ? payload.message.trim().slice(0, 3_000) : "";
+                if (!nextMessage) throw new Error("没有生成可发送的下一句");
+                responseContent = JSON.stringify({
+                  message: nextMessage,
+                  purpose: typeof payload.purpose === "string" ? payload.purpose.trim().slice(0, 300) : "",
+                });
+              } catch (error) {
+                writeAiDiagnostic("warn", { event: "ai_demo_inspiration_invalid", requestId, mode: body.mode, attempt, reason: error instanceof Error ? error.message : "下一句结构无效" }, tenant.tenantId);
+                if (attempt === 1) {
+                  retryReason = "invalid-demo-inspiration";
+                  continue;
+                }
+                return Response.json({ error: "AI 连续两次没有生成可发送的下一句；你仍可手动输入继续测试", requestId }, { status: 502 });
               }
             }
             writeAiDiagnostic("info", {

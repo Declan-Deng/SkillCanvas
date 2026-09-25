@@ -7223,7 +7223,7 @@ h3 {
   border-radius: 14px;
   display: grid;
   gap: 8px;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
   box-shadow: 0 8px 26px rgba(26, 52, 43, 0.05);
   margin-top: 16px;
   padding: 9px;
@@ -7311,6 +7311,36 @@ h3 {
   filter: brightness(0) invert(1);
   height: 13px;
   width: 13px;
+}
+
+.demo-chat-composer .demo-chat-inspiration {
+  align-items: center;
+  align-self: center;
+  background: #e7f4ef;
+  border: 1px solid #b6d8cc;
+  border-radius: 8px;
+  color: #126f5c;
+  display: inline-flex;
+  font-size: var(--type-label);
+  font-weight: 780;
+  gap: 7px;
+  justify-content: center;
+  min-height: 40px;
+  padding: 0 12px;
+  transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
+  white-space: nowrap;
+}
+
+.demo-chat-composer .demo-chat-inspiration img {
+  filter: invert(34%) sepia(23%) saturate(1350%) hue-rotate(115deg) brightness(91%) contrast(91%);
+  height: 15px;
+  width: 15px;
+}
+
+.demo-chat-composer .demo-chat-inspiration:hover:not(:disabled) {
+  background: #d9eee6;
+  border-color: #76b6a1;
+  color: #0a5d4c;
 }
 
 .demo-chat-composer button:disabled {
@@ -11637,6 +11667,11 @@ h3 {
   .demo-chat-composer {
     align-items: center;
     grid-template-columns: auto minmax(0, 1fr) auto;
+  }
+
+  .demo-chat-composer .demo-chat-inspiration {
+    grid-column: 1 / -1;
+    justify-self: start;
   }
 
   .demo-chat-composer .demo-chat-send {

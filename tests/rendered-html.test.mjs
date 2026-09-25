@@ -357,12 +357,15 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /function handleBuildPrimaryAction\(\)/);
   assert.match(page, /onClick=\{handleBuildPrimaryAction\}/);
   assert.match(page, /自动修复并重新生成/);
-  assert.match(page, /function sendDemoChatMessage\(\)/);
+  assert.match(page, /function sendDemoChatMessage\(/);
+  assert.match(page, /function continueDemoWithInspiration\(\)/);
   assert.match(page, /function runAutomaticDemoTurns\(/);
   assert.match(page, /demoReplyNeedsUserTurn\(latestReply\)/);
   assert.match(page, /conversationEvidence: episodeConversation/);
   assert.match(page, /已自动续跑/);
   assert.match(page, /自动补充的测试输入/);
+  assert.match(page, /AI 生成并自动发送的测试输入/);
+  assert.match(page, /让 AI 帮我继续/);
   assert.match(page, /function handleDemoChatFiles\(/);
   assert.match(page, /function reevaluateDemoConversation\(/);
   assert.match(page, /更新评分/);
@@ -378,6 +381,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /accept="\.pdf,\.md,\.txt,\.json,\.csv,\.html,\.js,\.ts,\.tsx,\.py"/);
   assert.doesNotMatch(page, /继续试用这个 Skill/);
   assert.match(route, /mode === "demo-chat"/);
+  assert.match(route, /mode === "demo-inspiration"/);
+  assert.match(route, /one plausible next user message/);
+  assert.match(route, /ai_demo_inspiration_invalid/);
   assert.match(route, /continuing the same visible trial/);
   assert.match(route, /"mockTurns"/);
   assert.match(route, /one or two mockTurns/);

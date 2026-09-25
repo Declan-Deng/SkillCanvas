@@ -559,7 +559,7 @@ type DemoChatMessage = {
   role: "user" | "assistant";
   content: string;
   attachments?: DemoChatAttachment[];
-  source?: "owner" | "mock";
+  source?: "owner" | "mock" | "inspiration";
 };
 
 type CapabilityCatalogItem = CapabilityItem & {
@@ -5145,6 +5145,7 @@ export default function Home() {
   const [demoChatSequence, setDemoChatSequence] = useState(0);
   const [demoChatInput, setDemoChatInput] = useState("");
   const [demoChatBusy, setDemoChatBusy] = useState(false);
+  const [demoInspirationBusy, setDemoInspirationBusy] = useState(false);
   const [demoChatError, setDemoChatError] = useState("");
   const [demoChatAttachments, setDemoChatAttachments] = useState<DemoChatAttachment[]>([]);
   const [demoChatFilesLoading, setDemoChatFilesLoading] = useState(false);
@@ -9964,9 +9965,10 @@ export default function Home() {
     return conversation;
   }
 
-  async function sendDemoChatMessage() {
-    const message = demoChatInput.trim();
-    const attachments = demoChatAttachments;
+  async function sendDemoChatMessage(options: { message?: string; source?: "owner" | "inspiration" } = {}) {
+    const source = options.source || "owner";
+    const message = (options.message ?? demoChatInput).trim();
+    const attachments = source === "owner" ? demoChatAttachments : [];
     if ((!message && !attachments.length) || !skillDemo || demoChatBusy || demoChatFilesLoading) return;
     if (!hasRealModel) {
       setToast("继续对话前需要先连接模型");
@@ -9976,9 +9978,9 @@ export default function Home() {
     const sequence = demoChatSequence + 1;
     const visibleMessage = message || `请结合我刚上传的${attachments.length === 1 ? "文件" : `${attachments.length} 个文件`}继续。`;
     const userMessage: DemoChatMessage = {
-      id: `user-${demoRunCount}-${sequence}`,
+      id: `${source === "inspiration" ? "inspiration-user" : "user"}-${demoRunCount}-${sequence}`,
       role: "user",
-      source: "owner",
+      source,
       content: visibleMessage.slice(0, 3_000),
       attachments: attachments.length ? attachments : undefined,
     };
@@ -10008,10 +10010,41 @@ export default function Home() {
     } catch (error) {
       setDemoConversation((current) => current.filter((item) => item.id !== userMessage.id));
       setDemoChatInput(message);
-      setDemoChatAttachments(attachments);
+      if (source === "owner") setDemoChatAttachments(attachments);
       setDemoChatError(error instanceof Error ? error.message : "继续对话失败，请重试");
     } finally {
       setDemoChatBusy(false);
+    }
+  }
+
+  async function continueDemoWithInspiration() {
+    if (!skillDemo || demoChatBusy || demoInspirationBusy || demoChatFilesLoading || demoChatInput.trim() || demoChatAttachments.length) return;
+    if (!hasRealModel) {
+      setToast("让 AI 帮你继续前需要先连接模型");
+      setSettingsOpen(true);
+      return;
+    }
+    setDemoChatError("");
+    setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
+    setDemoInspirationBusy(true);
+    try {
+      const result = await callAI<{ message?: unknown }>("demo-inspiration", {
+        idea,
+        sourceText: contextBundle,
+        answers: interviewEvidence,
+        capabilityPlan,
+        loopPlan,
+        skill: files,
+        demo: skillDemo,
+        conversation: demoConversation,
+      });
+      const generatedMessage = typeof result.message === "string" ? result.message.trim().slice(0, 3_000) : "";
+      if (!generatedMessage) throw new Error("AI 没有生成可发送的下一句");
+      await sendDemoChatMessage({ message: generatedMessage, source: "inspiration" });
+    } catch (error) {
+      setDemoChatError(error instanceof Error ? error.message : "AI 暂时没想出合适的下一句，你仍可手动输入");
+    } finally {
+      setDemoInspirationBusy(false);
     }
   }
 
@@ -10918,10 +10951,10 @@ export default function Home() {
           </div>
         </details>
         <div className="demo-conversation">
-          <div className="demo-conversation-heading"><div><strong>{automaticTurns ? `已自动续跑 ${automaticTurns} 轮` : "继续对话"}</strong><small>{automaticTurns ? "系统模拟了必要的材料补充；你仍可在下面接着追问或纠正。" : "补充材料或修改意见，AI 会基于当前结果继续处理。"}</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，评分生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
+          <div className="demo-conversation-heading"><div><strong>{automaticTurns ? `已自动续跑 ${automaticTurns} 轮` : "继续对话"}</strong><small>{automaticTurns ? "系统模拟了必要的材料补充；你可以自己继续输入，也可以让 AI 再生成一条测试输入。" : "补充材料或修改意见；不想自己写时，可以让 AI 帮你继续测试。"}</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，评分生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
           {demoConversation.length > 0 && (
             <div className="demo-message-list" aria-live="polite">
-              {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? message.source === "mock" ? "模拟" : "你" : "AI"}</span><div className="demo-message-body">{message.role === "user" && message.source === "mock" && <small>自动补充的测试输入</small>}<p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
+              {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? message.source === "mock" ? "模拟" : message.source === "inspiration" ? "AI 代写" : "你" : "AI"}</span><div className="demo-message-body">{message.role === "user" && message.source === "mock" && <small>自动补充的测试输入</small>}{message.role === "user" && message.source === "inspiration" && <small>AI 生成并自动发送的测试输入</small>}<p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
               {demoChatBusy && <div className="demo-message assistant pending"><span>AI</span><div className="demo-message-body"><p><i /><i /><i /></p><small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，回复生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small></div></div>}
             </div>
           )}
@@ -10936,6 +10969,7 @@ export default function Home() {
               onChange={handleDemoChatFiles}
               tabIndex={-1}
             />
+            <button className="demo-chat-inspiration" type="button" onClick={() => void continueDemoWithInspiration()} disabled={demoChatBusy || demoInspirationBusy || demoChatFilesLoading || Boolean(demoChatInput.trim()) || Boolean(demoChatAttachments.length)} title={demoChatInput.trim() || demoChatAttachments.length ? "清空待发送内容后，可让 AI 生成下一句" : "根据当前对话生成一条测试输入并自动发送"}><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" /><span>{demoInspirationBusy ? "AI 正在想…" : "让 AI 帮我继续"}</span></button>
             <button className="demo-chat-attach" type="button" onClick={() => demoChatFileInputRef.current?.click()} disabled={demoChatBusy || demoChatFilesLoading || demoChatAttachments.length >= 3} aria-label={demoChatFilesLoading ? "正在读取文件" : "添加文件"}>{demoChatFilesLoading ? <span>读取中</span> : <img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/paperclip.svg" alt="" aria-hidden="true" />}</button>
             <textarea
               value={demoChatInput}
