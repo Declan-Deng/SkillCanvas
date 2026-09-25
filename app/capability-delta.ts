@@ -19,6 +19,14 @@ export type CapabilityDelta = {
   researchFocus: string[];
 };
 
+export function externalCapabilityDeltaGaps(delta: CapabilityDelta) {
+  return delta.skillMustTeach.filter((gap) => gap.knowledgeNeed === "external");
+}
+
+export function externalCapabilityDeltaGapIds(delta: CapabilityDelta) {
+  return externalCapabilityDeltaGaps(delta).map((gap) => gap.id);
+}
+
 const clean = (value: unknown, fallback = "", max = 420) => typeof value === "string"
   ? value.replace(/\s+/g, " ").trim().slice(0, max) || fallback
   : fallback;
@@ -106,6 +114,19 @@ export function normalizeCapabilityDelta(value: unknown): CapabilityDelta {
     excludedGenericKnowledge: list(raw.excludedGenericKnowledge, 12, 260),
     researchFocus,
   };
+}
+
+/** Merge independent contract and quality audits without letting either pass
+ * erase the other. The normalizer remains the single acceptance boundary. */
+export function mergeCapabilityDeltas(...values: unknown[]): CapabilityDelta {
+  const deltas = values.map(normalizeCapabilityDelta);
+  return normalizeCapabilityDelta({
+    summary: deltas.map((delta) => delta.summary).filter(Boolean).join("；"),
+    bareModelCan: deltas.flatMap((delta) => delta.bareModelCan),
+    skillMustTeach: deltas.flatMap((delta) => delta.skillMustTeach),
+    excludedGenericKnowledge: deltas.flatMap((delta) => delta.excludedGenericKnowledge),
+    researchFocus: deltas.flatMap((delta) => delta.researchFocus),
+  });
 }
 
 export const EMPTY_CAPABILITY_DELTA: CapabilityDelta = {

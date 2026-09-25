@@ -2,7 +2,7 @@ import { auditUserEvidencePolarity, bindSkillIREvals, declaredWorkflowStateRoots
 import { requirementEvidence } from "./user-evidence.ts";
 import { bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, normalizeWorkflowDagSteps, WORKFLOW_TERMINALS } from "./workflow-dag.ts";
 import { hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
-import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta } from "./capability-delta.ts";
+import { EMPTY_CAPABILITY_DELTA, externalCapabilityDeltaGapIds, normalizeCapabilityDelta } from "./capability-delta.ts";
 import { reconcileRuntimeInputResources, hasRuntimeInputBinding } from "./bundle-resource-repair.ts";
 
 export type CanonicalMutation =
@@ -187,8 +187,8 @@ function reconcileDerivedContracts(ir: SkillIR) {
   next.knowledgeAssessment = normalizeKnowledgeAssessment(
     next.knowledgeAssessment,
     Array.isArray(next.domainEvidence) ? next.domainEvidence : [],
-    Boolean(next.capabilityDelta?.skillMustTeach?.length),
-    next.capabilityDelta?.skillMustTeach?.map((gap) => gap.id) || [],
+    externalCapabilityDeltaGapIds(next.capabilityDelta).length > 0,
+    externalCapabilityDeltaGapIds(next.capabilityDelta),
   );
   next.runtimeContract.completionChecks = [...new Set([
     ...next.outputs.flatMap((output) => output.validation),
@@ -378,7 +378,8 @@ export function validateCanonicalSkillIR(ir: SkillIR) {
     if (!["official_rule", "evidence_backed_practice", "user_preference", "heuristic"].includes(evidenceType)) issues.push(`domain-evidence ${id} has invalid evidence_type`);
     if (!sourceUrls.length && !evalCaseIds.length && evidenceType !== "user_preference") issues.push(`domain-evidence ${id} has no source_urls or eval_case_ids provenance`);
   });
-  const normalizedKnowledge = normalizeKnowledgeAssessment(ir.knowledgeAssessment, domainEvidence, Boolean(ir.capabilityDelta?.skillMustTeach?.length), ir.capabilityDelta?.skillMustTeach?.map((gap) => gap.id) || []);
+  const externalGapIds = externalCapabilityDeltaGapIds(normalizeCapabilityDelta(ir.capabilityDelta));
+  const normalizedKnowledge = normalizeKnowledgeAssessment(ir.knowledgeAssessment, domainEvidence, externalGapIds.length > 0, externalGapIds);
   if (JSON.stringify(ir.knowledgeAssessment) !== JSON.stringify(normalizedKnowledge)) issues.push("knowledgeAssessment 与 Canonical Domain Evidence 覆盖情况不一致");
   const dag = compileWorkflowDag(
     normalizeWorkflowDagSteps(ir.runtimeContract?.workflow),
@@ -402,14 +403,15 @@ export function parseCanonicalSkillIR(files: Record<string, string>) {
   try {
     const parsed = JSON.parse(files["evals/skill-ir.json"] || "") as SkillIR;
     const capabilityDelta = normalizeCapabilityDelta(parsed.capabilityDelta || EMPTY_CAPABILITY_DELTA);
+    const externalGapIds = externalCapabilityDeltaGapIds(capabilityDelta);
     return reconcileSkillIRStateLoops(reconcileSkillIRUserEvidence({
       ...parsed,
       capabilityDelta,
       knowledgeAssessment: normalizeKnowledgeAssessment(
         parsed.knowledgeAssessment,
         Array.isArray(parsed.domainEvidence) ? parsed.domainEvidence : [],
-        capabilityDelta.skillMustTeach.length > 0,
-        capabilityDelta.skillMustTeach.map((gap) => gap.id),
+        externalGapIds.length > 0,
+        externalGapIds,
       ),
       runtimeContract: { ...parsed.runtimeContract, workflow: normalizeWorkflowDagSteps(parsed.runtimeContract?.workflow) },
     }));

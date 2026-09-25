@@ -1,6 +1,6 @@
 import { normalizeKnowledgeAssessment, projectSkillIRFiles, type SkillIR } from "./skill-ir.ts";
 import type { PipelineIssue } from "./skill-pipeline-core.ts";
-import { normalizeCapabilityDelta } from "./capability-delta.ts";
+import { externalCapabilityDeltaGapIds, normalizeCapabilityDelta } from "./capability-delta.ts";
 
 type ContractIssue = Pick<PipelineIssue, "type" | "evidence">;
 
@@ -25,14 +25,15 @@ export function repairCapabilityDeltaContract(files: Record<string, string>) {
     throw new Error("无法修复 Capability Delta：缺少受支持的 Canonical SkillIR");
   }
   const capabilityDelta = normalizeCapabilityDelta(ir.capabilityDelta);
+  const externalGapIds = externalCapabilityDeltaGapIds(capabilityDelta);
   const repairedIR: SkillIR = {
     ...ir,
     capabilityDelta,
     knowledgeAssessment: normalizeKnowledgeAssessment(
       ir.knowledgeAssessment,
       Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
-      capabilityDelta.skillMustTeach.length > 0,
-      capabilityDelta.skillMustTeach.map((gap) => gap.id),
+      externalGapIds.length > 0,
+      externalGapIds,
     ),
   };
   const candidate = projectSkillIRFiles(repairedIR, files);

@@ -195,7 +195,7 @@ import {
   type ResearchProviderId,
 } from "./knowledge-research";
 import { dedupeResearchSources } from "./research-core";
-import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta";
+import { EMPTY_CAPABILITY_DELTA, externalCapabilityDeltaGaps, mergeCapabilityDeltas, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta";
 import { bindWorkflowCapabilities, normalizeWorkflowDagSteps, type WorkflowDagStep } from "./workflow-dag";
 import { verifyBundleScriptTests, verifyExecutionsInLocalSandbox } from "./eval-workflow-service";
 import { DurableWorkflowJournal } from "./workflow-client";
@@ -1371,6 +1371,23 @@ function compactTaskPhrase(idea: string) {
 
 function capabilityIsActive(item: CapabilityItem) {
   return item.status !== "not-needed" && item.enabled !== false && item.necessity?.decision !== "exclude";
+}
+
+const EXTERNAL_DECISION_AUDIT_SIGNAL = /(?:分类|区分|诊断|评估|评分|优先级|排序|推荐|决策|判定|审核|验证|比较|归因|预测|风险|合规|取舍|映射|classif|distinguish|diagnos|assess|evaluat|priorit|rank|recommend|decid|audit|verif|compar|attribute|forecast|risk|compliance|map)/i;
+
+/** A zero-external-gap result deserves one bounded second look when the task
+ * contains semantic judgment. This is an audit, not a forced web-search gate:
+ * the model may still return no external gap when the contract is sufficient. */
+function capabilityPlanNeedsExternalDecisionAudit(plan: CapabilityPlan) {
+  const capabilityText = plan.items
+    .filter((item) => capabilityIsActive(item) && item.kind !== "eval")
+    .map((item) => [item.requirement, item.purpose, item.routingCondition, item.fallback, ...(item.evaluationCriteria || [])].filter(Boolean).join(" "))
+    .join(" ");
+  return EXTERNAL_DECISION_AUDIT_SIGNAL.test([
+    capabilityText,
+    ...(plan.failureModes || []),
+    ...(plan.riskBranches || []).flatMap((branch) => [branch.condition, branch.action, branch.stopOrRedirect]),
+  ].filter(Boolean).join(" "));
 }
 
 function capabilityNecessity(item: CapabilityItem) {
@@ -9060,7 +9077,7 @@ export default function Home() {
   }
 
   async function runBuildTimeKnowledgeCompiler(basePlan: CapabilityPlan, capabilityDelta: CapabilityDelta): Promise<KnowledgePack> {
-    const externalGaps = capabilityDelta.skillMustTeach.filter((gap) => gap.knowledgeNeed === "external");
+    const externalGaps = externalCapabilityDeltaGaps(capabilityDelta);
     const researchDelta: CapabilityDelta = {
       ...capabilityDelta,
       skillMustTeach: externalGaps,
@@ -9383,6 +9400,22 @@ export default function Home() {
         reportClientGenerationLoopEvent("generation_loop_phase", {
           phase: "capability-delta", reason: "未识别出需要额外教授的专业能力；继续按已确认的要求生成基础 Skill，不虚构能力增益或来源知识",
         });
+      }
+      if (!externalCapabilityDeltaGaps(liveCapabilityDelta).length && capabilityPlanNeedsExternalDecisionAudit(generationPlan)) {
+        showLoopBusy("正在复核任务里的分类、判断与验证规则是否需要外部专业依据");
+        const qualityAudit = normalizeCapabilityDelta(await callAI<unknown>("capability-delta", {
+          idea,
+          sourceText: contextBundle,
+          answers: interviewEvidence,
+          blueprint,
+          capabilityPlan: generationPlan,
+          validationFeedback: `上一轮只识别了用户已经确定的执行契约，没有识别任何 external gap。请只复核任务中的语义判断质量层：分类、诊断、比较、优先级、风险表达、专业受众表达或结果验证所需的任务特定规则。用户选择的标签、顺序、格式、确认点和权限仍是 contract-only，绝不能拿去搜索；但“如何把模糊输入正确映射到这些标签”“如何识别领域失败或验证输出没有越界”是不同的外部知识问题。如果确实不存在会改变正确性的外部规则，返回空 skillMustTeach；不要用泛化最佳实践凑数。\n\n上一轮 Capability Delta：\n${JSON.stringify(liveCapabilityDelta)}`,
+        }));
+        const externalAuditOnly = {
+          ...qualityAudit,
+          skillMustTeach: qualityAudit.skillMustTeach.filter((gap) => gap.knowledgeNeed === "external"),
+        };
+        liveCapabilityDelta = mergeCapabilityDeltas(liveCapabilityDelta, externalAuditOnly);
       }
       await durableBuild?.complete("capability-delta", {
         status: liveCapabilityDelta.status,

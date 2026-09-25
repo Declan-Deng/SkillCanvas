@@ -119,7 +119,7 @@ test("knowledge sufficiency is recomputed from canonical four-category evidence"
   });
 });
 
-function compile(extraAnswers = {}) {
+function compile(extraAnswers = {}, capabilityDelta) {
   return compileSkillIR({
     skillName: "tailor-resume",
     idea: "根据 JD 修改简历",
@@ -130,6 +130,7 @@ function compile(extraAnswers = {}) {
       { id: "goal", requirement: "根据 JD 修改简历", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" },
       { id: "format-rule", requirement: "每条经历必须恰好 20 个字", provenance: "generator_default", modality: "MUST", hard: true, source: "generator default" },
     ],
+    ...(capabilityDelta ? { capabilityDelta } : {}),
   });
 }
 
@@ -159,6 +160,29 @@ test("a basic Skill compiles without invented capability lift or source evidence
   assert.ok(ir.requirements.some((item) => item.id === "goal" && item.hard));
   assert.match(projectSkillMarkdown(ir), /## Workflow/);
   assert.doesNotMatch(projectSkillMarkdown(ir), /## Skill-specific capability delta/);
+});
+
+test("contract-only capability gaps do not create a false knowledge insufficiency", () => {
+  const ir = compile({}, {
+    status: "ready",
+    summary: "固定用户确认的输出契约",
+    bareModelCan: [],
+    skillMustTeach: [{
+      id: "wait-for-confirmation",
+      taskDecision: "先展示结果，再等待用户确认后继续",
+      bareModelBehavior: "裸模型可能遗漏用户明确要求的停顿并直接继续",
+      requiredSkillBehavior: "未收到真实用户确认时必须停止，不得自动推进",
+      whySkillIsNeeded: "避免把用户尚未确认的结果直接当作最终版本",
+      knowledgeNeed: "contract-only",
+      researchQuestions: [],
+    }],
+    excludedGenericKnowledge: [],
+    researchFocus: [],
+  });
+
+  assert.equal(ir.capabilityDelta.skillMustTeach.length, 1);
+  assert.equal(ir.knowledgeAssessment.status, "not-required");
+  assert.deepEqual(ir.knowledgeAssessment.requiredGapIds || [], []);
 });
 
 test("Canonical SkillIR compilation blocks a workflow with unmet artifact dependencies", () => {
