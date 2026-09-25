@@ -23,12 +23,17 @@ export function StartButton({ children, disabled, ...props }: ButtonHTMLAttribut
     if (frame.current) return;
     state.time = performance.now();
     const tick = (now: number) => {
-      const dt = Math.min((now - state.time) / 1000, 1 / 30);
+      // Run the same spring at 2.5x speed: 60% less following time.
+      const elapsed = Math.min((now - state.time) / 1000, 1 / 30) / 0.4;
       state.time = now;
-      // mass 1, stiffness 100, damping 10; one tiny composited layer.
-      state.vx += (100 * (state.tx - state.x) - 10 * state.vx) * dt;
-      state.vy += (100 * (state.ty - state.y) - 10 * state.vy) * dt;
-      state.x += state.vx * dt; state.y += state.vy * dt;
+      // Small integration steps keep the faster spring stable across refresh rates.
+      const steps = Math.max(1, Math.ceil(elapsed / (1 / 120)));
+      const dt = elapsed / steps;
+      for (let step = 0; step < steps; step++) {
+        state.vx += (100 * (state.tx - state.x) - 10 * state.vx) * dt;
+        state.vy += (100 * (state.ty - state.y) - 10 * state.vy) * dt;
+        state.x += state.vx * dt; state.y += state.vy * dt;
+      }
       paint();
       if (Math.abs(state.tx - state.x) + Math.abs(state.ty - state.y) + Math.abs(state.vx) + Math.abs(state.vy) < 0.1) {
         frame.current = 0;
