@@ -220,6 +220,16 @@
   display: block;
   height: auto;
   max-width: 620px;
+  width: 100%;
+}
+
+.showcase-hero-workflow img,
+.showcase-intro-illustration img,
+.showcase-journey-illustration img,
+.showcase-requirements-illustration img,
+.showcase-system-illustration img {
+  display: block;
+  height: auto;
   object-fit: contain;
   width: 100%;
 }

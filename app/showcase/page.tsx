@@ -128,31 +128,20 @@ export default function ShowcasePage() {
           </div>
         </div>
         <div className="showcase-hero-visual">
-          <Image
-            className="showcase-hero-workflow"
-            src="/skillcanvas-workflow-hero-emoji.png"
-            width={1254}
-            height={1254}
-            alt="机器人协同任务清单、工作流、目标和日程的 SkillCanvas 插画"
-            priority
-            sizes="(max-width: 760px) calc(100vw - 40px), (max-width: 1040px) 620px, 44vw"
-            unoptimized
-          />
+          <picture className="showcase-hero-workflow">
+            <source srcSet="/skillcanvas-workflow-hero-emoji.avif" type="image/avif" />
+            <img src="/skillcanvas-workflow-hero-emoji.png" width="1254" height="1254" alt="机器人协同任务清单、工作流、目标和日程的 SkillCanvas 插画" decoding="async" fetchPriority="high" />
+          </picture>
         </div>
       </header>
 
       <section className="showcase-intro" id="story">
         <div className="showcase-intro-message">
           <p className="showcase-intro-lead">用户往往知道自己想要什么，却很难一次说清 AI 应该怎么工作。</p>
-          <Image
-            className="showcase-intro-illustration"
-            src="/skillcanvas-unclear-intent-emoji.png"
-            width={1254}
-            height={1254}
-            alt=""
-            sizes="(max-width: 760px) 260px, 300px"
-            unoptimized
-          />
+          <picture className="showcase-intro-illustration">
+            <source srcSet="/skillcanvas-unclear-intent-emoji-640.avif" type="image/avif" />
+            <img src="/skillcanvas-unclear-intent-emoji-640.png" width="640" height="640" alt="" loading="lazy" decoding="async" />
+          </picture>
         </div>
         <p className="showcase-intro-answer">SkillCanvas 从一句模糊需求开始，基于 16 个需求方向动态生成问题与选项，并由 AI 预选推荐答案。用户只需选择、校正或少量补充，就能逐步形成可执行的 Skill 蓝图。</p>
       </section>
@@ -204,15 +193,10 @@ export default function ShowcasePage() {
             <h2 id="journey-title">把开放式表达，改成 AI 预选的选项式澄清</h2>
             <p>16 个需求方向保证关键维度覆盖，AI 动态生成问题与推荐选项，用户主要负责选择和校正。</p>
           </div>
-          <Image
-            className="showcase-journey-illustration"
-            src="/skillcanvas-ai-clarification-emoji.png"
-            width={1254}
-            height={1254}
-            alt=""
-            sizes="(max-width: 760px) 220px, 280px"
-            unoptimized
-          />
+          <picture className="showcase-journey-illustration">
+            <source srcSet="/skillcanvas-ai-clarification-emoji-640.avif" type="image/avif" />
+            <img src="/skillcanvas-ai-clarification-emoji-640.png" width="640" height="640" alt="" loading="lazy" decoding="async" />
+          </picture>
         </div>
         <ol className="showcase-stage-list">
           {stages.map((stage, index) => (
@@ -235,7 +219,10 @@ export default function ShowcasePage() {
             <p className="showcase-requirements-principle">框架负责不漏关键维度，AI 负责怎么问，用户只负责校正。</p>
             <p>16 个需求方向保证覆盖，AI 根据任务与资料动态生成问题、选项并预选答案；用户只需选择、校正或少量补充，即可形成 Skill 蓝图。</p>
           </div>
-          <Image className="showcase-requirements-illustration" src="/skillcanvas-16d-clarification-emoji.png" alt="" width={1254} height={1254} unoptimized />
+          <picture className="showcase-requirements-illustration">
+            <source srcSet="/skillcanvas-16d-clarification-emoji-640.avif" type="image/avif" />
+            <img src="/skillcanvas-16d-clarification-emoji-640.png" alt="" width="640" height="640" loading="lazy" decoding="async" />
+          </picture>
         </div>
         <div className="showcase-requirement-groups">
           {requirementGroups.map((group, groupIndex) => (
@@ -325,7 +312,10 @@ export default function ShowcasePage() {
         <div className="showcase-gates-heading">
           <h2 id="gates-title">把 Top Skill 共性，沉淀成生成质量门禁</h2>
           <p>模型负责生成候选，规则负责检查结构与语义；没有通过 Gate 的版本不会进入最终交付。</p>
-          <Image className="showcase-system-illustration" src="/skillcanvas-quality-gate-emoji.png" alt="" width={1254} height={1254} unoptimized />
+          <picture className="showcase-system-illustration">
+            <source srcSet="/skillcanvas-quality-gate-emoji-640.avif" type="image/avif" />
+            <img src="/skillcanvas-quality-gate-emoji-640.png" alt="" width="640" height="640" loading="lazy" decoding="async" />
+          </picture>
         </div>
         <div className="showcase-gate-track">
           <article>
@@ -351,7 +341,10 @@ export default function ShowcasePage() {
           <h2 id="loop-title">Eval 先找证据，Loop 再定向修复</h2>
           <p>执行、评分与修改彼此隔离；held-out 不进入优化上下文，候选只能通过 SkillIR 修改，避免过拟合和规则漂移。</p>
           <div className="showcase-loop-legend"><span>Harness</span><span>Optimization Loop</span></div>
-          <Image className="showcase-system-illustration" src="/skillcanvas-eval-repair-clean-emoji.png" alt="" width={1254} height={1254} unoptimized />
+          <picture className="showcase-system-illustration">
+            <source srcSet="/skillcanvas-eval-repair-clean-emoji-640.avif" type="image/avif" />
+            <img src="/skillcanvas-eval-repair-clean-emoji-640.png" alt="" width="640" height="640" loading="lazy" decoding="async" />
+          </picture>
         </div>
         <LoopDiagram steps={loopSteps} />
         <div className="showcase-eval-flow showcase-loop-eval" id="eval-title" aria-label="评测规模与成本控制">

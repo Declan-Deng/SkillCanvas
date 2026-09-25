@@ -487,9 +487,15 @@ textarea:focus-visible {
   object-fit: contain;
 }
 
+.brief-hero-illustration-frame {
+  display: block;
+  justify-self: end;
+  width: 100%;
+}
+
 @media (max-width: 600px) {
   .brief-hero { grid-template-columns: minmax(0, 1fr); gap: 8px; }
-  .brief-hero-illustration { justify-self: end; width: 120px; }
+  .brief-hero-illustration-frame { width: 120px; }
 }
 
 .brief-stage > * {
@@ -1413,9 +1419,15 @@ h3 {
 .interview-heading-pen {
   display: block;
   height: 80px;
-  object-fit: contain;
   transform: rotate(7deg);
   width: 80px;
+}
+
+.interview-heading-pen img {
+  display: block;
+  height: 100%;
+  object-fit: contain;
+  width: 100%;
 }
 
 .discovery-preview-card {

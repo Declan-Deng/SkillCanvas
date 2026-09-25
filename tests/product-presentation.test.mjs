@@ -5,13 +5,16 @@ import test from "node:test";
 const page = readFileSync(new URL("../app/page.tsx", import.meta.url), "utf8");
 const css = readFileSync(new URL("../app/globals.css", import.meta.url), "utf8");
 
-test("hero asset is an RGBA PNG with matching intrinsic dimensions", () => {
-  const png = readFileSync(new URL("../public/skillcanvas-hero-helper-emoji.png", import.meta.url));
+test("hero asset uses a right-sized transparent fallback and an AVIF source", () => {
+  const png = readFileSync(new URL("../public/skillcanvas-hero-helper-emoji-512.png", import.meta.url));
+  const avif = readFileSync(new URL("../public/skillcanvas-hero-helper-emoji-512.avif", import.meta.url));
   assert.equal(png.subarray(1, 4).toString(), "PNG");
   assert.equal(png[25], 6, "RGBA color type preserves transparency");
-  assert.equal(png.readUInt32BE(16), 1254);
-  assert.equal(png.readUInt32BE(20), 1254);
-  assert.match(page, /width="1254" height="1254"/);
+  assert.equal(png.readUInt32BE(16), 512);
+  assert.equal(png.readUInt32BE(20), 512);
+  assert.equal(avif.subarray(4, 12).toString(), "ftypavif");
+  assert.match(page, /srcSet="\/skillcanvas-hero-helper-emoji-512\.avif"[^>]*type="image\/avif"/);
+  assert.match(page, /src="\/skillcanvas-hero-helper-emoji-512\.png" width="512" height="512"/);
 });
 
 test("quick-start text is 25 percent smaller without reducing its hit target", () => {
@@ -22,7 +25,7 @@ test("quick-start text is 25 percent smaller without reducing its hit target", (
 });
 
 test("hero keeps the headline and adds a decorative local image in the right column", () => {
-  assert.match(page, /className="brief-hero"[\s\S]*?AI 不懂你[\s\S]*?来帮你[\s\S]*?className="brief-hero-illustration" src="\/skillcanvas-hero-helper-emoji\.png"[^>]*alt="" aria-hidden="true"/);
+  assert.match(page, /className="brief-hero"[\s\S]*?AI 不懂你[\s\S]*?来帮你[\s\S]*?className="brief-hero-illustration-frame"[\s\S]*?className="brief-hero-illustration"[^>]*alt="" aria-hidden="true"/);
   assert.match(css, /\.brief-hero\s*\{[^}]*grid-template-columns: minmax\(0, 1fr\) clamp\(140px, 18vw, 210px\);/);
   assert.match(css, /@media \(max-width: 600px\)[\s\S]*?\.brief-hero \{ grid-template-columns: minmax\(0, 1fr\);/);
 });
@@ -51,10 +54,13 @@ test("loading overlay omits token noise and uses truthful dotted waiting/output 
 });
 
 test("interview heading uses the transparent pen and final note is below the four questions", () => {
-  const pen = readFileSync(new URL("../public/skillcanvas-note-pen.png", import.meta.url));
+  const pen = readFileSync(new URL("../public/skillcanvas-note-pen-192.png", import.meta.url));
+  const penAvif = readFileSync(new URL("../public/skillcanvas-note-pen-192.avif", import.meta.url));
   assert.equal(pen.subarray(1, 4).toString(), "PNG");
   assert.equal(pen[25], 6, "pen stays transparent");
-  assert.match(page, /className="interview-heading-pen" src="\/skillcanvas-note-pen\.png"/);
+  assert.equal(pen.readUInt32BE(16), 192);
+  assert.equal(penAvif.subarray(4, 12).toString(), "ftypavif");
+  assert.match(page, /className="interview-heading-pen"[\s\S]*?src="\/skillcanvas-note-pen-192\.png"/);
   assert.doesNotMatch(page, /completeness-badge|需求完整度/);
   assert.match(css, /\.interview-heading-pen\s*\{[^}]*height: 80px;[^}]*width: 80px;/);
   const questionListEnd = page.indexOf("{isFinalInterviewRound && (\n                <section className=\"final-note-card\"");
@@ -66,6 +72,12 @@ test("interview heading uses the transparent pen and final note is below the fou
   assert.match(page, /handleContextSources\(event, "background"\)/);
   assert.match(css, /\.final-note-card\s*\{[\s\S]*?#fff3b8;/);
   assert.match(css, /\.final-note-copy\s*\{[^}]*align-content: start;/);
+});
+
+test("Tabler icons are served locally without an unpkg runtime dependency", () => {
+  assert.doesNotMatch(page, /https:\/\/unpkg\.com\/@tabler\/icons/);
+  assert.match(page, /src="\/icons\/tabler\/chart-line\.svg"/);
+  assert.match(page, /src="\/icons\/tabler\/sparkles\.svg"/);
 });
 
 test("blueprint stays borderless and capability selection has one surface", () => {

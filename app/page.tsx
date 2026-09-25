@@ -964,10 +964,10 @@ const INTERVIEW_ROUND_META = [
 ] as const;
 
 const CONTEXT_FIELDS: Array<{ id: ContextFieldId; tabLabel: string; label: string; description: string; placeholder: string; tag: string; icon: string }> = [
-  { id: "existingPrompt", tabLabel: "方法 / SOP", label: "方法 / SOP", description: "粘贴你已经在使用的方法、步骤、检查清单或 Prompt。", placeholder: "把常用 Prompt、SOP、操作步骤或检查清单粘贴到这里……", tag: "提取可复用步骤", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/file-description.svg" },
-  { id: "idealOutput", tabLabel: "理想样例", label: "理想产出示例", description: "粘贴你觉得很好的结果、文章片段、报告、方案或代码。", placeholder: "把理想的文章、报告、方案、代码或其他结果粘贴到这里……", tag: "让 AI 知道“好”的样子", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/star.svg" },
-  { id: "negativeOutput", tabLabel: "避免什么", label: "你不希望出现什么", description: "粘贴反例，或者直接说明哪些表达、判断和做法会让你不满意。", placeholder: "粘贴反例，或写下你最不喜欢的做法……", tag: "告诉 AI 哪些不能做", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/shield-check.svg" },
-  { id: "background", tabLabel: "背景资料", label: "背景资料", description: "补充业务背景、目标用户、专业术语、规则或其他判断依据。", placeholder: "例如：产品背景、目标用户、专业术语、品牌规则、业务限制……", tag: "补足判断所需信息", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/folder.svg" },
+  { id: "existingPrompt", tabLabel: "方法 / SOP", label: "方法 / SOP", description: "粘贴你已经在使用的方法、步骤、检查清单或 Prompt。", placeholder: "把常用 Prompt、SOP、操作步骤或检查清单粘贴到这里……", tag: "提取可复用步骤", icon: "/icons/tabler/file-description.svg" },
+  { id: "idealOutput", tabLabel: "理想样例", label: "理想产出示例", description: "粘贴你觉得很好的结果、文章片段、报告、方案或代码。", placeholder: "把理想的文章、报告、方案、代码或其他结果粘贴到这里……", tag: "让 AI 知道“好”的样子", icon: "/icons/tabler/star.svg" },
+  { id: "negativeOutput", tabLabel: "避免什么", label: "你不希望出现什么", description: "粘贴反例，或者直接说明哪些表达、判断和做法会让你不满意。", placeholder: "粘贴反例，或写下你最不喜欢的做法……", tag: "告诉 AI 哪些不能做", icon: "/icons/tabler/shield-check.svg" },
+  { id: "background", tabLabel: "背景资料", label: "背景资料", description: "补充业务背景、目标用户、专业术语、规则或其他判断依据。", placeholder: "例如：产品背景、目标用户、专业术语、品牌规则、业务限制……", tag: "补足判断所需信息", icon: "/icons/tabler/folder.svg" },
 ];
 
 const DEFAULT_INTERVIEW_ROUNDS: InterviewRound[] = [
@@ -10922,8 +10922,8 @@ export default function Home() {
                 ? <div className="demo-score"><small>{demoConversationScoredTurns > 0 ? `当前单场景 · ${demoConversationScoredTurns} 轮对话` : `当前单场景 · ${observedEvals.length} 项证据`}</small><strong>{averageEvalScore}</strong><span>/ 100</span><em>不与多场景总分直接比较</em></div>
                 : <div className="demo-score pending"><small>本轮证据</small><strong>0</strong><span>项可评分</span></div>}
             {!pendingReview && <div className="demo-head-actions">
-              <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
-              <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "评分中…" : conversationScoreIsFresh ? "本次评分已更新" : "更新本次评分"}</span></button>
+              <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="/icons/tabler/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
+              <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="/icons/tabler/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "评分中…" : conversationScoreIsFresh ? "本次评分已更新" : "更新本次评分"}</span></button>
             </div>}
           </div>
         </div>
@@ -10969,8 +10969,8 @@ export default function Home() {
               onChange={handleDemoChatFiles}
               tabIndex={-1}
             />
-            <button className="demo-chat-inspiration" type="button" onClick={() => void continueDemoWithInspiration()} disabled={demoChatBusy || demoInspirationBusy || demoChatFilesLoading || Boolean(demoChatInput.trim()) || Boolean(demoChatAttachments.length)} title={demoChatInput.trim() || demoChatAttachments.length ? "清空待发送内容后，可让 AI 生成下一句" : "根据当前对话生成一条测试输入并自动发送"}><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" /><span>{demoInspirationBusy ? "AI 正在想…" : "让 AI 帮我继续"}</span></button>
-            <button className="demo-chat-attach" type="button" onClick={() => demoChatFileInputRef.current?.click()} disabled={demoChatBusy || demoChatFilesLoading || demoChatAttachments.length >= 3} aria-label={demoChatFilesLoading ? "正在读取文件" : "添加文件"}>{demoChatFilesLoading ? <span>读取中</span> : <img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/paperclip.svg" alt="" aria-hidden="true" />}</button>
+            <button className="demo-chat-inspiration" type="button" onClick={() => void continueDemoWithInspiration()} disabled={demoChatBusy || demoInspirationBusy || demoChatFilesLoading || Boolean(demoChatInput.trim()) || Boolean(demoChatAttachments.length)} title={demoChatInput.trim() || demoChatAttachments.length ? "清空待发送内容后，可让 AI 生成下一句" : "根据当前对话生成一条测试输入并自动发送"}><img src="/icons/tabler/sparkles.svg" alt="" aria-hidden="true" /><span>{demoInspirationBusy ? "AI 正在想…" : "让 AI 帮我继续"}</span></button>
+            <button className="demo-chat-attach" type="button" onClick={() => demoChatFileInputRef.current?.click()} disabled={demoChatBusy || demoChatFilesLoading || demoChatAttachments.length >= 3} aria-label={demoChatFilesLoading ? "正在读取文件" : "添加文件"}>{demoChatFilesLoading ? <span>读取中</span> : <img src="/icons/tabler/paperclip.svg" alt="" aria-hidden="true" />}</button>
             <textarea
               value={demoChatInput}
               onChange={(event) => { setDemoChatInput(event.target.value); setDemoChatError(""); }}
@@ -10979,7 +10979,7 @@ export default function Home() {
               aria-label="继续与 Demo 对话"
               rows={1}
             />
-            <button className="demo-chat-send" type="button" onClick={() => void sendDemoChatMessage()} disabled={(!demoChatInput.trim() && !demoChatAttachments.length) || demoChatBusy || demoChatFilesLoading}><span>{demoChatBusy ? "回复中…" : "发送"}</span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/send.svg" alt="" aria-hidden="true" /></button>
+            <button className="demo-chat-send" type="button" onClick={() => void sendDemoChatMessage()} disabled={(!demoChatInput.trim() && !demoChatAttachments.length) || demoChatBusy || demoChatFilesLoading}><span>{demoChatBusy ? "回复中…" : "发送"}</span><img src="/icons/tabler/send.svg" alt="" aria-hidden="true" /></button>
           </div>
           {demoChatError && <div className="demo-chat-error" role="alert"><span>{demoChatError}</span><button type="button" onClick={() => void sendDemoChatMessage()} disabled={demoChatBusy || (!demoChatInput.trim() && !demoChatAttachments.length)}>重试</button></div>}
         </div>
@@ -11038,7 +11038,7 @@ export default function Home() {
         {step === "brief" && <button type="button" className={`sidebar-edge-toggle ${briefSidebarOpen ? "open" : ""}`} onClick={() => setBriefSidebarOpen((current) => !current)} aria-label={briefSidebarOpen ? "收起创建流程" : "展开创建流程"} aria-expanded={briefSidebarOpen}><span>{briefSidebarOpen ? "‹" : "›"}</span></button>}
         <aside className="step-rail" aria-hidden={step === "brief" && !briefSidebarOpen}>
           <div className="rail-heading">
-            <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chart-line.svg" alt="" aria-hidden="true" /></span>
+            <span><img src="/icons/tabler/chart-line.svg" alt="" aria-hidden="true" /></span>
             <strong>创建进度</strong>
           </div>
           <nav aria-label="Skill 创建步骤">
@@ -11069,7 +11069,10 @@ export default function Home() {
             <div className="stage-content brief-stage">
               <div className="brief-hero">
                 <h1><span className="headline-line">AI 不懂你</span><br /><span className="brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</span> 来帮你</h1>
-                <img className="brief-hero-illustration" src="/skillcanvas-hero-helper-emoji.png" width="1254" height="1254" alt="" aria-hidden="true" />
+                <picture className="brief-hero-illustration-frame">
+                  <source srcSet="/skillcanvas-hero-helper-emoji-512.avif" type="image/avif" />
+                  <img className="brief-hero-illustration" src="/skillcanvas-hero-helper-emoji-512.png" width="512" height="512" alt="" aria-hidden="true" decoding="async" fetchPriority="high" />
+                </picture>
               </div>
 
               <div className="idea-composer">
@@ -11102,7 +11105,7 @@ export default function Home() {
 
               <div className={`context-builder ${contextPanelOpen ? "open" : ""}`}>
                 <button className={`context-builder-toggle ${contextPanelOpen ? "expanded" : ""} ${contextFilledCount + sourceNames.length ? "" : "without-status"}`} type="button" aria-expanded={contextPanelOpen} onClick={() => setContextPanelOpen((current) => !current)}>
-                  {!contextPanelOpen && <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/books.svg" alt="" aria-hidden="true" /></span>}
+                  {!contextPanelOpen && <span><img src="/icons/tabler/books.svg" alt="" aria-hidden="true" /></span>}
                   <div><strong>补充参考 <b>（可选）</b></strong><small>有现成方法、样例或偏好，可以让 Skill 更懂你</small></div>
                   {!contextPanelOpen && contextFilledCount + sourceNames.length > 0 && <em>已补充 {contextFilledCount + sourceNames.length} 项</em>}
                   <i>{contextPanelOpen ? "⌃" : "⌄"}</i>
@@ -11161,7 +11164,10 @@ export default function Home() {
                   <p>按实际需求选择，或直接写下你的想法。AI 会围绕影响结果的关键选择继续细化，最多四轮。</p>
                 </div>
                 <div className="interview-heading-aside">
-                  <img className="interview-heading-pen" src="/skillcanvas-note-pen.png" width="1254" height="1254" alt="" aria-hidden="true" />
+                  <picture className="interview-heading-pen">
+                    <source srcSet="/skillcanvas-note-pen-192.avif" type="image/avif" />
+                    <img src="/skillcanvas-note-pen-192.png" width="192" height="192" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                  </picture>
                 </div>
               </div>
 
@@ -11526,21 +11532,21 @@ export default function Home() {
               </div>
               <section className="build-product-overview" aria-label="Skill 生成结果摘要">
                 <div className="build-product-status">
-                  <span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/circle-check.svg" alt="" aria-hidden="true" /></span>
+                  <span className="build-product-icon"><img src="/icons/tabler/circle-check.svg" alt="" aria-hidden="true" /></span>
                   <div><span>已生成</span><strong>{bundleAudit.blockers.length ? "这份 Skill 已生成，修复发布问题后即可评估" : "这份 Skill 已经可以进入真实任务评估"}</strong><p>{buildProductSummary}</p></div>
                   <em>{bundleAudit.blockers.length ? `${bundleAudit.blockers.length} 项发布问题` : "结构检查已通过"}</em>
                 </div>
                 <div className="build-product-section build-product-capabilities">
-                  <div className="build-product-section-title"><span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" /></span><div><strong>加入了哪些关键能力</strong><p>这里只展示相对普通 AI 新增、并且会改变实际工作方式的能力。</p></div></div>
+                  <div className="build-product-section-title"><span className="build-product-icon"><img src="/icons/tabler/sparkles.svg" alt="" aria-hidden="true" /></span><div><strong>加入了哪些关键能力</strong><p>这里只展示相对普通 AI 新增、并且会改变实际工作方式的能力。</p></div></div>
                   {buildProductCapabilities.length ? <div className="build-product-capability-list">{buildProductCapabilities.map((item) => <article key={item.id}><strong>{item.name}</strong><p>{item.purpose || item.requirement}</p><small>{item.routingCondition}</small></article>)}</div> : <p className="build-product-empty">本次任务不需要额外能力，Skill 主要负责稳定执行你确认的工作方式。</p>}
                 </div>
                 <div className="build-product-section build-product-risks">
-                  <div className="build-product-section-title"><span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/shield-exclamation.svg" alt="" aria-hidden="true" /></span><div><strong>还有哪些风险</strong><p>只保留会影响下一步决策的限制、缺口和待验证事项。</p></div></div>
+                  <div className="build-product-section-title"><span className="build-product-icon"><img src="/icons/tabler/shield-exclamation.svg" alt="" aria-hidden="true" /></span><div><strong>还有哪些风险</strong><p>只保留会影响下一步决策的限制、缺口和待验证事项。</p></div></div>
                   {buildProductRisks.length ? <ul>{buildProductRisks.map((risk) => <li key={risk}>{risk}</li>)}</ul> : <p className="build-product-empty success">当前没有阻止评估的风险，仍建议用一条真实任务确认最终效果。</p>}
                 </div>
               </section>
               <details className="build-explanation">
-                <summary><span><strong>为什么这样生成</strong><small>查看采用的专业知识、工作流和关键规则</small></span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" /></summary>
+                <summary><span><strong>为什么这样生成</strong><small>查看采用的专业知识、工作流和关键规则</small></span><img src="/icons/tabler/chevron-down.svg" alt="" aria-hidden="true" /></summary>
                 <div className="build-explanation-body">
                   <section>
                     <div><span>专业知识</span><strong>{knowledgePack.atoms.length ? `${knowledgePack.evidenceCoverage?.verifiedRuleCount || 0} 条可执行规则 · ${knowledgePack.evidenceCoverage?.advisoryRuleCount || 0} 条参考洞察` : knowledgePack.status === "not-needed" ? "本次不需要额外专业知识" : "专业知识尚未补齐"}</strong></div>
@@ -11557,7 +11563,7 @@ export default function Home() {
                 </div>
               </details>
               <details className="build-developer-details">
-                <summary><span><strong>开发者详情</strong><small>Compiler、Manifest、Eval、运行指标与全部文件</small></span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/code-dots.svg" alt="" aria-hidden="true" /></summary>
+                <summary><span><strong>开发者详情</strong><small>Compiler、Manifest、Eval、运行指标与全部文件</small></span><img src="/icons/tabler/code-dots.svg" alt="" aria-hidden="true" /></summary>
                 <div className="build-developer-content">
               {knowledgePack.status !== "idle" && (
                 <section className={`knowledge-pack-panel ${knowledgePack.status}`} aria-label="生成阶段专业知识增强结果">
@@ -11764,7 +11770,7 @@ export default function Home() {
                         <div><strong>{needsWorkEvals.length}</strong><span>还能再提升</span></div>
                       </div>
                       <button type="button" className="eval-report-toggle" onClick={() => setEvalDetailsOpen((current) => !current)} aria-expanded={evalDetailsOpen} aria-controls="eval-report-details" disabled={!observedEvals.length}>
-                        {evalDetailsOpen ? "收起" : "展开"}<img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" />
+                        {evalDetailsOpen ? "收起" : "展开"}<img src="/icons/tabler/chevron-down.svg" alt="" aria-hidden="true" />
                       </button>
                     </div>
                     <div id="eval-report-details" className="eval-report-details" hidden={!evalDetailsOpen}>
@@ -12125,7 +12131,7 @@ export default function Home() {
                 <div className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName} style={{ "--stage-index": index } as CSSProperties}>
                   <i aria-hidden="true">{index < busyStageIndex ? "✓" : index === busyStageIndex ? "●" : ""}</i>
                   <span><strong>{stageName}</strong><small>{index < busyStageIndex ? "已完成" : index === busyStageIndex ? "进行中" : "待进行"}</small></span>
-                  {index < BUSY_STAGES[busyTask].stages.length - 1 && <img className="progress-step-arrow" src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-right.svg" alt="" aria-hidden="true" />}
+                  {index < BUSY_STAGES[busyTask].stages.length - 1 && <img className="progress-step-arrow" src="/icons/tabler/chevron-right.svg" alt="" aria-hidden="true" />}
                 </div>
               ))}
             </div>
