@@ -151,6 +151,16 @@ test("the canonical runtime projection always satisfies the workflow heading gat
   assert.equal(hasExecutableWorkflowHeading(projected), true);
 });
 
+test("a basic Skill compiles without invented capability lift or source evidence", () => {
+  const ir = compile();
+  assert.equal(ir.capabilityDelta.skillMustTeach.length, 0);
+  assert.equal(ir.knowledgeAssessment.status, "not-required");
+  assert.equal(ir.domainEvidence.length, 0);
+  assert.ok(ir.requirements.some((item) => item.id === "goal" && item.hard));
+  assert.match(projectSkillMarkdown(ir), /## Workflow/);
+  assert.doesNotMatch(projectSkillMarkdown(ir), /## Skill-specific capability delta/);
+});
+
 test("Canonical SkillIR compilation blocks a workflow with unmet artifact dependencies", () => {
   const plan = fixturePlan();
   plan.workflowSteps = [{

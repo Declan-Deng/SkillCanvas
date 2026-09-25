@@ -45,18 +45,27 @@ test("located quote alone is not proof of entailment and model self-certificatio
   assert.match(unsupported.rejected.join(" "), /does not entail/);
 });
 
-test("a verifier's own admission of unsupported inference vetoes its positive vote", () => {
+test("structured unsupported verdicts reject claims regardless of explanatory wording", () => {
   for (const reason of [
     "来源支持部分动作，但未明确提及这个检查，不过作为扩展是合理的。",
     "动作中的附加检查是合理延伸。",
     "The quote does not explicitly mention this action, but it is a reasonable extension.",
   ]) {
-    assert.equal(review(compile(), { reason }).atoms.length, 0, reason);
+    assert.equal(review(compile(), { reason, sourceSupported: false }).atoms.length, 0, reason);
     const pending = compile();
     const checks = knowledgeVerificationCandidates(pending)[0].supportChecks;
-    assert.equal(review(pending, { supportChecks: checks.map((check) => ({ id: check.id, sourceIndexes: [0], reason })) }).atoms.length, 0);
+    assert.equal(review(pending, { supportChecks: checks.map((check) => ({ id: check.id, sourceIndexes: [0], supported: false, reason })) }).atoms.length, 0);
   }
   assert.equal(review(compile(), { reason: "The cited source directly supports the complete action." }).atoms.length, 1);
+});
+
+test("negative wording and unrelated caveats do not override positive evidence receipts", () => {
+  for (const reason of ["来源直接支持该规则，没有未支持的推断。", "No unsupported inference is present; the source directly supports the claim.", "来源未提及其他无关场景，但本条动作有直接证据。"]) {
+    assert.equal(review(compile(), { reason }).atoms.length, 1, reason);
+    const pending = compile();
+    const checks = knowledgeVerificationCandidates(pending)[0].supportChecks;
+    assert.equal(review(pending, { supportChecks: checks.map((check) => ({ id: check.id, sourceIndexes: [0], supported: true, reason })) }).atoms.length, 1);
+  }
 });
 
 test("excluded advice and user policy are rejected, including semantic paraphrases", () => {

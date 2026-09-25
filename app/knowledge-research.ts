@@ -922,6 +922,7 @@ export function applyKnowledgeVerification(pack: KnowledgePack, raw: unknown, pr
       verifiedGapIds: list(result.verifiedGapIds, 16, 80), reason: clean(result.reason, "知识证据核验缺失或未通过", 400),
       supportChecks: (Array.isArray(result.supportChecks) ? result.supportChecks : []).map(record).map((check) => ({
         id: String(check.id || ""), reason: clean(check.reason, "", 400),
+        ...(typeof check.supported === "boolean" ? { supported: check.supported } : {}),
         sourceIndexes: Array.isArray(check.sourceIndexes) ? check.sourceIndexes.filter((index): index is number => typeof index === "number") : [],
       })),
     };

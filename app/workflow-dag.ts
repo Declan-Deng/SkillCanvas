@@ -477,13 +477,31 @@ export function compileWorkflowDag(steps: WorkflowDagStep[], initialInputs: stri
   };
   const isTerminalBranch = (step: WorkflowDagStep) => ["deliver", "persist"].includes(step.role || "")
     && step.produces.some((token) => terminalOutputSet.has(token));
+  // Only content handoffs separated by a real user-feedback event may commit
+  // alternative versions of the same internal result. Terminal status alone
+  // proves neither exclusivity nor ordering. External writes always require
+  // normal dependency ordering, including writes in a revision path.
+  const isFeedbackVersionPair = (earlier: WorkflowDagStep, later: WorkflowDagStep) => {
+    if (earlier.role !== "deliver" || later.role !== "deliver"
+      || !earlier.delivers?.length || !later.delivers?.length
+      || earlier.delivers.some((token) => later.delivers!.includes(token))) return false;
+    return steps.some((checkpoint) => {
+      if (!pauseTerminalForStep(checkpoint) || !checkpoint.resumeProduces?.length
+        || !precedes(checkpoint.id, later.id) || precedes(checkpoint.id, earlier.id)) return false;
+      // The pre-feedback handoff must derive from the very artifact being
+      // reviewed, not merely share a request or a state field.
+      return checkpoint.requires.some((token) => {
+        if (initial.has(token) || isTerminal(token)) return false;
+        const owner = producerByToken.get(token);
+        return earlier.delivers!.includes(token) || Boolean(owner && precedes(owner, earlier.id));
+      });
+    });
+  };
   for (const writer of steps) for (const token of writer.mutates) {
     for (const other of steps) {
       if (other.id === writer.id || (!other.requires.includes(token) && !other.mutates.includes(token))) continue;
-      // Multiple terminal producers are conditional branch endings by
-      // contract. Their final state writes belong to those same alternatives,
-      // so they do not need an artificial cross-branch dependency.
-      if (other.mutates.includes(token) && isTerminalBranch(writer) && isTerminalBranch(other)) continue;
+      if (other.mutates.includes(token) && isTerminalBranch(writer) && isTerminalBranch(other)
+        && (isFeedbackVersionPair(writer, other) || isFeedbackVersionPair(other, writer))) continue;
       if (!precedes(writer.id, other.id) && !precedes(other.id, writer.id)) issues.push({
         type: "unordered-mutation", stepId: writer.id, dependency: token,
         message: `${writer.id} 与 ${other.id} 对 ${token} 存在未排序的读写/写写冲突；请用产生的版本或完成令牌声明先后依赖`,

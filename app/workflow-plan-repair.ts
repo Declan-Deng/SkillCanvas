@@ -597,7 +597,8 @@ function commitAlternativeStateAtDelivery(steps: WorkflowDagStep[], capabilities
   for (const state of declared) {
     const writers = next.filter((step) => step.mutates.includes(state) && !terminalDeliveries.includes(step));
     if (writers.length < 2 || writers.some((step) => step.role !== "transform"
-      || !step.capabilityIds.length || step.capabilityIds.some((id) => kinds.get(id) !== "llm")
+      || !step.capabilityIds.some((id) => kinds.get(id) === "llm")
+      || step.capabilityIds.some((id) => !["llm", "reference"].includes(kinds.get(id) || ""))
       || step.input.includes(state) || step.when.includes(state))) continue;
     // If another operation reads this state before handoff, moving its write
     // would change runtime behavior. Leave that graph for explicit repair.
@@ -734,8 +735,18 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
 
 export function inspectWorkflowPlan(context: WorkflowPlanContext) {
   const initialInputs = ["$request", "$source", ...context.inputs.map((input) => `input:${input.id}`), ...(context.stateFields || [])];
+  const bindingChanges: Array<{ stage: string; stepIds: string[] }> = [];
+  const trace = (stage: string, before: WorkflowDagStep[], after: WorkflowDagStep[]) => {
+    const previous = new Map(before.map((step) => [step.id, JSON.stringify(step)]));
+    const current = new Map(after.map((step) => [step.id, JSON.stringify(step)]));
+    const stepIds = [...new Set([...previous.keys(), ...current.keys()])]
+      .filter((id) => previous.get(id) !== current.get(id));
+    if (stepIds.length) bindingChanges.push({ stage, stepIds });
+  };
   const normalized = normalizeWorkflowPlanBindings(context);
+  trace("normalize-bindings", normalizeWorkflowDagSteps(context.workflowSteps), normalized);
   const bound = bindWorkflowCapabilities(normalized, context.capabilities);
+  trace("bind-capabilities", normalized, bound);
   const baseline = closeWorkflowDagTerminals(bound, initialInputs);
   const baselineCompile = compileWorkflowDag(baseline, initialInputs, { terminalOutputs: Object.values(WORKFLOW_TERMINALS), requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed] });
   const capabilityById = new Map(context.capabilities.map((item) => [item.id, item]));
@@ -751,13 +762,14 @@ export function inspectWorkflowPlan(context: WorkflowPlanContext) {
     ? stabilizeBoundWorkflowPlan(bound, context.capabilities)
     : bound;
   const steps = closeWorkflowDagTerminals(stabilized, initialInputs);
+  trace("close-deliveries", bound, steps);
   const result = compileWorkflowDag(steps, initialInputs, { terminalOutputs: Object.values(WORKFLOW_TERMINALS), requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed] });
   const ids = new Set(context.capabilities.map((item) => item.id));
   const ownershipIssues = steps.flatMap((step) => !step.capabilityIds.length || step.capabilityIds.some((id) => !ids.has(id))
     ? [`Workflow step ${step.id} 缺少有效的 capability owner；必须使用当前已启用能力的 id`] : []);
   const issues = [...result.issues.map((item) => item.message), ...ownershipIssues, ...workflowCapabilityRouteIssues(steps, context.capabilities)];
   if (!steps.length) issues.push("Workflow 没有可执行步骤");
-  return { valid: !issues.length, steps, ordered: result.ordered, initialInputs, issues };
+  return { valid: !issues.length, steps, ordered: result.ordered, initialInputs, issues, bindingChanges };
 }
 
 export type WorkflowRepairRequest = {
@@ -837,9 +849,11 @@ export function applyWorkflowStepPatch(steps: WorkflowDagStep[], payload: Record
 export async function repairWorkflowPlan(
   context: WorkflowPlanContext,
   propose: (request: WorkflowRepairRequest) => Promise<unknown>,
-  onProgress?: (event: { attempt: number; status: "repairing" | "passed" | "failed"; issues: string[] }) => void,
+  onProgress?: (event: { attempt: number; status: "repairing" | "passed" | "failed"; issues: string[]; bindingChanges?: Array<{ stage: string; stepIds: string[] }> }) => void,
+  saveCheckpoint?: (steps: WorkflowDagStep[]) => void,
 ) {
   let current = inspectWorkflowPlan(context);
+  saveCheckpoint?.(structuredClone(current.steps));
   const originalSteps = current.steps;
   const originalCompile = compileWorkflowDag(originalSteps, current.initialInputs);
   const structuralProductions = new Set(originalCompile.issues.flatMap((issue) => issue.type === "duplicate-producer" && issue.dependency && current.initialInputs.includes(issue.dependency) ? [issue.dependency] : []));
@@ -852,7 +866,7 @@ export async function repairWorkflowPlan(
   while ((!current.valid || rejectionIssues.length) && attempts < 2) {
     attempts += 1;
     const issues = [...current.issues, ...rejectionIssues];
-    onProgress?.({ attempt: attempts, status: "repairing", issues });
+    onProgress?.({ attempt: attempts, status: "repairing", issues, bindingChanges: current.bindingChanges });
     const raw = await propose({
       workflowSteps: current.steps,
       capabilities: context.capabilities,
@@ -902,13 +916,16 @@ export async function repairWorkflowPlan(
     }
     if (rejectionIssues.length) continue;
     current = inspectWorkflowPlan({ ...context, workflowSteps: proposed });
+    // Persist only patches that passed task/permission preservation checks.
+    // An incomplete graph is a repair checkpoint, never a completed blueprint.
+    saveCheckpoint?.(structuredClone(current.steps));
   }
   const issues = [...current.issues, ...rejectionIssues];
   if (!current.valid || rejectionIssues.length) {
-    onProgress?.({ attempt: attempts, status: "failed", issues });
+    onProgress?.({ attempt: attempts, status: "failed", issues, bindingChanges: current.bindingChanges });
     throw new Error(`WORKFLOW_DAG_INVALID: 工作流连线定向修复 ${attempts} 轮仍未通过：${issues.join("；")}`);
   }
-  onProgress?.({ attempt: attempts, status: "passed", issues: [] });
+  onProgress?.({ attempt: attempts, status: "passed", issues: [], bindingChanges: current.bindingChanges });
   return { workflowSteps: current.ordered, attempts };
 }
 

@@ -149,6 +149,15 @@ test("state mutations require explicit read and write ordering", () => {
   assert.equal(compileWorkflowDag([{ ...writer, requires: [] }], ["state"]).valid, false);
 });
 
+test("terminal labels do not exempt simultaneous shared writes, including external persistence", () => {
+  for (const role of ["deliver", "persist"]) {
+    const writer = (id) => ({ ...step(id, ["$request", "shared"], ["$output"]), role, delivers: ["shared"], mutates: ["shared"] });
+    const result = compileWorkflowDag([writer("a"), writer("b")], ["$request", "shared"], { terminalOutputs: ["$output"] });
+    assert.equal(result.valid, false);
+    assert.ok(result.issues.some((issue) => issue.type === "unordered-mutation"));
+  }
+});
+
 test("reference resources bind inside their consuming operation, not as fake completions", () => {
   const consumer = { ...step("compose", ["$request"], ["report"]), role: "deliver" };
   const workflow = bindWorkflowCapabilities([consumer], [

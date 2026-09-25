@@ -576,6 +576,33 @@ test("alternative draft branches commit their shared final state only at their o
   assert.deepEqual(normalizeWorkflowPlanBindings({ ...context, workflowSteps: checked.steps }), checked.steps);
   const repaired = await repairWorkflowPlan(context, () => assert.fail("alternative branch state commit must not call the model"));
   assert.equal(repaired.attempts, 0);
+  for (const attached of [false, true]) {
+    const withReference = structuredClone(context);
+    withReference.capabilities.push(cap("guide", "reference", "Context", "Guidance"));
+    if (attached) withReference.workflowSteps.filter((step) => step.id.startsWith("draft-report"))
+      .forEach((step) => step.capabilityIds.push("guide"));
+    const checkedReference = inspectWorkflowPlan(withReference);
+    assert.equal(checkedReference.valid, true, checkedReference.issues.join("; "));
+    assert.deepEqual(inspectWorkflowPlan({ ...withReference, workflowSteps: checkedReference.steps }).steps, checkedReference.steps);
+  }
+});
+
+test("safe partial repair survives a failed invocation and rejected patches never overwrite it", async () => {
+  const { context, repaired } = fixture();
+  let saved;
+  let calls = 0;
+  await assert.rejects(repairWorkflowPlan(context, async () => {
+    calls++;
+    if (calls === 1) return { workflowSteps: repaired.map((step) => step.id === "extract-resume" ? { ...step, input: "$resume_pdf", requires: ["$resume_pdf"] } : step) };
+    return { stepUpdates: [{ id: "analyze-specification", changes: { id: "forbidden-rename" } }] };
+  }, undefined, (steps) => { saved = steps; }), /WORKFLOW_DAG_INVALID/);
+  assert.ok(saved.some((step) => step.id === "analyze-specification"));
+  assert.ok(!saved.some((step) => step.id === "forbidden-rename"));
+  const result = await repairWorkflowPlan({ ...context, workflowSteps: saved }, async (request) => {
+    assert.ok(request.workflowSteps.some((step) => step.id === "analyze-specification"));
+    return { workflowSteps: repaired };
+  });
+  assert.equal(result.attempts, 1);
 });
 
 test("shared delivery or intermediate state reads do not silently suppress unordered writes", () => {
@@ -770,16 +797,28 @@ test("accepted repaired plan passes the actual Canonical SkillIR compiler and ex
 test("live generator validates before paid research and again before Canonical compilation", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const build = page.slice(page.indexOf("async function compileSkill()"), page.indexOf("async function compileSkill()") + 12_000);
-  const first = build.indexOf("await ensureValidGenerationWorkflow(generationPlan)");
+  const first = build.indexOf("await ensureValidGenerationWorkflow(generationPlan");
   const research = build.indexOf("await runBuildTimeKnowledgeCompiler");
-  const last = build.lastIndexOf("await ensureValidGenerationWorkflow(generationPlan)");
+  const last = build.lastIndexOf("await ensureValidGenerationWorkflow(generationPlan");
   const canonical = build.indexOf("const canonicalIR = createCanonicalSkillIR");
   assert.ok(first >= 0 && first < research && research < last && last < canonical);
+  assert.doesNotMatch(build, /throw new Error\("CAPABILITY_DELTA_INSUFFICIENT/);
+  assert.match(build, /未识别出需要额外教授的专业能力/);
   assert.match(page, /runtimeInputs: deriveTaskInputContract/);
   assert.doesNotMatch(page, /normalizedWorkflow\.map[^\n]+\.filter\(\(step\) => step\.capabilityIds\.length > 0\)/);
   const route = await readFile(new URL("../app/api/ai/route.ts", import.meta.url), "utf8");
   assert.match(route, /if \(mode === "workflow-repair"\) return/);
   assert.match(route, /system: WORKFLOW_REPAIR_PROMPT/);
+});
+
+test("binding diagnostics identify stages without leaking task content", () => {
+  const context = { inputs: [], capabilities: [cap("core", "llm", "Input", "Output"), cap("guide", "reference", "Context", "Guidance")], workflowSteps: [
+    node("draft", ["$request"], ["$draft"]),
+    { ...node("finish", ["$draft"], ["$output"], "deliver"), delivers: ["$draft"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.ok(checked.bindingChanges.some((change) => change.stage === "bind-capabilities"));
+  assert.ok(checked.bindingChanges.every((change) => Object.keys(change).sort().join(",") === "stage,stepIds"));
 });
 
 test("observed terse repair response inherits roles and control ownership, binds a declared file and routes optional search", async () => {

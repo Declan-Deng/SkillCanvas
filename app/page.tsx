@@ -7430,7 +7430,15 @@ export default function Home() {
       const foundation = result.foundation;
       const normalizedCapabilities = normalizeCapabilityPlan(result.capabilityPlan);
       if (!normalizedCapabilities) throw new Error("模型没有返回完整的能力与资源计划");
-      const plannedCapabilities = await ensureValidGenerationWorkflow(ensureTaskCapabilities(normalizedCapabilities, idea, demoAnswers));
+      const checkpoint = blueprintCheckpointRef.current;
+      const checkpointKey = checkpoint.key;
+      const workflowOwnerKey = checkpoint.workflowOwnerKey;
+      const plannedCapabilities = await ensureValidGenerationWorkflow(ensureTaskCapabilities(normalizedCapabilities, idea, demoAnswers), (steps) => {
+        if (checkpoint === blueprintCheckpointRef.current && checkpoint.key === checkpointKey
+          && checkpoint.workflowOwnerKey === workflowOwnerKey && checkpoint.workflow) {
+          checkpoint.workflow.workflowSteps = structuredClone(steps);
+        }
+      });
       const plannedLoop = normalizeLoopPlan(result.loopPlan, deriveLoopPlan(idea, demoAnswers, plannedCapabilities));
       const confirmedAnswerText = confirmedAnswerEvidenceText(demoAnswers);
       const normalizedBlueprint = foundation.sections.map((item, index) => ({ ...item, content: reconcileDataMutationPolicy(item.content, confirmedAnswerText), index: item.index || String.fromCharCode(65 + index) }));
@@ -9051,6 +9059,15 @@ export default function Home() {
   }
 
   async function runBuildTimeKnowledgeCompiler(basePlan: CapabilityPlan, capabilityDelta: CapabilityDelta): Promise<KnowledgePack> {
+    if (!capabilityDelta.skillMustTeach.length) {
+      const skipped: KnowledgePack = {
+        ...EMPTY_KNOWLEDGE_PACK, status: "not-needed",
+        summary: "本次按已确认的任务要求生成，不额外声称专业能力提升；需要来源的结论仍须提供证据。",
+        generatedAt: new Date().toISOString(),
+      };
+      setKnowledgePack(skipped);
+      return skipped;
+    }
     setBuildLoop((current) => ({ ...current, status: "checking", phase: "knowledge" }));
     setInternalMcpEvidenceReports((current) => ({ ...current, "knowledge-compile": undefined }));
     showLoopBusy("正在判断哪些领域知识能真正改变 Skill 的专业判断与工作分支");
@@ -9284,7 +9301,7 @@ export default function Home() {
     }
   }
 
-  async function ensureValidGenerationWorkflow(plan: CapabilityPlan): Promise<CapabilityPlan> {
+  async function ensureValidGenerationWorkflow(plan: CapabilityPlan, saveCheckpoint?: (steps: CapabilityPlan["workflowSteps"]) => void): Promise<CapabilityPlan> {
     const result = await repairWorkflowPlan({
       workflowSteps: plan.workflowSteps,
       capabilities: plan.items.filter((item) => item.kind !== "eval" && capabilityIsActive(item)),
@@ -9292,13 +9309,13 @@ export default function Home() {
       stateFields: plan.stateModel.needed ? plan.stateModel.fields.map((field) => field.name) : [],
     }, (workflowRepair) => callAI("workflow-repair", {
       idea, answers: interviewEvidence, outputContract: plan.outputContract, workflowRepair,
-    }), ({ attempt, status, issues }) => {
+    }), ({ attempt, status, issues, bindingChanges }) => {
       if (status === "repairing") showLoopBusy(`正在修复工作流连线（第 ${attempt} 轮），保留已有任务、知识和用户要求`);
       reportClientGenerationLoopEvent(status === "failed" ? "generation_loop_failed" : "generation_loop_phase", {
-        phase: "workflow-dag-preflight", round: attempt, blockers: issues,
+        phase: "workflow-dag-preflight", round: attempt, blockers: issues, bindingChanges,
         reason: status === "passed" ? "输入、实际产物、用户反馈与交付连线检查通过" : status === "failed" ? "工作流连线修复仍未通过；未开始文件生成" : "只修复有问题的工作流连线，不重新生成需求或专业知识",
       });
-    });
+    }, saveCheckpoint);
     return { ...plan, workflowSteps: result.workflowSteps };
   }
 
@@ -9320,7 +9337,7 @@ export default function Home() {
       if (!hasRealModel) throw new Error("模型配置已缺失，请重新连接");
       // Old sessions may contain a pre-guard blueprint. Repair it before any
       // paid research/build work, not after knowledge has already completed.
-      generationPlan = await ensureValidGenerationWorkflow(generationPlan);
+      generationPlan = await ensureValidGenerationWorkflow(generationPlan, (steps) => setCapabilityPlan({ ...generationPlan, workflowSteps: steps }));
       setCapabilityPlan(generationPlan);
       durableBuild = await DurableWorkflowJournal.start("build", {
         goal: idea.slice(0, 2_000),
@@ -9354,7 +9371,9 @@ export default function Home() {
         }));
       }
       if (liveCapabilityDelta.status === "insufficient") {
-        throw new Error("CAPABILITY_DELTA_INSUFFICIENT: 两轮分析仍未识别出裸模型之外的可证明能力；已停止生成，避免产出只有普通 Prompt 的伪 Skill");
+        reportClientGenerationLoopEvent("generation_loop_phase", {
+          phase: "capability-delta", reason: "未识别出需要额外教授的专业能力；继续按已确认的要求生成基础 Skill，不虚构能力增益或来源知识",
+        });
       }
       await durableBuild?.complete("capability-delta", {
         status: liveCapabilityDelta.status,
@@ -9386,7 +9405,7 @@ export default function Home() {
       );
       // Research can introduce another runtime resource. Validate its consumer
       // while retaining the completed knowledge pack and all original work.
-      generationPlan = await ensureValidGenerationWorkflow(generationPlan);
+      generationPlan = await ensureValidGenerationWorkflow(generationPlan, (steps) => setCapabilityPlan({ ...generationPlan, workflowSteps: steps }));
       setCapabilityPlan(generationPlan);
       const liveKnowledgeText = serializeKnowledgePack(liveKnowledgePack);
       const liveKnowledgeProjection = applyKnowledgePackToFiles({ "SKILL.md": "" }, liveKnowledgePack);
