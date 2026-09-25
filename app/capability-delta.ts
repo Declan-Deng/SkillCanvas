@@ -4,6 +4,9 @@ export type CapabilityDeltaGap = {
   bareModelBehavior: string;
   requiredSkillBehavior: string;
   whySkillIsNeeded: string;
+  /** Contract-only gaps are enforced from confirmed user requirements. They
+   * are real Skill behavior, but must never trigger web research. */
+  knowledgeNeed: "external" | "contract-only";
   researchQuestions: string[];
 };
 
@@ -71,21 +74,27 @@ export function normalizeCapabilityDelta(value: unknown): CapabilityDelta {
     const key = `${taskDecision}|${requiredSkillBehavior}`.toLowerCase();
     if (seen.has(key)) return [];
     seen.add(key);
+    const researchQuestions = list(candidate.researchQuestions, 8, 260);
+    const knowledgeNeed = candidate.knowledgeNeed === "contract-only" || candidate.knowledgeNeed === "external"
+      ? candidate.knowledgeNeed
+      : researchQuestions.length ? "external" : "contract-only";
     return [{
       id: clean(candidate.id, slug(taskDecision, index), 80).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || `gap-${index + 1}`,
       taskDecision,
       bareModelBehavior: clean(candidate.bareModelBehavior, "裸模型能完成通用理解与表达，但不能稳定执行该专属判断", 360),
       requiredSkillBehavior,
       whySkillIsNeeded,
-      researchQuestions: list(candidate.researchQuestions, 8, 260),
+      knowledgeNeed,
+      researchQuestions: knowledgeNeed === "external" ? researchQuestions : [],
     }];
   }).slice(0, 12);
   // Research is downstream of a defensible gap. Keeping model-authored focus
   // after every gap was rejected used to let generic workflow prose leak back
   // into the knowledge compiler and made an invalid delta look "ready" again.
-  const researchFocus = gaps.length ? Array.from(new Set([
+  const externalGaps = gaps.filter((gap) => gap.knowledgeNeed === "external");
+  const researchFocus = externalGaps.length ? Array.from(new Set([
     ...list(raw.researchFocus, 12, 260),
-    ...gaps.flatMap((gap) => gap.researchQuestions),
+    ...externalGaps.flatMap((gap) => gap.researchQuestions),
   ])).slice(0, 16) : [];
   return {
     status: gaps.length ? "ready" : "insufficient",

@@ -9060,12 +9060,26 @@ export default function Home() {
   }
 
   async function runBuildTimeKnowledgeCompiler(basePlan: CapabilityPlan, capabilityDelta: CapabilityDelta): Promise<KnowledgePack> {
-    if (!capabilityDelta.skillMustTeach.length) {
-      const skipped: KnowledgePack = {
-        ...EMPTY_KNOWLEDGE_PACK, status: "not-needed",
-        summary: "本次按已确认的任务要求生成，不额外声称专业能力提升；需要来源的结论仍须提供证据。",
-        generatedAt: new Date().toISOString(),
-      };
+    const externalGaps = capabilityDelta.skillMustTeach.filter((gap) => gap.knowledgeNeed === "external");
+    const researchDelta: CapabilityDelta = {
+      ...capabilityDelta,
+      skillMustTeach: externalGaps,
+      researchFocus: Array.from(new Set(externalGaps.flatMap((gap) => gap.researchQuestions))).slice(0, 16),
+    };
+    const notRequiredPack = (summary: string, plan = EMPTY_KNOWLEDGE_PACK.plan): KnowledgePack => ({
+      ...EMPTY_KNOWLEDGE_PACK,
+      status: "not-needed",
+      summary,
+      plan,
+      coverage: { target: 0, covered: [], missing: [], score: 100 },
+      categoryCoverage: { covered: [], missing: [], score: 100 },
+      sufficiency: "not-required",
+      generatedAt: new Date().toISOString(),
+    });
+    if (!externalGaps.length) {
+      const skipped = notRequiredPack(capabilityDelta.skillMustTeach.length
+        ? "需要写入 Skill 的行为已由用户要求完整定义，不需要用网页来源重新证明；系统将直接按已确认的工作方式生成。"
+        : "本次按已确认的任务要求生成，不额外声称专业能力提升；需要来源的结论仍须提供证据。");
       setKnowledgePack(skipped);
       return skipped;
     }
@@ -9077,24 +9091,24 @@ export default function Home() {
       sourceText: contextBundle,
       answers: interviewEvidence,
       capabilityPlan: basePlan,
-      capabilityDelta,
+      capabilityDelta: researchDelta,
     });
+    const rawPlanRequired = Boolean(rawPlan && typeof rawPlan === "object" && (rawPlan as Record<string, unknown>).required === true);
     const plan = normalizeKnowledgePlan({
       ...(rawPlan && typeof rawPlan === "object" ? rawPlan as Record<string, unknown> : {}),
-      required: capabilityDelta.skillMustTeach.length > 0,
-      capabilityDeltaGapIds: capabilityDelta.skillMustTeach.map((item) => item.id),
-      excludedGenericKnowledge: capabilityDelta.excludedGenericKnowledge,
+      capabilityDeltaGapIds: externalGaps.map((item) => item.id),
+      excludedGenericKnowledge: researchDelta.excludedGenericKnowledge,
       userPolicies: ["evidence-policy", "boundary", "autonomy", "output-format"].map((key) => (demoAnswers as Record<string, string>)[key] || "").filter(Boolean),
     }, idea);
     const verifyPack = async (candidate: KnowledgePack, prior?: KnowledgePack) => {
       const knowledgeClaims = knowledgeVerificationCandidates(candidate);
       if (!knowledgeClaims.length) return candidate;
       setBusyExecutionNote("正在核对每条规则的来源原文与对应能力差值，不把用户偏好当作外部知识");
-      const verdicts = await callAI<unknown>("knowledge-verify", { capabilityDelta, knowledgeClaims, acceptedKnowledge: knowledgeVerificationContext(prior), knowledgePlan: plan, answers: interviewEvidence });
+      const verdicts = await callAI<unknown>("knowledge-verify", { capabilityDelta: researchDelta, knowledgeClaims, acceptedKnowledge: knowledgeVerificationContext(prior), knowledgePlan: plan, answers: interviewEvidence });
       return applyKnowledgeVerification(candidate, verdicts, prior);
     };
     const workflowMcpEnabled = mcpConnections.length > 0;
-    if (capabilityDelta.skillMustTeach.length > 0 && !plan.required) {
+    if (rawPlanRequired && !plan.required) {
       const insufficient: KnowledgePack = {
         ...EMPTY_KNOWLEDGE_PACK,
         status: "unavailable",
@@ -9108,13 +9122,7 @@ export default function Home() {
       return insufficient;
     }
     if (!plan.required) {
-      const skipped: KnowledgePack = {
-        ...EMPTY_KNOWLEDGE_PACK,
-        status: "not-needed",
-        summary: plan.reason || "现有用户资料和模型能力已经足够，不额外制造领域知识文件",
-        plan,
-        generatedAt: new Date().toISOString(),
-      };
+      const skipped = notRequiredPack(plan.reason || "现有用户资料和模型能力已经足够，不额外制造领域知识文件", plan);
       setKnowledgePack(skipped);
       return skipped;
     }
@@ -9205,12 +9213,12 @@ export default function Home() {
       const compiling: KnowledgePack = { ...researching, status: "compiling", sources, summary: `已取得 ${sources.length} 个来源${workflowMcpEnabled ? `（MCP ${mcpReport.sources.length}）` : ""}，正在提炼会改变 Skill 行为的专业规则${webResearchIssue ? `；网页补充未完成：${webResearchIssue}` : ""}` };
       setKnowledgePack(compiling);
       setBusyExecutionNote(`已读取 ${sources.length} 个来源，正在核对适用条件、例外和失败处理`);
-      const evidenceFocus = [...plan.decisionDimensions, ...capabilityDelta.skillMustTeach.flatMap((gap) => gap.researchQuestions)];
+      const evidenceFocus = [...plan.decisionDimensions, ...externalGaps.flatMap((gap) => gap.researchQuestions)];
       let evidencePayload = buildKnowledgeEvidencePayload(sources, 42_000, { focus: evidenceFocus });
       let pack = await compileBatches({
         idea,
         answers: interviewEvidence,
-        capabilityDelta,
+        capabilityDelta: researchDelta,
         knowledgePlan: plan,
         researchSources: evidencePayload,
       });
@@ -9227,7 +9235,7 @@ export default function Home() {
         setBusyExecutionNote(`${densityGate.reason}，正在针对未覆盖能力补搜来源；引用不支持规则时，不会只改写同一批证据`);
         try {
           const missingGapIds = new Set(pack.evidenceCoverage?.missingGapIds || plan.capabilityDeltaGapIds);
-          const gapQuestions = capabilityDelta.skillMustTeach.filter((gap) => missingGapIds.has(gap.id)).flatMap((gap) => gap.researchQuestions);
+          const gapQuestions = externalGaps.filter((gap) => missingGapIds.has(gap.id)).flatMap((gap) => gap.researchQuestions);
           const followupQueries = buildFollowupResearchQueries(plan, densityGate.missingDimensions, gapQuestions);
           const previousUrls = new Set(sources.map((source) => source.url));
           const usedUrls = pack.atoms.flatMap((atom) => atom.sourceUrls);
@@ -9266,7 +9274,7 @@ export default function Home() {
           pack = await compileBatches({
             idea,
             answers: interviewEvidence,
-            capabilityDelta,
+            capabilityDelta: researchDelta,
             knowledgePlan: { ...plan, knowledgeGaps: densityGate.missingDimensions.length ? densityGate.missingDimensions : plan.knowledgeGaps },
             researchSources: evidencePayload,
             priorKnowledgePack: serializeKnowledgePackForRefinement(pack, evidencePayload),
@@ -11539,7 +11547,7 @@ export default function Home() {
                       </div>
                     </details>
                   )}
-                  {knowledgePack.rejected.length > 0 && <details className="knowledge-rejected"><summary>为什么这 {knowledgePack.rejected.length} 条候选没有写入</summary><ul>{knowledgePack.rejected.map((item) => <li key={item}>{item}</li>)}</ul></details>}
+                  {knowledgePack.rejected.length > 0 && <details className="knowledge-rejected"><summary>查看 {knowledgePack.rejected.length} 条未采用原因</summary><ul>{knowledgePack.rejected.map((item) => <li key={item}>{item}</li>)}</ul></details>}
                 </section>
               )}
               <section className={`build-loop-result ${buildLoop.status}`} aria-label="Build Loop 结果">

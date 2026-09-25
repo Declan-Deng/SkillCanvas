@@ -131,6 +131,20 @@ test("knowledge planning only enables research for executable gaps and queries",
   assert.equal(enabled.queries.length, 4);
 });
 
+test("knowledge planner can explicitly decline research for contract-defined behavior", () => {
+  const plan = normalizeKnowledgePlan({
+    required: false,
+    reason: "确认时机和输出标签都来自用户已经确认的工作方式",
+    knowledgeGaps: [],
+    decisionDimensions: [],
+    queries: [],
+  }, "每周汇报助手");
+
+  assert.equal(plan.required, false);
+  assert.deepEqual(plan.knowledgeGaps, []);
+  assert.deepEqual(plan.queries, []);
+});
+
 test("knowledge queries stay anchored to the actual task instead of drifting to unrelated standards", () => {
   const plan = normalizeKnowledgePlan({
     required: true,

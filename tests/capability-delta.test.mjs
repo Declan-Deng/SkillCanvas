@@ -22,7 +22,28 @@ test("capability delta rejects generic quality filler and preserves behavior-cha
   assert.equal(delta.status, "ready");
   assert.equal(delta.skillMustTeach.length, 1);
   assert.equal(delta.skillMustTeach[0].id, "extract-before-rewrite");
+  assert.equal(delta.skillMustTeach[0].knowledgeNeed, "external");
   assert.deepEqual(delta.researchFocus, ["事实抽取完成后应如何验证字段来源"]);
+});
+
+test("confirmed workflow behavior remains a real Skill gap without triggering web research", () => {
+  const delta = normalizeCapabilityDelta({
+    researchFocus: ["如何证明用户选择的确认时机"],
+    skillMustTeach: [{
+      id: "wait-for-user-confirmation",
+      taskDecision: "先展示归类结果，再等待用户确认后生成成稿",
+      bareModelBehavior: "裸模型可能直接生成成稿，遗漏用户明确指定的停顿点",
+      requiredSkillBehavior: "归类结果交付后必须暂停，只有真实用户回复才能继续",
+      whySkillIsNeeded: "避免把用户尚未确认的归类直接写成最终成稿",
+      knowledgeNeed: "contract-only",
+      researchQuestions: ["网页来源如何证明这个用户选择"],
+    }],
+  });
+
+  assert.equal(delta.status, "ready");
+  assert.equal(delta.skillMustTeach[0].knowledgeNeed, "contract-only");
+  assert.deepEqual(delta.skillMustTeach[0].researchQuestions, []);
+  assert.deepEqual(delta.researchFocus, []);
 });
 
 test("capability delta rejects a workflow restatement that adds no decision rule", () => {
