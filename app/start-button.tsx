@@ -15,8 +15,8 @@ export function StartButton({ children, disabled, ...props }: ButtonHTMLAttribut
       || window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     const bounds = event.currentTarget.getBoundingClientRect();
     const state = motion.current;
-    state.tx = event.clientX - bounds.left - 70;
-    state.ty = event.clientY - bounds.top - 70;
+    state.tx = (event.clientX - bounds.left) * event.currentTarget.offsetWidth / bounds.width - 70;
+    state.ty = (event.clientY - bounds.top) * event.currentTarget.offsetHeight / bounds.height - 70;
     if (entering) { stop(); state.x = state.tx; state.y = state.ty; state.vx = state.vy = 0; }
     const paint = () => { if (spot.current) spot.current.style.transform = `translate(${state.x}px, ${state.y}px)`; };
     paint();
