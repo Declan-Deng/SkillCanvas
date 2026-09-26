@@ -5137,7 +5137,6 @@ export default function Home() {
   const [selectedFile, setSelectedFile] = useState("SKILL.md");
   const [evals, setEvals] = useState<EvalResult[]>(DEFAULT_EVALS);
   const [evalRan, setEvalRan] = useState(false);
-  const [evalDetailsOpen, setEvalDetailsOpen] = useState(false);
   const [skillDemo, setSkillDemo] = useState<SkillDemo | null>(null);
   const [demoReviewPending, setDemoReviewPending] = useState(false);
   const [demoExpanded, setDemoExpanded] = useState(true);
@@ -10918,16 +10917,24 @@ export default function Home() {
     const conversationScoreIsFresh = Boolean(latestCompletedReplyId) && demoConversationScoredReplyId === latestCompletedReplyId;
     const hasNewConversationEvidence = Boolean(latestCompletedReplyId) && !conversationScoreIsFresh;
     const automaticTurns = demoConversation.filter((message) => message.role === "assistant" && message.source === "mock").length;
+    const visibleComparisonEvals = observedEvals.slice(0, 3);
     return (
       <section className={`skill-demo-card ${pendingReview ? "review-pending" : ""}`}>
         <div className="skill-demo-head">
           <div className="skill-demo-title"><span>第 {Math.max(1, demoRunCount)} 次试跑</span><h3>{skillDemo.title}</h3><p>{skillDemo.scenario}</p></div>
           <div className="skill-demo-aside">
-            {pendingReview
-              ? <div className="demo-score pending"><small>与通用 AI 对比</small><strong>等待分析</strong><span>先完成本轮试跑</span></div>
-              : observedEvals.length
-                ? <div className="demo-score"><small>{demoConversationScoredTurns > 0 ? `基于 ${demoConversationScoredTurns} 轮对话` : "与通用 AI 对比"}</small><strong>{strongEvals.length ? "已看到提升" : "尚未看到提升"}</strong><span>{strongEvals.length ? "查看具体方面" : "继续换场景验证"}</span></div>
-                : <div className="demo-score pending"><small>与通用 AI 对比</small><strong>等待分析</strong><span>暂无可判断证据</span></div>}
+            <section className={`demo-improvement-summary ${pendingReview || !observedEvals.length ? "pending" : ""}`} aria-label="相比通用 AI 的具体变化">
+              <div className="demo-improvement-heading">
+                <span>{demoConversationScoredTurns > 0 ? `基于 ${demoConversationScoredTurns} 轮对话` : "相比通用 AI"}</span>
+                <strong>{pendingReview || !observedEvals.length ? "等待分析" : strongEvals.length ? `${strongEvals.length} 个方面表现更好` : "尚未证明有提升"}</strong>
+              </div>
+              {visibleComparisonEvals.length > 0
+                ? <ul>{visibleComparisonEvals.map((result) => {
+                    const improved = result.score >= DEMO_SCORING_POLICY.observedGoodFloor;
+                    return <li className={improved ? "improved" : "gap"} key={result.label}><span>{improved ? "提升" : "待加强"}</span><div><strong>{result.label}</strong><p>{result.strength || result.detail}</p></div></li>;
+                  })}</ul>
+                : <p>{pendingReview ? "完成本轮试跑后，这里会直接列出具体提升和证据。" : "当前没有足够证据判断它是否优于通用 AI，请换一个场景继续验证。"}</p>}
+            </section>
             {!pendingReview && <div className="demo-head-actions">
               <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="/icons/tabler/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
               <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="/icons/tabler/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "对比中…" : conversationScoreIsFresh ? "对比结论已更新" : "更新对比结论"}</span></button>
@@ -11762,7 +11769,7 @@ export default function Home() {
                       </section>
                     )}
                     {renderSkillDemoCard(false)}
-                    <section className={`eval-report-panel ${evalDetailsOpen ? "expanded" : "collapsed"}`} aria-label="本轮效果报告">
+                    <section className="eval-report-panel expanded" aria-label="本轮效果报告">
                     <div className={`eval-report-summary ${needsWorkEvals.length ? "needs-work" : observedEvals.length ? "ready" : "partial"}`}>
                       <div className="eval-report-verdict">
                         <span>相比通用 AI</span>
@@ -11773,11 +11780,8 @@ export default function Home() {
                         <div><strong>{strongEvals.length}</strong><span>方面已看到提升</span></div>
                         <div><strong>{needsWorkEvals.length}</strong><span>方面仍需加强</span></div>
                       </div>
-                      <button type="button" className="eval-report-toggle" onClick={() => setEvalDetailsOpen((current) => !current)} aria-expanded={evalDetailsOpen} aria-controls="eval-report-details" disabled={!observedEvals.length}>
-                        {evalDetailsOpen ? "收起" : "展开"}<img src="/icons/tabler/chevron-down.svg" alt="" aria-hidden="true" />
-                      </button>
                     </div>
-                    <div id="eval-report-details" className="eval-report-details" hidden={!evalDetailsOpen}>
+                    <div id="eval-report-details" className="eval-report-details">
                       <div className="eval-list" aria-label="本轮效果验证">
                     {evals.map((result, index) => {
                       // Hide unobserved rows without shifting optimization indices.

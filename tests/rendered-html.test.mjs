@@ -21,7 +21,8 @@ async function render() {
 test("evaluation UI hides unobserved rows and counts without changing optimization targets", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
-  const report = page.slice(page.indexOf('<section className={`eval-report-panel'), page.indexOf('<div className="finding-card"', page.indexOf('<section className={`eval-report-panel')));
+  const reportStart = page.indexOf('<section className="eval-report-panel expanded"');
+  const report = page.slice(reportStart, page.indexOf('<div className="finding-card"', reportStart));
   assert.match(report, /evals\.map\(\(result, index\) => \{\s*\/\/[^\n]*\n\s*if \(result\.coverage === "not-covered"\) return null;/);
   assert.match(report, /openOptimization\(index\)/);
   assert.doesNotMatch(report, /pendingEvals|还没测到|还没有测到|为什么还不能判断|换场景验证/);
@@ -211,8 +212,12 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /bestQualityScore:\s*comparison\.skillScore/);
   assert.doesNotMatch(page, /baselineQualityScore:\s*blindResult\.revealedScores/);
   assert.doesNotMatch(page, /user-proof-card|场景正式对照总分|重新跑多场景对照|查看每个冻结场景的真实得分与扣分原因|旧版本分数已隐藏/);
-  assert.match(page, /与通用 AI 对比/);
-  assert.match(page, /已看到提升/);
+  assert.match(page, /相比通用 AI/);
+  assert.match(page, /aria-label="相比通用 AI 的具体变化"/);
+  assert.match(page, /result\.strength \|\| result\.detail/);
+  assert.doesNotMatch(page, /查看具体方面/);
+  assert.doesNotMatch(page, /hidden=\{!evalDetailsOpen\}/);
+  assert.match(page, /个方面表现更好/);
   assert.doesNotMatch(page, /不与多场景总分直接比较/);
   assert.match(page, /本次提案=\$\{attempted\}/);
   assert.match(page, /optimizationStableAtCeiling/);
