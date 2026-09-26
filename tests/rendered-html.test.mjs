@@ -182,6 +182,10 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /本地确定性检查/);
   assert.match(page, /Loop 自动推进/);
   assert.match(page, /不代表当前请求超时或正在重试/);
+  assert.match(page, /生成大概需要 5–7 分钟/);
+  assert.match(page, /const BUILD_ESTIMATED_SECONDS = 7 \* 60/);
+  assert.match(page, /Math\.min\(99, Math\.max\(1, Math\.ceil\(\(busyElapsed \/ BUILD_ESTIMATED_SECONDS\) \* 100\)\)\)/);
+  assert.match(page, /aria-label="预计生成进度"/);
   assert.doesNotMatch(page, /busyElapsedSeconds >= 70[\s\S]{0,100}正在执行紧凑重试/);
   assert.match(page, /等待超过 \$\{Math\.round\(timeoutMs \/ 1_000\)\} 秒/);
   assert.match(page, /重试当前步骤/);

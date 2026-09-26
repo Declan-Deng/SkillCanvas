@@ -9992,6 +9992,17 @@ h3 {
   white-space: nowrap;
 }
 
+.ai-progress-top b.ai-progress-percent {
+  color: var(--coral);
+  font-size: 20px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.04em;
+  line-height: 1;
+  min-width: 58px;
+  text-align: right;
+  transition: color 160ms ease;
+}
+
 .busy-execution-status {
   align-items: center;
   animation: busy-status-enter 220ms var(--ease-out) both;

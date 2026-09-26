@@ -737,6 +737,8 @@ const BUSY_STAGES: Record<BusyTask, { title: string; stages: string[] }> = {
   personalize: { title: "AI 正在验证下一版候选", stages: ["读取你确认的不满意点", "定向生成候选 Skill", "用冻结任务检查既有能力", "用新任务生成并复评 Demo", "原子提交已验证版本"] },
 };
 
+const BUILD_ESTIMATED_SECONDS = 7 * 60;
+
 const AI_MODE_LABELS: Record<string, string> = {
   "knowledge-plan": "识别专业知识缺口",
   "knowledge-compile": "把来源编译成专业规则",
@@ -5671,6 +5673,11 @@ export default function Home() {
   const busyElapsedLabel = busyElapsed < 60
     ? `${busyElapsed} 秒`
     : `${Math.floor(busyElapsed / 60)} 分 ${busyElapsed % 60} 秒`;
+  const busyBuildProgress = busyTask === "build"
+    ? busyClosing
+      ? 100
+      : Math.min(99, Math.max(1, Math.ceil((busyElapsed / BUILD_ESTIMATED_SECONDS) * 100)))
+    : null;
   const busyExecutionLabel = busyExecutionKind === "local"
     ? "本地确定性检查"
     : busyExecutionKind === "loop"
@@ -11889,7 +11896,7 @@ export default function Home() {
           <section className="generation-notice-modal" aria-modal="true" role="dialog" aria-labelledby="generation-notice-title">
             <button className="close-button" aria-label="关闭生成提醒" onClick={() => setGenerationNoticeOpen(false)}>×</button>
             <span className="generation-notice-kicker">开始生成前</span>
-            <h2 id="generation-notice-title">生成可能需要几分钟</h2>
+            <h2 id="generation-notice-title">生成大概需要 5–7 分钟</h2>
             <p>SkillCanvas 会继续完成专业知识检索、Skill 生成、结构检查和自动优化。你不必一直停留在当前页面。</p>
             <div className={`generation-notice-permission ${notificationPermission}`}>
               <span aria-hidden="true">{notificationPermission === "granted" ? "✓" : "●"}</span>
@@ -12110,7 +12117,9 @@ export default function Home() {
             <div className="ai-progress-top">
               <span className="coach-avatar">AI</span>
               <div><strong>{BUSY_STAGES[busyTask].title}</strong><small>当前阶段：{busyStage}</small></div>
-              <b>已等待 {busyElapsedLabel}</b>
+              {busyBuildProgress !== null
+                ? <b className="ai-progress-percent" role="progressbar" aria-label="预计生成进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={busyBuildProgress}>{busyBuildProgress}%</b>
+                : <b>已等待 {busyElapsedLabel}</b>}
             </div>
             <div className={`busy-execution-status ${busyExecutionKind}`} key={`${busyStage}-${busyExecutionKind}-${busyExecutionNote}`}>
               <span>{busyExecutionLabel}</span>
