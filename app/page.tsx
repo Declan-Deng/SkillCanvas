@@ -5653,17 +5653,17 @@ export default function Home() {
   const observedEvals = evals.filter((item) => item.coverage !== "not-covered");
   const strongEvals = observedEvals.filter((item) => item.score >= DEMO_SCORING_POLICY.observedGoodFloor);
   const needsWorkEvals = observedEvals.filter((item) => item.score < DEMO_SCORING_POLICY.observedGoodFloor);
-  const averageEvalScore = evalRan && observedEvals.length ? Math.round(observedEvals.reduce((total, item) => total + item.score, 0) / observedEvals.length) : 0;
-  const evaluationHeadline = needsWorkEvals.length
-    ? `这次试跑发现 ${needsWorkEvals.length} 个还能再提升的地方`
+  const demonstratedImprovementLabels = strongEvals.map((item) => item.label);
+  const evaluationHeadline = demonstratedImprovementLabels.length
+    ? `相比通用 AI，${demonstratedImprovementLabels.join("、")}更可靠`
     : observedEvals.length
-      ? "这次表现符合要求"
-      : "本轮结果待评估";
+      ? "本轮还没有看到相对通用 AI 的明确提升"
+      : "完成一次真实试跑后，再看它比通用 AI 好在哪里";
   const evaluationSummary = needsWorkEvals.length
-    ? `优先处理“${needsWorkEvals[0].label}”。其他结论会保留，不需要一次读完所有评语。`
+    ? `已经看到的提升会保留；“${needsWorkEvals[0].label}”仍需要加强。`
     : observedEvals.length
-      ? `已经确认 ${strongEvals.length} 项表现，可以继续发布检查，也可以选择其中一项继续提高。`
-      : "继续对话并更新评分，查看本轮结果。";
+      ? "这些结论来自当前 Demo 中可以直接观察到的行为，不用数字分数代替你的判断。"
+      : "继续对话并更新对比结论，查看本轮实际变化。";
   const busyStageIndex = busyTask
     ? Math.min(BUSY_STAGES[busyTask].stages.length - 1, busyPhaseIndex)
     : 0;
@@ -10054,15 +10054,15 @@ export default function Home() {
     const completedTurns = completedReplies.length;
     const latestReplyId = completedReplies.at(-1)?.id || "";
     if (!latestReplyId) {
-      setToast("先继续对话一轮，AI 回复后即可更新评分");
+      setToast("先继续对话一轮，AI 回复后即可更新对比结论");
       return;
     }
     if (latestReplyId === demoConversationScoredReplyId) {
-      setToast("当前对话已经评分；继续对话后可再次更新");
+      setToast("当前对话已经完成对比；继续对话后可再次更新");
       return;
     }
     if (!hasRealModel) {
-      setToast("重新评分前需要先连接模型");
+      setToast("更新对比结论前需要先连接模型");
       setSettingsOpen(true);
       return;
     }
@@ -10090,9 +10090,9 @@ export default function Home() {
       setEvalRan(true);
       setDemoConversationScoredTurns(completedTurns);
       setDemoConversationScoredReplyId(latestReplyId);
-      setToast(`已更新本次场景评分（${completedTurns} 轮对话）；顶部多场景对照需单独重新运行`);
+      setToast(`已更新本次场景对比结论（${completedTurns} 轮对话）；顶部多场景对照需单独重新运行`);
     } catch (error) {
-      setDemoChatError(error instanceof Error ? error.message : "对话证据重新评分失败");
+      setDemoChatError(error instanceof Error ? error.message : "对话证据重新对比失败");
     } finally {
       setDemoConversationScoreBusy(false);
     }
@@ -10211,7 +10211,7 @@ export default function Home() {
 
   async function runEvaluation() {
     if (!hasRealModel) {
-      setToast("真实 Demo 需要先连接模型；不会用静态分数冒充试跑结果");
+      setToast("真实 Demo 需要先连接模型；不会用文件检查冒充实际提升");
       setSettingsOpen(true);
       return;
     }
@@ -10917,13 +10917,13 @@ export default function Home() {
           <div className="skill-demo-title"><span>第 {Math.max(1, demoRunCount)} 次试跑</span><h3>{skillDemo.title}</h3><p>{skillDemo.scenario}</p></div>
           <div className="skill-demo-aside">
             {pendingReview
-              ? <div className="demo-score pending"><small>已保存</small><strong>✓</strong><span>等待评估</span></div>
+              ? <div className="demo-score pending"><small>与通用 AI 对比</small><strong>等待分析</strong><span>先完成本轮试跑</span></div>
               : observedEvals.length
-                ? <div className="demo-score"><small>{demoConversationScoredTurns > 0 ? `当前单场景 · ${demoConversationScoredTurns} 轮对话` : `当前单场景 · ${observedEvals.length} 项证据`}</small><strong>{averageEvalScore}</strong><span>/ 100</span><em>不与多场景总分直接比较</em></div>
-                : <div className="demo-score pending"><small>本轮证据</small><strong>0</strong><span>项可评分</span></div>}
+                ? <div className="demo-score"><small>{demoConversationScoredTurns > 0 ? `基于 ${demoConversationScoredTurns} 轮对话` : "与通用 AI 对比"}</small><strong>{strongEvals.length ? "已看到提升" : "尚未看到提升"}</strong><span>{strongEvals.length ? "查看具体方面" : "继续换场景验证"}</span></div>
+                : <div className="demo-score pending"><small>与通用 AI 对比</small><strong>等待分析</strong><span>暂无可判断证据</span></div>}
             {!pendingReview && <div className="demo-head-actions">
               <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="/icons/tabler/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
-              <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="/icons/tabler/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "评分中…" : conversationScoreIsFresh ? "本次评分已更新" : "更新本次评分"}</span></button>
+              <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="/icons/tabler/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "对比中…" : conversationScoreIsFresh ? "对比结论已更新" : "更新对比结论"}</span></button>
             </div>}
           </div>
         </div>
@@ -10951,7 +10951,7 @@ export default function Home() {
           </div>
         </details>
         <div className="demo-conversation">
-          <div className="demo-conversation-heading"><div><strong>{automaticTurns ? `已自动续跑 ${automaticTurns} 轮` : "继续对话"}</strong><small>{automaticTurns ? "系统模拟了必要的材料补充；你可以自己继续输入，也可以让 AI 再生成一条测试输入。" : "补充材料或修改意见；不想自己写时，可以让 AI 帮你继续测试。"}</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，评分生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
+          <div className="demo-conversation-heading"><div><strong>{automaticTurns ? `已自动续跑 ${automaticTurns} 轮` : "继续对话"}</strong><small>{automaticTurns ? "系统模拟了必要的材料补充；你可以自己继续输入，也可以让 AI 再生成一条测试输入。" : "补充材料或修改意见；不想自己写时，可以让 AI 帮你继续测试。"}</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，对比分析中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
           {demoConversation.length > 0 && (
             <div className="demo-message-list" aria-live="polite">
               {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? message.source === "mock" ? "模拟" : message.source === "inspiration" ? "AI 代写" : "你" : "AI"}</span><div className="demo-message-body">{message.role === "user" && message.source === "mock" && <small>自动补充的测试输入</small>}{message.role === "user" && message.source === "inspiration" && <small>AI 生成并自动发送的测试输入</small>}<p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
@@ -11665,14 +11665,11 @@ export default function Home() {
                   })}
                 </div>}
                 {generationLoop.status !== "idle" && !optimizationBlockedByBuild && <div className="generation-loop-metrics">
-                  <div><span>未使用 Skill 的得分</span><strong>{generationLoop.benchmarkRuns ? generationLoop.baselineScore : "—"}</strong></div>
-                  <div><span>当前 Skill 的得分</span><strong>{generationLoop.benchmarkRuns ? generationLoop.bestScore : "—"}</strong></div>
-                  <div className={generationLoop.lift > 0 ? "positive" : ""}><span>使用 Skill 后提升</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.lift >= 0 ? "+" : ""}${generationLoop.lift}` : "—"}</strong></div>
-                  <div><span>关键要求通过率</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.passRate}%` : "—"}</strong></div>
-                  <div><span>对照评分（普通 AI / Skill）</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.baselineQualityScore} / ${generationLoop.bestQualityScore}` : "—"}</strong></div>
-                  <div><span>盲测结果</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 更好" : generationLoop.blindWinner === "baseline" ? "普通 AI 更好" : generationLoop.blindWinner === "tie" ? "两者接近" : "—"}</strong></div>
+                  <div className={generationLoop.lift > 0 ? "positive" : ""}><span>相比通用 AI</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 更好" : generationLoop.blindWinner === "baseline" ? "通用 AI 更好" : generationLoop.blindWinner === "tie" ? "暂未看到明显差异" : "等待对比"}</strong></div>
+                  <div><span>整体提升</span><strong>{generationLoop.benchmarkRuns ? generationLoop.lift >= 8 ? "提升明显" : generationLoop.lift > 0 ? "有所提升" : generationLoop.lift === 0 ? "表现接近" : "出现退步" : "等待测试"}</strong></div>
+                  <div><span>关键要求</span><strong>{generationLoop.benchmarkRuns ? generationLoop.passRate >= 90 ? "大部分稳定做到" : generationLoop.passRate >= 70 ? "基本做到，仍有缺口" : "多项仍未做到" : "等待测试"}</strong></div>
                   <div><span>测试规模</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkCases} 个场景 × 每版 ${generationLoop.benchmarkRepeatsPerCase} 次` : "—"}</strong></div>
-                  <div><span>结果稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? `Skill 波动 ${generationLoop.bestStddev} · 普通 AI 波动 ${generationLoop.baselineStddev ?? "—"}` : "每个场景只测了 1 次"}</strong></div>
+                  <div><span>结果稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? generationLoop.bestStddev <= 5 ? "多次结果较稳定" : "不同轮次仍有波动" : "每个场景只测了 1 次"}</strong></div>
                 </div>}
                 {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{generationCopy.issueLabel}</summary><p>这些是测试记录，不一定代表不同问题；同一问题可能有多条证据。</p><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
               </section>
@@ -11744,7 +11741,7 @@ export default function Home() {
                     <h3>先让它完成一次代表性任务</h3>
                     <p>AI 会根据你的目标和资料设计一条真实输入，再严格按当前 Skill 生成完整结果。之后才会指出不足，不再用文件是否齐全代替效果。</p>
                     <button className="primary-button" onClick={runEvaluation} disabled={busy}>{busy ? "正在生成 Demo…" : "生成第一版 Demo"}<span>↗</span></button>
-                    <small>{hasRealModel ? `由 ${model} 试跑 · Key 通过服务端安全代理使用` : "需要先连接模型；不会用静态分数冒充真实试跑"}</small>
+                    <small>{hasRealModel ? `由 ${model} 试跑 · Key 通过服务端安全代理使用` : "需要先连接模型；不会用文件检查冒充实际提升"}</small>
                   </div>
                 )
               ) : (
@@ -11761,13 +11758,13 @@ export default function Home() {
                     <section className={`eval-report-panel ${evalDetailsOpen ? "expanded" : "collapsed"}`} aria-label="本轮效果报告">
                     <div className={`eval-report-summary ${needsWorkEvals.length ? "needs-work" : observedEvals.length ? "ready" : "partial"}`}>
                       <div className="eval-report-verdict">
-                        <span>本轮结论</span>
+                        <span>相比通用 AI</span>
                         <strong>{evaluationHeadline}</strong>
                         <p>{evaluationSummary}</p>
                       </div>
                       <div className="eval-report-counts" aria-label="本轮证据状态">
-                        <div><strong>{strongEvals.length}</strong><span>表现符合要求</span></div>
-                        <div><strong>{needsWorkEvals.length}</strong><span>还能再提升</span></div>
+                        <div><strong>{strongEvals.length}</strong><span>方面已看到提升</span></div>
+                        <div><strong>{needsWorkEvals.length}</strong><span>方面仍需加强</span></div>
                       </div>
                       <button type="button" className="eval-report-toggle" onClick={() => setEvalDetailsOpen((current) => !current)} aria-expanded={evalDetailsOpen} aria-controls="eval-report-details" disabled={!observedEvals.length}>
                         {evalDetailsOpen ? "收起" : "展开"}<img src="/icons/tabler/chevron-down.svg" alt="" aria-hidden="true" />
@@ -11779,28 +11776,27 @@ export default function Home() {
                       // Hide unobserved rows without shifting optimization indices.
                       if (result.coverage === "not-covered") return null;
                       const history = optimizationHistory[result.label];
-                      const delta = history ? result.score - history.before.score : 0;
                       const analyzingThis = optimizationOpen && optimizationTargetIndex === index && optimizationActive;
                       const statusLabel = result.score >= DEMO_SCORING_POLICY.observedGoodFloor
-                          ? "这次表现符合要求"
+                          ? "已看到明确提升"
                           : result.score >= DEMO_SCORING_POLICY.observedWarningFloor
-                            ? "有一个明显差距"
-                            : "优先提升";
+                            ? "提升还不够稳定"
+                            : "尚未看到提升";
                       return (
                         <article className={`eval-row ${history ? "optimized" : ""} ${result.tone}`} key={result.label}>
                           <div className="eval-row-head">
-                            <span className="eval-title-line"><strong>{result.label}</strong>{history && <em>复评 {delta >= 0 ? "+" : ""}{delta}</em>}</span>
+                            <span className="eval-title-line"><strong>{result.label}</strong>{history && <em>已重新对比</em>}</span>
                             <span className={`eval-status ${result.tone}`}>{statusLabel}</span>
                           </div>
                           <div className={`eval-row-body ${result.score < DEMO_SCORING_POLICY.observedGoodFloor ? "has-gap" : "good"}`}>
-                            <div className="eval-observation"><span>本轮看到的表现</span><p>{result.strength || result.detail}</p></div>
+                            <div className="eval-observation"><span>比通用 AI 提升在哪里</span><p>{result.strength || result.detail}</p></div>
                             {result.score < DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-next-gap"><span>还能再提升的地方</span><p>{result.issue || "本轮暂未发现明确差距。"}</p></div>}
-                            {result.score >= DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-good-note"><span>结论</span><p>{result.detail}</p></div>}
+                            {result.score >= DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-good-note"><span>为什么算提升</span><p>{result.detail}</p></div>}
                           </div>
                           <div className="eval-row-actions">
                             <details className="eval-evidence-details">
                               <summary>查看判断依据 <span>⌄</span></summary>
-                              <div><p><strong>观察依据</strong>{result.evidence || "请结合上面的 Demo 判断。"}</p><p><strong>对实际使用的影响</strong>{result.impact || "这会影响结果是否真正可用。"}</p><p><strong>内部观察分</strong>{history && <del>{history.before.score}</del>} {result.score}/100</p></div>
+                              <div><p><strong>观察依据</strong>{result.evidence || "请结合上面的 Demo 判断。"}</p><p><strong>对实际使用的影响</strong>{result.impact || "这会影响结果是否真正可用。"}</p><p><strong>判断范围</strong>只基于当前试跑中实际出现的行为，不把未测试场景当作已经提升。</p></div>
                             </details>
                             {(result.score < DEMO_SCORING_POLICY.observedGoodFloor || history) && <button className="eval-optimize-button" onClick={() => void openOptimization(index)} disabled={optimizationActive || busy}>{analyzingThis ? "正在分析…" : history ? "继续优化" : "优化这一项"}<span>→</span></button>}
                           </div>
@@ -12016,7 +12012,7 @@ export default function Home() {
             <div className="optimization-baseline">
               <span className={`eval-dot ${optimizationTarget.tone}`} />
               <div><strong>当前评估</strong><p>{optimizationTarget.detail}</p></div>
-              <b>{optimizationTarget.score}</b>
+              <b>{optimizationTarget.score >= DEMO_SCORING_POLICY.observedGoodFloor ? "已见提升" : optimizationTarget.score >= DEMO_SCORING_POLICY.observedWarningFloor ? "仍需加强" : "尚未提升"}</b>
             </div>
 
             {optimizationStatus === "analyzing" && (
@@ -12087,10 +12083,10 @@ export default function Home() {
                   <div><strong>{optimizationTargetHistory.accepted ? "候选版本已通过，成为当前最佳版本" : "候选版本未通过，已自动回滚"}</strong><small>使用 {optimizationTargetHistory.testedCases} 项独立任务验证 · 目标维度必须严格提升且其他关键能力不能明显退步</small></div>
                 </div>
                 <div className="optimization-score-change">
-                  <div><span>原版验证分</span><strong>{optimizationTargetHistory.before.score}</strong></div>
+                  <div><span>原版表现</span><strong>{optimizationTargetHistory.before.score >= DEMO_SCORING_POLICY.observedGoodFloor ? "已见提升" : optimizationTargetHistory.before.score >= DEMO_SCORING_POLICY.observedWarningFloor ? "仍需加强" : "尚未提升"}</strong></div>
                   <i>→</i>
-                  <div className="after"><span>候选验证分</span><strong>{optimizationTargetHistory.after.score}</strong></div>
-                  <b>{optimizationTargetHistory.after.score - optimizationTargetHistory.before.score >= 0 ? "+" : ""}{optimizationTargetHistory.after.score - optimizationTargetHistory.before.score} pts</b>
+                  <div className="after"><span>候选表现</span><strong>{optimizationTargetHistory.after.score >= DEMO_SCORING_POLICY.observedGoodFloor ? "已见提升" : optimizationTargetHistory.after.score >= DEMO_SCORING_POLICY.observedWarningFloor ? "仍需加强" : "尚未提升"}</strong></div>
+                  <b>{optimizationTargetHistory.accepted ? "提升已通过" : "没有证明更好"}</b>
                 </div>
                 <div className="optimization-result-copy"><strong>{optimizationTargetHistory.accepted ? "这次具体改变了什么" : "为什么没有采用"}</strong><p>{optimizationTargetHistory.summary}</p></div>
                 <div className="optimization-applied"><span>{optimizationTargetHistory.accepted ? "已采用" : "候选修改"}</span>{optimizationTargetHistory.appliedTitles.map((title) => <b key={title}>{optimizationTargetHistory.accepted ? "✓" : "○"} {title}</b>)}</div>

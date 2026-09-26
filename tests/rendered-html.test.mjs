@@ -25,7 +25,9 @@ test("evaluation UI hides unobserved rows and counts without changing optimizati
   assert.match(report, /evals\.map\(\(result, index\) => \{\s*\/\/[^\n]*\n\s*if \(result\.coverage === "not-covered"\) return null;/);
   assert.match(report, /openOptimization\(index\)/);
   assert.doesNotMatch(report, /pendingEvals|还没测到|还没有测到|为什么还不能判断|换场景验证/);
-  assert.match(page, /: observedEvals\.length\s*\? "这次表现符合要求"\s*: "本轮结果待评估"/);
+  assert.match(page, /相比通用 AI，\$\{demonstratedImprovementLabels\.join\("、"\)\}更可靠/);
+  assert.match(report, /比通用 AI 提升在哪里/);
+  assert.doesNotMatch(report, /内部观察分|\/100|验证分/);
   assert.match(css, /\.eval-report-counts\s*\{[^}]*repeat\(2, minmax\(72px, 1fr\)\)/);
 });
 
@@ -205,8 +207,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /bestQualityScore:\s*comparison\.skillScore/);
   assert.doesNotMatch(page, /baselineQualityScore:\s*blindResult\.revealedScores/);
   assert.doesNotMatch(page, /user-proof-card|场景正式对照总分|重新跑多场景对照|查看每个冻结场景的真实得分与扣分原因|旧版本分数已隐藏/);
-  assert.match(page, /当前单场景 ·/);
-  assert.match(page, /不与多场景总分直接比较/);
+  assert.match(page, /与通用 AI 对比/);
+  assert.match(page, /已看到提升/);
+  assert.doesNotMatch(page, /不与多场景总分直接比较/);
   assert.match(page, /本次提案=\$\{attempted\}/);
   assert.match(page, /optimizationStableAtCeiling/);
   assert.match(page, /generationCopy\.badge/);
@@ -368,7 +371,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /让 AI 帮我继续/);
   assert.match(page, /function handleDemoChatFiles\(/);
   assert.match(page, /function reevaluateDemoConversation\(/);
-  assert.match(page, /更新评分/);
+  assert.match(page, /更新对比结论/);
   assert.doesNotMatch(page, /次试跑完成/);
   assert.match(page, /restoreFrozenBundleExactly/);
   assert.match(page, /current-format snapshots byte-for-byte/);
@@ -376,7 +379,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /async function rerunMultiSceneComparison\(\)/);
   assert.match(page, /demoConversationScoredReplyId/);
   assert.match(page, /hasNewConversationEvidence/);
-  assert.match(page, /先继续对话一轮，AI 回复后即可更新评分/);
+  assert.match(page, /先继续对话一轮，AI 回复后即可更新对比结论/);
   assert.doesNotMatch(page, /completedConversationTurns < 2/);
   assert.match(page, /accept="\.pdf,\.md,\.txt,\.json,\.csv,\.html,\.js,\.ts,\.tsx,\.py"/);
   assert.doesNotMatch(page, /继续试用这个 Skill/);
