@@ -15,6 +15,7 @@ import { annotateInterviewEvidence, USER_EVIDENCE_PROMPT } from "../../user-evid
 import { WORKFLOW_REPAIR_PROMPT } from "../../workflow-plan-repair";
 import { BLUEPRINT_LEGACY_PROMPT, assertBlueprintStage, blueprintStagePrompt, blueprintRepairPrompt } from "../../blueprint-planner";
 import { BlueprintStageError, normalizeBlueprintStage, applyBlueprintFieldRepairs, type BlueprintRepair } from "../../blueprint-contract";
+import { generationTemperature } from "../../generation-temperature";
 
 type AIMode = "ping" | "models" | "source-analysis" | "capability-delta" | "knowledge-plan" | "knowledge-compile" | "knowledge-verify" | "preview" | "interview" | "blueprint" | "blueprint-foundation" | "blueprint-plan" | "blueprint-capabilities" | "blueprint-workflow" | "workflow-repair" | "build" | "repair" | "eval-execute" | "eval-grade" | "eval-compare" | "optimization-diagnose" | "optimization-patch-plan" | "optimization-research" | "demo" | "demo-chat" | "demo-inspiration" | "evaluate" | "personalize" | "optimization-evidence" | "optimization-plan" | "optimize" | "evaluate-dimension";
 type Provider = "deepseek" | "openai" | "compatible";
@@ -1182,7 +1183,7 @@ export async function POST(request: Request) {
                 : `${user}\n\nThe previous attempt did not finish correctly. Return one complete valid JSON object now. Escape every backslash inside string values and do not use Markdown fences.${body.mode === "blueprint-foundation" || body.mode === "blueprint-plan" ? " Retry transport removed repeated wording but retained every confirmed decision and balanced evidence from every source section. Do not omit a requirement merely because its wording is shorter." : ""}${body.mode === "repair" ? " For a P1 repair, canonicalMutations must be a non-empty array. Use identity.update with changes for trigger-description scope, or exact fields such as inputId plus changes, outputId plus changes, requirementId plus changes, or capabilityId plus changes; do not return prose-only advice or edits to compiler-owned projections." : ""}${body.mode === "optimize" ? " Keep the response compact: return only small CanonicalMutation objects and scripts/assets implementation bytes." : ""}${body.mode === "build" ? " Keep the JSON concise but complete. Follow the original output scope; do not regenerate compiler-owned files or omit approved implementation resources." : ""}`,
             },
           ],
-          temperature: attempt === 2 || body.mode === "evaluate" ? 0.15 : 0.35,
+          temperature: generationTemperature(body.mode, attempt),
           max_tokens: attemptOutputTokenBudget(body.mode, attempt, retryReason),
           response_format: { type: "json_object" },
         };
