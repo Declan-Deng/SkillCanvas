@@ -1307,7 +1307,7 @@ export async function POST(request: Request) {
         if (choice?.finish_reason === "length") {
           writeAiDiagnostic("warn", { event: "ai_output_truncated", requestId, mode: body.mode, attempt, elapsedMs: Date.now() - startedAt, outputChars: content.length, promptTokens: data.usage?.prompt_tokens, completionTokens: data.usage?.completion_tokens, reason: `finish=length; outputBudget=${requestBody.max_tokens}; ${splitBlueprint && attempt === 1 ? "retry with bounded larger output ceiling" : "no further retry"}` }, tenant.tenantId);
           if (splitBlueprint && attempt === 1) { retryReason = "output-limit-recovery"; continue; }
-          const label = ({ "blueprint-foundation": "需求整理", "blueprint-capabilities": "能力与交付规划", "blueprint-workflow": "工作流与循环规划", "blueprint-plan": "蓝图规划", "preview": "预演理解", "workflow-repair": "工作流连线修复", build: "Skill 生成", repair: "生成修复" } as Record<string, string>)[body.mode] || "当前步骤";
+          const label = ({ "blueprint-foundation": "需求整理", "blueprint-capabilities": "能力与交付规划", "blueprint-workflow": "工作流与循环规划", "blueprint-plan": "蓝图规划", "preview": "需求细化", "workflow-repair": "工作流连线修复", build: "Skill 生成", repair: "生成修复" } as Record<string, string>)[body.mode] || "当前步骤";
           return Response.json({ error: `${label}达到模型输出上限，被截断（finish=length）；不是回答格式错误。已保留此前完成的阶段，请重试当前步骤；若重复出现，请换用支持更长输出的模型`, code: "AI_OUTPUT_TRUNCATED", mode: body.mode, requestId,
             usage: splitBlueprint ? blueprintUsage : { promptTokens: data.usage?.prompt_tokens ?? Math.ceil((system.length + user.length) / 3.4), completionTokens: data.usage?.completion_tokens ?? Math.ceil(content.length / 3.4), estimated: data.usage?.prompt_tokens == null || data.usage?.completion_tokens == null },
           }, { status: 502 });

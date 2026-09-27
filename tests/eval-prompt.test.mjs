@@ -133,7 +133,7 @@ test("Demo normalization keeps complete executable input, including the text aft
 test("legacy Eval banks are migrated before P0/P1 repair and cannot hide behind a restored frozen version", () => {
   assert.equal(EVAL_COMPILER_VERSION, "2.14");
   assert.match(source, /evalNeedsRebuild = parsed\.version !== EVAL_COMPILER_VERSION/);
-  assert.match(source, /restoreFrozenBundleExactly = savedEvalVersion === EVAL_COMPILER_VERSION/);
+  assert.match(source, /restoreFrozenBundleExactly = saved\.sessionSchemaVersion === SESSION_SCHEMA_VERSION[\s\S]*saved\.pipelineContractVersion === PIPELINE_CONTRACT_VERSION[\s\S]*savedEvalVersion === EVAL_COMPILER_VERSION/);
   const loop = source.slice(source.indexOf("async function runOptimizationLoop("));
   assert.ok(loop.indexOf("evalVersion !== EVAL_COMPILER_VERSION") < loop.indexOf("await runP0StaticRepairLoop("));
   assert.ok(loop.indexOf("evalVersion !== EVAL_COMPILER_VERSION") < loop.indexOf("await runP1ContractRepairLoop("));

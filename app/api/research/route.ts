@@ -1,5 +1,5 @@
-import { dedupeResearchSources, htmlToEvidenceText, parseFirecrawlResults, parseSearxngResults, safeResearchUrl } from "../../research-core";
-import type { ResearchProviderId, RetrievedKnowledgeSource } from "../../knowledge-research";
+import { dedupeResearchSources, htmlToEvidenceText, parseDeepseekWebSearchResults, parseFirecrawlResults, parseSearxngResults, safeResearchUrl } from "../../research-core";
+import { classifyKnowledgeSourceAuthority, type ResearchProviderId, type RetrievedKnowledgeSource } from "../../knowledge-research";
 import { readServerCredentialState, tenantContext } from "../../server-data";
 import { checkRequestRate } from "../../request-guard";
 
@@ -8,6 +8,10 @@ type RequestBody = {
   provider?: ResearchProviderId;
   apiKey?: string;
   baseUrl?: string;
+  modelApiKey?: string;
+  modelProvider?: string;
+  model?: string;
+  preferredDomains?: unknown;
   queries?: unknown;
 };
 
@@ -113,6 +117,82 @@ async function searchSearxng(baseUrl: string, queries: string[]) {
   return dedupeResearchSources(await Promise.all(discovered.map(fetchEvidencePage)));
 }
 
+function normalizePreferredDomains(value: unknown) {
+  if (!Array.isArray(value)) return [];
+  return Array.from(new Set(value.flatMap((item) => {
+    if (typeof item !== "string") return [];
+    const raw = item.trim().toLowerCase().replace(/^https?:\/\//, "").replace(/\/.*$/, "").replace(/^www\./, "");
+    return /^[a-z0-9.-]+\.[a-z]{2,}$/i.test(raw) ? [raw] : [];
+  }))).slice(0, 10);
+}
+
+function domainMatches(url: string, domains: string[]) {
+  if (!domains.length) return false;
+  try {
+    const hostname = new URL(url).hostname.toLowerCase().replace(/^www\./, "");
+    return domains.some((domain) => hostname === domain || hostname.endsWith(`.${domain}`));
+  } catch {
+    return false;
+  }
+}
+
+async function searchDeepseek(apiKey: string, model: string, queries: string[], preferredDomains: string[]) {
+  if (apiKey.trim().length < 9) throw new Error("DeepSeek API Key 未配置");
+  if (!model.trim()) throw new Error("DeepSeek 模型未配置");
+  const retrievedAt = new Date().toISOString();
+  const settled = await Promise.allSettled(queries.map(async (query) => {
+    const domainInstruction = preferredDomains.length
+      ? ` Prefer primary sources from these domains when relevant: ${preferredDomains.join(", ")}.`
+      : " Prefer official and primary sources.";
+    const response = await fetchWithTimeout("https://api.deepseek.com/anthropic/v1/messages", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": apiKey.trim(),
+        "anthropic-version": "2023-06-01",
+      },
+      body: JSON.stringify({
+        model: model.trim().slice(0, 120),
+        max_tokens: 1_200,
+        messages: [{
+          role: "user",
+          content: `You must use web_search to find current, attributable evidence for this research question: ${query}.${domainInstruction} Do not answer from memory.`,
+        }],
+        tools: [{
+          type: "web_search_20250305",
+          name: "web_search",
+          max_uses: 1,
+          ...(preferredDomains.length ? { allowed_domains: preferredDomains } : {}),
+        }],
+      }),
+    }, 32_000);
+    const raw = await response.text();
+    if (!response.ok) throw new Error(`DeepSeek 检索失败（${response.status}）`);
+    const discovered = parseDeepseekWebSearchResults(JSON.parse(raw), query).slice(0, 6);
+    const seeds: RetrievedKnowledgeSource[] = discovered.map((item, index) => {
+      const authority = classifyKnowledgeSourceAuthority(item.url, item.title);
+      return {
+        id: `deepseek-${index + 1}`,
+        query: item.query,
+        title: item.title,
+        url: item.url,
+        // Discovery text is intentionally unusable as compiled evidence. The
+        // source survives only if fetchEvidencePage replaces it with page text.
+        excerpt: `DeepSeek web-search discovery: ${item.title}`,
+        publishedAt: item.publishedAt,
+        retrievedAt,
+        authorityTier: authority.tier,
+        authorityReason: authority.reason,
+      };
+    });
+    const fetched = await Promise.all(seeds.map(fetchEvidencePage));
+    return fetched.filter((item) => !item.excerpt.startsWith("DeepSeek web-search discovery:") && item.excerpt.length >= 120);
+  }));
+  const sources = collectSearchBatches(settled, "DeepSeek 联网搜索");
+  const preferredUrls = sources.filter((item) => domainMatches(item.url, preferredDomains)).map((item) => item.url);
+  return dedupeResearchSources(sources, 12, preferredUrls);
+}
+
 export async function POST(request: Request) {
   try {
     const tenant = tenantContext(request);
@@ -121,16 +201,37 @@ export async function POST(request: Request) {
     const body = await request.json() as RequestBody;
     const credentialState = await readServerCredentialState(tenant.tenantId);
     const stored = credentialState.config;
-    const provider = credentialState.researchManaged ? stored?.researchProvider || "disabled" : body.provider || stored?.researchProvider || "disabled";
-    if (!(["firecrawl", "searxng"] as ResearchProviderId[]).includes(provider)) return Response.json({ error: "尚未配置可用的专业知识联网服务" }, { status: 400 });
-    const queries = body.action === "test" ? ["Firecrawl search documentation"] : Array.isArray(body.queries)
+    const requestedProvider = body.provider;
+    const provider: ResearchProviderId = credentialState.researchManaged
+      ? requestedProvider === "deepseek" && stored?.provider === "deepseek"
+        ? "deepseek"
+        : requestedProvider === stored?.researchProvider
+          ? requestedProvider
+          : stored?.researchProvider || "disabled"
+      : requestedProvider || stored?.researchProvider || "disabled";
+    if (!(["firecrawl", "searxng", "deepseek"] as ResearchProviderId[]).includes(provider)) return Response.json({ error: "尚未配置可用的专业知识联网服务" }, { status: 400 });
+    const queries = body.action === "test" ? [provider === "deepseek" ? "DeepSeek API official documentation" : "Firecrawl search documentation"] : Array.isArray(body.queries)
       ? Array.from(new Set(body.queries.filter((item): item is string => typeof item === "string").map((item) => item.replace(/\s+/g, " ").trim().slice(0, 180)).filter(Boolean))).slice(0, 4)
       : [];
     if (!queries.length) return Response.json({ error: "没有可执行的专业知识检索问题" }, { status: 400 });
-    const baseUrl = researchBase(provider, credentialState.researchManaged ? stored?.researchBaseUrl || "" : typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl : stored?.researchBaseUrl || "");
-    const sources = provider === "firecrawl"
-      ? await searchFirecrawl(baseUrl, credentialState.researchManaged ? stored?.researchApiKey || "" : typeof body.apiKey === "string" && body.apiKey.trim() ? body.apiKey : stored?.researchApiKey || "", queries, body.action === "test" ? 1 : 5)
-      : await searchSearxng(baseUrl, queries);
+    const preferredDomains = normalizePreferredDomains(body.preferredDomains);
+    let sources: RetrievedKnowledgeSource[];
+    if (provider === "deepseek") {
+      const modelProvider = credentialState.managed ? stored?.provider : body.modelProvider || stored?.provider;
+      if (modelProvider !== "deepseek") return Response.json({ error: "DeepSeek 联网搜索需要使用已配置的 DeepSeek 模型服务" }, { status: 400 });
+      const modelApiKey = credentialState.managed
+        ? stored?.apiKey || ""
+        : typeof body.modelApiKey === "string" && body.modelApiKey.trim()
+          ? body.modelApiKey
+          : stored?.apiKey || "";
+      const model = credentialState.managed ? stored?.model || "" : typeof body.model === "string" && body.model.trim() ? body.model : stored?.model || "";
+      sources = await searchDeepseek(modelApiKey, model, queries, preferredDomains);
+    } else {
+      const baseUrl = researchBase(provider, credentialState.researchManaged ? stored?.researchBaseUrl || "" : typeof body.baseUrl === "string" && body.baseUrl.trim() ? body.baseUrl : stored?.researchBaseUrl || "");
+      sources = provider === "firecrawl"
+        ? await searchFirecrawl(baseUrl, credentialState.researchManaged ? stored?.researchApiKey || "" : typeof body.apiKey === "string" && body.apiKey.trim() ? body.apiKey : stored?.researchApiKey || "", queries, body.action === "test" ? 1 : 5)
+        : await searchSearxng(baseUrl, queries);
+    }
     if (!sources.length) return Response.json({ error: "联网服务没有返回可用于编译专业知识的正文证据" }, { status: 502 });
     return Response.json(body.action === "test" ? { ok: true, sourceCount: sources.length } : { sources });
   } catch (error) {

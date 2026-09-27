@@ -9,7 +9,7 @@ import { generationClientBudget } from "./generation-request";
 import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract, contractRepairFailureReason } from "./skill-projection-repair";
 import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases, recommendedHostCapabilityIds } from "./capability-routing";
 import { pickRecommendedInterviewOption } from "./interview-discovery";
-import { compileKnowledgeBatches, knowledgeClientTimeout, retainKnowledgeFailure } from "./knowledge-compiler";
+import { compileKnowledgeBatches, knowledgeClientTimeout, retainKnowledgeFailure, verifyKnowledgeClaimsInBatches } from "./knowledge-compiler";
 import { selectKnowledgeQueries } from "./knowledge-passages";
 import { runBlueprintPlanning, type BlueprintCheckpoint } from "./blueprint-planner";
 import { HOST_FILE_WORKSPACE_CAPABILITY } from "./host-file-capability";
@@ -124,7 +124,8 @@ import {
 } from "./skill-pipeline-core";
 import { classifyBundleIssue, validateBundleContentCoherence, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
 import { demoReplyNeedsUserTurn, normalizePlannedDemoTurns, type PlannedDemoUserTurn } from "./demo-episode";
-import { isCompilerOwnedEvalCoverageIssue, issuesAreCompilerOwnedEvalCoverage } from "./eval-repair-routing";
+import { isCompilerOwnedEvalCoverageIssue } from "./eval-repair-routing";
+import { compilerOwnedContractIssues } from "./contract-repair-routing";
 import {
   applySkillIRMutations,
   feedbackRequirementMutations,
@@ -171,6 +172,7 @@ import {
 } from "./skill-ir";
 import {
   EMPTY_KNOWLEDGE_PACK,
+  alignKnowledgePlanToCapabilityDelta,
   applyKnowledgePackToFiles,
   buildKnowledgeEvidencePayload,
   buildFollowupResearchQueries,
@@ -196,6 +198,13 @@ import {
 } from "./knowledge-research";
 import { dedupeResearchSources } from "./research-core";
 import { EMPTY_CAPABILITY_DELTA, externalCapabilityDeltaGaps, mergeCapabilityDeltas, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta";
+import {
+  PIPELINE_CONTRACT_VERSION,
+  createNotRequiredKnowledgePack,
+  knowledgeAssessmentFromPack,
+  prepareKnowledgeRuntime,
+  reconcileKnowledgePackWithCapabilityDelta,
+} from "./knowledge-runtime";
 import { bindWorkflowCapabilities, normalizeWorkflowDagSteps, type WorkflowDagStep } from "./workflow-dag";
 import { verifyBundleScriptTests, verifyExecutionsInLocalSandbox } from "./eval-workflow-service";
 import { DurableWorkflowJournal } from "./workflow-client";
@@ -302,6 +311,7 @@ const EMPTY_AI_TOKEN_USAGE: AiTokenUsage = {
 };
 
 const SESSION_STORAGE_KEY = "skillcanvas.current-tab.v1";
+const SESSION_SCHEMA_VERSION = 2;
 const NO_SKILL_HARNESS_CACHE_KEY = `skillcanvas.no-skill-harness.v${EVAL_COMPILER_VERSION}`;
 // One-time migration key from the early prototype. Secrets are removed from
 // browser storage immediately and persisted through /api/credentials instead.
@@ -808,6 +818,7 @@ function ProviderLogo({ id }: { id: ProviderId }) {
 const RESEARCH_PROVIDERS: Record<ResearchProviderId, { name: string; mark: string; detail: string; baseUrl: string }> = {
   disabled: { name: "暂不联网", mark: "—", detail: "仍会识别知识缺口，但不会把模型常识伪装成来源知识", baseUrl: "" },
   firecrawl: { name: "Firecrawl", mark: "FC", detail: "搜索并提取网页正文，适合直接形成可引用知识", baseUrl: "https://api.firecrawl.dev" },
+  deepseek: { name: "DeepSeek 联网搜索", mark: "DS", detail: "复用 DeepSeek Key 搜索，再由 SkillCanvas 读取原文并核验来源", baseUrl: "" },
   searxng: { name: "SearXNG", mark: "SX", detail: "连接你自部署的开源搜索服务，再读取公开结果正文", baseUrl: "" },
 };
 
@@ -4754,6 +4765,15 @@ function stripCompiledKnowledgeSummary(summary: string) {
     .trim();
 }
 
+function comparisonTaskTitle(value: string, fallback: string) {
+  const normalized = value
+    .replace(/\s*本用例重点验证：[\s\S]*$/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const title = normalized || fallback;
+  return title.length > 76 ? `${title.slice(0, 76).trim()}…` : title;
+}
+
 function normalizedCompiledKnowledgeSummary(summary: string, domain?: string) {
   const baseSummary = stripCompiledKnowledgeSummary(summary);
   if (domain === undefined) return baseSummary;
@@ -5180,6 +5200,7 @@ export default function Home() {
   const busyCloseTimer = useRef<number | null>(null);
   const autoOptimizationResumeKey = useRef("");
   const optimizationRunInFlight = useRef(false);
+  const evaluationLaunchPendingRef = useRef(false);
   const [busyPhaseIndex, setBusyPhaseIndex] = useState(0);
   const [busyElapsed, setBusyElapsed] = useState(0);
   const [busyExecutionKind, setBusyExecutionKind] = useState<BusyExecutionKind>("local");
@@ -5214,6 +5235,7 @@ export default function Home() {
   const [researchApiKey, setResearchApiKey] = useState("");
   const [researchCredentialStored, setResearchCredentialStored] = useState(false);
   const [researchCredentialManaged, setResearchCredentialManaged] = useState(false);
+  const [configuredResearchProvider, setConfiguredResearchProvider] = useState<ResearchProviderId>("disabled");
   const [researchBaseUrl, setResearchBaseUrl] = useState("");
   const [researchProbe, setResearchProbe] = useState<{ status: "idle" | "testing" | "ok" | "error"; message: string }>({ status: "idle", message: "检索连接与模型连接需要分别测试" });
   const researchProbeController = useRef<AbortController | null>(null);
@@ -5282,7 +5304,7 @@ export default function Home() {
         if (typeof legacy.model === "string") setModel(legacy.model);
         if (typeof legacy.baseUrl === "string") setBaseUrl(legacy.baseUrl);
         if (typeof legacy.apiKey === "string") setApiKey(legacy.apiKey);
-        if (["disabled", "firecrawl", "searxng"].includes(String(legacy.researchProvider))) setResearchProvider(legacy.researchProvider as ResearchProviderId);
+        if (["disabled", "firecrawl", "searxng", "deepseek"].includes(String(legacy.researchProvider))) setResearchProvider(legacy.researchProvider as ResearchProviderId);
         if (typeof legacy.researchApiKey === "string") setResearchApiKey(legacy.researchApiKey);
         if (typeof legacy.researchBaseUrl === "string") setResearchBaseUrl(legacy.researchBaseUrl);
         try {
@@ -5295,8 +5317,10 @@ export default function Home() {
             setCredentialStored(typeof legacy.apiKey === "string" && legacy.apiKey.trim().length > 8);
             setResearchCredentialStored(
               legacy.researchProvider === "searxng"
+              || legacy.researchProvider === "deepseek"
               || (typeof legacy.researchApiKey === "string" && legacy.researchApiKey.trim().length > 7),
             );
+            if (["disabled", "firecrawl", "searxng", "deepseek"].includes(String(legacy.researchProvider))) setConfiguredResearchProvider(legacy.researchProvider as ResearchProviderId);
             setApiKey("");
             setResearchApiKey("");
           }
@@ -5320,13 +5344,14 @@ export default function Home() {
           if (["deepseek", "openai", "compatible"].includes(String(result.config.provider))) setProvider(result.config.provider as ProviderId);
           if (typeof result.config.model === "string") setModel(result.config.model);
           if (typeof result.config.baseUrl === "string") setBaseUrl(result.config.baseUrl);
-          if (["disabled", "firecrawl", "searxng"].includes(String(result.config.researchProvider))) setResearchProvider(result.config.researchProvider as ResearchProviderId);
+          if (["disabled", "firecrawl", "searxng", "deepseek"].includes(String(result.config.researchProvider))) setResearchProvider(result.config.researchProvider as ResearchProviderId);
           if (typeof result.config.researchBaseUrl === "string") setResearchBaseUrl(result.config.researchBaseUrl);
         }
         setCredentialStored(Boolean(result.configured));
         setResearchCredentialStored(Boolean(result.researchConfigured));
         setCredentialManaged(Boolean(result.managed));
         setResearchCredentialManaged(Boolean(result.researchManaged));
+        if (result.config?.researchProvider) setConfiguredResearchProvider(result.config.researchProvider);
         if (result.configured) setApiKey("");
         if (result.researchConfigured) setResearchApiKey("");
       } catch {
@@ -5343,11 +5368,20 @@ export default function Home() {
         const savedLoopSnapshot = saved.generationLoop && typeof saved.generationLoop === "object"
           ? saved.generationLoop as Partial<GenerationLoopState>
           : {};
+        const savedCanonicalIRSnapshot = parseCanonicalSkillIR(savedFilesSnapshot);
+        const restoreSavedKnowledgePack = (value: unknown, restoredAnswers: Record<string, string>) => {
+          const restored = reconcileKnowledgePackContentPermission(restoreKnowledgePack(value), restoredAnswers);
+          return savedCanonicalIRSnapshot
+            ? reconcileKnowledgePackWithCapabilityDelta(restored, savedCanonicalIRSnapshot.capabilityDelta)
+            : restored;
+        };
         let savedEvalVersion = "";
         try {
           savedEvalVersion = String((JSON.parse(savedFilesSnapshot["evals/evals.json"] || "{}") as { version?: unknown }).version || "");
         } catch { /* Invalid or legacy Eval bundles are migrated below. */ }
-        const restoreFrozenBundleExactly = savedEvalVersion === EVAL_COMPILER_VERSION
+        const restoreFrozenBundleExactly = saved.sessionSchemaVersion === SESSION_SCHEMA_VERSION
+          && saved.pipelineContractVersion === PIPELINE_CONTRACT_VERSION
+          && savedEvalVersion === EVAL_COMPILER_VERSION
           && savedLoopSnapshot.evaluationContractVersion === EVAL_COMPILER_VERSION
           && savedLoopSnapshot.status !== "running";
         const restoredStep = normalizeWorkflowStep(saved.step);
@@ -5405,13 +5439,17 @@ export default function Home() {
           const savedRounds = restoredInterviewRounds;
           const restoredAnswers = { ...createDemoAnswers(savedRounds, savedAnswers), __idea: typeof saved.idea === "string" ? saved.idea : "", __previewInput: restoredPreviewInput };
           const restoredPack = saved.knowledgePack && typeof saved.knowledgePack === "object"
-            ? reconcileKnowledgePackContentPermission(restoreKnowledgePack(saved.knowledgePack), restoredAnswers)
+            ? restoreSavedKnowledgePack(saved.knowledgePack, restoredAnswers)
             : EMPTY_KNOWLEDGE_PACK;
           const restoredPlan = attachCompiledKnowledgeCapability(normalizeCapabilityPlan(saved.capabilityPlan) || DEFAULT_CAPABILITY_PLAN, restoredPack);
           setCapabilityPlan(ensureTaskCapabilities(restoredPlan, typeof saved.idea === "string" ? saved.idea : "", restoredAnswers));
         }
         if (saved.loopPlan && typeof saved.loopPlan === "object") setLoopPlan(saved.loopPlan as LoopPlan);
-        if (saved.buildLoop && typeof saved.buildLoop === "object") setBuildLoop({ ...DEFAULT_BUILD_LOOP, ...saved.buildLoop as Partial<BuildLoopState> });
+        if (saved.buildLoop && typeof saved.buildLoop === "object") {
+          setBuildLoop(restoreFrozenBundleExactly
+            ? { ...DEFAULT_BUILD_LOOP, ...saved.buildLoop as Partial<BuildLoopState> }
+            : DEFAULT_BUILD_LOOP);
+        }
         if (saved.generationLoop && typeof saved.generationLoop === "object") {
           const savedLoop = savedLoopSnapshot;
           setGenerationLoop(restoreFrozenBundleExactly
@@ -5423,7 +5461,7 @@ export default function Home() {
         if (saved.knowledgePack && typeof saved.knowledgePack === "object") {
           const savedAnswers = saved.answers && typeof saved.answers === "object" ? saved.answers as Record<string, string> : {};
           const restoredAnswers = { ...createDemoAnswers(restoredInterviewRounds, savedAnswers), __idea: typeof saved.idea === "string" ? saved.idea : "", __previewInput: restoredPreviewInput };
-          setKnowledgePack(reconcileKnowledgePackContentPermission(restoreKnowledgePack(saved.knowledgePack), restoredAnswers));
+          setKnowledgePack(restoreSavedKnowledgePack(saved.knowledgePack, restoredAnswers));
         }
         if (saved.internalMcpEvidenceReports && typeof saved.internalMcpEvidenceReports === "object") {
           setInternalMcpEvidenceReports(saved.internalMcpEvidenceReports as InternalMcpEvidenceReports);
@@ -5433,7 +5471,7 @@ export default function Home() {
           const savedRounds = restoredInterviewRounds;
           const restoredAnswers = { ...createDemoAnswers(savedRounds, savedAnswers), __idea: typeof saved.idea === "string" ? saved.idea : "", __previewInput: restoredPreviewInput };
           const restoredPack = saved.knowledgePack && typeof saved.knowledgePack === "object"
-            ? reconcileKnowledgePackContentPermission(restoreKnowledgePack(saved.knowledgePack), restoredAnswers)
+            ? restoreSavedKnowledgePack(saved.knowledgePack, restoredAnswers)
             : EMPTY_KNOWLEDGE_PACK;
           const restoredPlan = attachCompiledKnowledgeCapability(normalizeCapabilityPlan(saved.capabilityPlan) || DEFAULT_CAPABILITY_PLAN, restoredPack);
           const restoredLoop = saved.loopPlan && typeof saved.loopPlan === "object" ? saved.loopPlan as LoopPlan : DEFAULT_LOOP_PLAN;
@@ -5450,7 +5488,7 @@ export default function Home() {
               Array.isArray(saved.sourceInsights) ? serializeSourceInsights(saved.sourceInsights as SourceInsight[]) : "",
               restoredPlan,
               restoredLoop,
-              parseCanonicalSkillIR(savedFilesSnapshot) || undefined,
+              savedCanonicalIRSnapshot || undefined,
             );
           setFiles(restoredFiles);
           if (["passed", "stable"].includes((saved.generationLoop as Partial<GenerationLoopState> | undefined)?.status || "")) {
@@ -5458,10 +5496,10 @@ export default function Home() {
           }
         }
         if (typeof saved.selectedFile === "string") setSelectedFile(saved.selectedFile);
-        if (Array.isArray(saved.evals)) setEvals(saved.evals as EvalResult[]);
-        if (typeof saved.evalRan === "boolean") setEvalRan(saved.evalRan);
-        if (saved.skillDemo && typeof saved.skillDemo === "object") setSkillDemo(normalizeSkillDemo(saved.skillDemo));
-        if (typeof saved.demoReviewPending === "boolean") setDemoReviewPending(saved.demoReviewPending);
+        if (Array.isArray(saved.evals)) setEvals(restoreFrozenBundleExactly ? saved.evals as EvalResult[] : []);
+        if (typeof saved.evalRan === "boolean") setEvalRan(restoreFrozenBundleExactly ? saved.evalRan : false);
+        if (saved.skillDemo && typeof saved.skillDemo === "object") setSkillDemo(restoreFrozenBundleExactly ? normalizeSkillDemo(saved.skillDemo) : null);
+        if (typeof saved.demoReviewPending === "boolean") setDemoReviewPending(restoreFrozenBundleExactly ? saved.demoReviewPending : false);
         if (typeof saved.demoExpanded === "boolean") setDemoExpanded(saved.demoExpanded);
         if (typeof saved.personalizationRound === "number") setPersonalizationRound(saved.personalizationRound);
         if (typeof saved.demoRunCount === "number") setDemoRunCount(saved.demoRunCount);
@@ -5530,12 +5568,17 @@ export default function Home() {
         if (typeof saved.model === "string") setModel(saved.model);
         if (Array.isArray(saved.availableModels)) setAvailableModels(saved.availableModels.filter((item): item is string => typeof item === "string"));
         if (typeof saved.baseUrl === "string") setBaseUrl(saved.baseUrl);
-        if (["disabled", "firecrawl", "searxng"].includes(String(saved.researchProvider))) setResearchProvider(saved.researchProvider as ResearchProviderId);
+        if (["disabled", "firecrawl", "searxng", "deepseek"].includes(String(saved.researchProvider))) setResearchProvider(saved.researchProvider as ResearchProviderId);
         if (typeof saved.researchBaseUrl === "string") setResearchBaseUrl(saved.researchBaseUrl);
         if (saved.sessionTokenUsage && typeof saved.sessionTokenUsage === "object") setSessionTokenUsage(normalizeAiTokenUsage(saved.sessionTokenUsage));
         if (Array.isArray(saved.platforms)) setPlatforms(saved.platforms.filter((item): item is string => typeof item === "string"));
         if (typeof saved.allowSensitiveExport === "boolean") setAllowSensitiveExport(saved.allowSensitiveExport);
-        if (Array.isArray(saved.completedSteps)) setCompletedSteps(new Set(saved.completedSteps.filter((item): item is StepId => ["brief", "interview", "blueprint", "build", "evaluate", "ship"].includes(String(item)))));
+        if (Array.isArray(saved.completedSteps)) {
+          const restoredCompletedSteps = saved.completedSteps.filter((item): item is StepId => ["brief", "interview", "blueprint", "build", "evaluate", "ship"].includes(String(item)));
+          setCompletedSteps(new Set(restoreFrozenBundleExactly
+            ? restoredCompletedSteps
+            : restoredCompletedSteps.filter((item) => item !== "evaluate" && item !== "ship")));
+        }
       }
     } catch {
       window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
@@ -5583,6 +5626,8 @@ export default function Home() {
     if (!sessionHydrated) return;
     try {
       window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+        sessionSchemaVersion: SESSION_SCHEMA_VERSION,
+        pipelineContractVersion: PIPELINE_CONTRACT_VERSION,
         step, idea, sourceNames, sourceWarnings, sourceInsights, sourceReceipt, contextNotes,
         interviewRounds, interviewRoundOrigins, interviewRoundIndex, highestRoundReached, intentInterpretation,
         discoveryPreview, previewFeedback, previewFeedbackCustom, interviewReadiness,
@@ -5645,26 +5690,47 @@ export default function Home() {
     ? researchApiKey.trim().length > 7 || researchCredentialStored
     : researchProvider === "searxng"
       ? /^https?:\/\//i.test(researchBaseUrl.trim())
+      : researchProvider === "deepseek"
+        ? provider === "deepseek" && hasApiKey
       : false;
+  const managedResearchChoices = Array.from(new Set<ResearchProviderId>([
+    ...(researchCredentialManaged && configuredResearchProvider !== "disabled" ? [configuredResearchProvider] : []),
+    ...(provider === "deepseek" ? ["deepseek" as const] : []),
+  ]));
   const busy = busyTask !== null;
   const optimizationActive = optimizationStatus === "analyzing" || optimizationStatus === "optimizing" || optimizationStatus === "reevaluating";
   const optimizationTarget = optimizationTargetIndex === null ? null : evals[optimizationTargetIndex] || null;
   const optimizationTargetHistory = optimizationTarget ? optimizationHistory[optimizationTarget.label] : null;
   const optimizationPhaseIndex = optimizationStatus === "analyzing" ? 0 : optimizationStatus === "ready" ? 1 : optimizationStatus === "optimizing" ? 1 : optimizationStatus === "reevaluating" ? 2 : optimizationStatus === "complete" ? 3 : 0;
   const observedEvals = evals.filter((item) => item.coverage !== "not-covered");
-  const strongEvals = observedEvals.filter((item) => item.score >= DEMO_SCORING_POLICY.observedGoodFloor);
-  const needsWorkEvals = observedEvals.filter((item) => item.score < DEMO_SCORING_POLICY.observedGoodFloor);
-  const demonstratedImprovementLabels = strongEvals.map((item) => item.label);
-  const evaluationHeadline = demonstratedImprovementLabels.length
-    ? `相比通用 AI，${demonstratedImprovementLabels.join("、")}更可靠`
-    : observedEvals.length
-      ? "本轮还没有看到相对通用 AI 的明确提升"
-      : "完成一次真实试跑后，再看它比通用 AI 好在哪里";
-  const evaluationSummary = needsWorkEvals.length
-    ? `已经看到的提升会保留；“${needsWorkEvals[0].label}”仍需要加强。`
-    : observedEvals.length
-      ? "这些结论来自当前 Demo 中可以直接观察到的行为，不用数字分数代替你的判断。"
-      : "继续对话并更新对比结论，查看本轮实际变化。";
+  const formalComparisonIsCurrent = generationLoop.benchmarkRuns > 0
+    && generationLoop.comparisonRevision === currentBundleRevision
+    && generationLoop.comparisonVerdict !== "not-run"
+    && generationLoop.comparisonEvidence.length > 0;
+  const formalComparisonRows = formalComparisonIsCurrent
+    ? generationLoop.comparisonEvidence.map((item) => {
+        const benchmarkCase = generationLoop.benchmarkSuiteCases.find((candidate) => candidate.id === item.caseId);
+        const verdict = item.blindVerdict || (item.delta >= 3 ? "candidate" : item.delta < 0 ? "baseline" : "tie");
+        return {
+          ...item,
+          verdict,
+          title: comparisonTaskTitle(item.taskPrompt || benchmarkCase?.prompt || "", "代表性任务对照"),
+          explanation: item.comparisonEvidence || "这条历史对照只保留了判定结果。重新运行正式对照后，会补齐裸模型与 Skill 的逐条差异证据。",
+        };
+      })
+    : [];
+  const formalImprovementRows = formalComparisonRows.filter((item) => item.verdict === "candidate");
+  const formalGapRows = formalComparisonRows.filter((item) => item.verdict !== "candidate");
+  const evaluationHeadline = !formalComparisonIsCurrent
+    ? "还没有与当前版本匹配的裸模型对照"
+    : generationLoop.comparisonVerdict === "improved"
+      ? `在 ${formalImprovementRows.length} 个真实任务中，Skill 的回答更好`
+      : generationLoop.comparisonVerdict === "equivalent"
+        ? "Skill 与裸模型表现接近，暂不宣称提升"
+        : "这版 Skill 还没有稳定超过裸模型";
+  const evaluationSummary = !formalComparisonIsCurrent
+    ? "需要让同一批任务分别交给裸模型和当前 Skill，再匿名比较两边结果。"
+    : "下面每条结论都来自同一任务、同一模型的匿名 A/B 对照；不再用固定维度或自评分代替真实差异。";
   const busyStageIndex = busyTask
     ? Math.min(BUSY_STAGES[busyTask].stages.length - 1, busyPhaseIndex)
     : 0;
@@ -6114,7 +6180,13 @@ export default function Home() {
   }
 
   function updateResearchProvider(next: ResearchProviderId) {
-    if (next !== researchProvider) setResearchCredentialStored(next === "searxng" && Boolean(RESEARCH_PROVIDERS[next].baseUrl));
+    if (next !== researchProvider) setResearchCredentialStored(
+      next === "deepseek"
+        ? provider === "deepseek" && hasApiKey
+        : next === configuredResearchProvider
+          ? true
+          : next === "searxng" && Boolean(RESEARCH_PROVIDERS[next].baseUrl),
+    );
     setResearchProvider(next);
     setResearchApiKey("");
     setResearchBaseUrl(RESEARCH_PROVIDERS[next].baseUrl);
@@ -6733,6 +6805,36 @@ export default function Home() {
       revealedScores,
       caseResults: comparison.caseResults.map((item) => ({ ...item, revealedWinner: revealWinner(item.winner) })),
     };
+  }
+
+  function attachTaskSpecificComparisonEvidence(
+    cases: BenchmarkCaseComparison[],
+    baseline: HarnessReport,
+    skill: HarnessReport,
+    blind: Awaited<ReturnType<typeof runBlindHarnessComparison>>,
+  ): BenchmarkCaseComparison[] {
+    const contractCases = new Map(baseline.contract.cases.map((item) => [item.id, item]));
+    const baselineCases = new Map(baseline.evidence.cases.map((item) => [item.caseId, item]));
+    const skillCases = new Map(skill.evidence.cases.map((item) => [item.caseId, item]));
+    const blindCases = new Map(blind.caseResults.map((item) => [item.caseId, item]));
+    return cases.map((item) => {
+      const contractCase = contractCases.get(item.caseId);
+      const actualTask = typeof contractCase?.context.actual_task === "string" ? contractCase.context.actual_task.trim() : "";
+      const blindCase = blindCases.get(item.caseId);
+      const revealedWinner = blindCase?.revealedWinner === "left"
+        ? "baseline"
+        : blindCase?.revealedWinner === "right"
+          ? "candidate"
+          : "tie";
+      return {
+        ...item,
+        taskPrompt: (actualTask || contractCase?.prompt || item.caseId).slice(0, 700),
+        baselineOutput: (baselineCases.get(item.caseId)?.output || "").slice(0, 1_600),
+        skillOutput: (skillCases.get(item.caseId)?.output || "").slice(0, 1_600),
+        blindVerdict: revealedWinner,
+        comparisonEvidence: (blindCase?.evidence || "").slice(0, 700),
+      };
+    });
   }
 
   function commitSkillMutation(receipt: SkillMutationReceipt, candidateFiles?: Record<string, string>) {
@@ -7820,7 +7922,7 @@ export default function Home() {
         if (!validation.executionReady || !state.issues.length) break;
         continue;
       }
-      if (issuesAreCompilerOwnedEvalCoverage(state.issues)) {
+      if (state.issues.some(isCompilerOwnedEvalCoverageIssue)) {
         if (evalCoverageRepairAttempted) {
           rejectedAttempts.push("Canonical Eval Compiler 补齐后仍存在同类覆盖阻塞，已停止重复生成；需要修复评测编译器而不是改写 Skill 语义");
           break;
@@ -7862,6 +7964,18 @@ export default function Home() {
           if (!state.issues.length) break;
           continue;
         }
+      }
+      const unhandledCompilerIssues = compilerOwnedContractIssues(state.issues);
+      if (unhandledCompilerIssues.length) {
+        const reason = `发现 ${unhandledCompilerIssues.length} 项编译器所有的契约问题，已停止模型空转：${unhandledCompilerIssues.map((issue) => issue.evidence).join("；").slice(0, 360)}`;
+        rejectedAttempts.push(reason);
+        reportClientGenerationLoopEvent("generation_loop_candidate", {
+          phase: "compiler-contract-routing",
+          round: rounds,
+          accepted: false,
+          reason,
+        });
+        break;
       }
       const blockers = state.issues.map((issue) => `${issue.type} · ${issue.files.join("、") || "bundle"} · ${issue.evidence}`);
       const allowedMutationTypes = allowedP1MutationTypes(state.issues);
@@ -8247,7 +8361,7 @@ export default function Home() {
       comparisonStage,
       comparisonCaseCount: selectionCases.length,
       comparisonVerdict: initialComparison.verdict,
-      comparisonEvidence: initialComparison.cases,
+      comparisonEvidence: attachTaskSpecificComparisonEvidence(initialComparison.cases, baselineHarness, bestHarness, blindResult),
       benchmarkSuiteCases: selectionCases,
       lift: initialComparison.lift,
       passRate: bestMetrics.passRate,
@@ -8411,6 +8525,9 @@ export default function Home() {
                     provider: researchProvider,
                     apiKey: researchApiKey,
                     baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
+                    modelProvider: provider,
+                    modelApiKey: apiKey,
+                    model,
                     queries,
                   }),
                   signal: controller.signal,
@@ -8977,7 +9094,7 @@ export default function Home() {
       comparisonStage,
       comparisonCaseCount: selectionCases.length,
       comparisonVerdict: comparisonIsCurrent ? finalComparison.verdict : "not-run",
-      comparisonEvidence: comparisonIsCurrent ? finalComparison.cases : [],
+      comparisonEvidence: comparisonIsCurrent ? attachTaskSpecificComparisonEvidence(finalComparison.cases, baselineHarness, bestHarness, blindResult) : [],
       benchmarkSuiteCases: selectionCases,
       lift: finalComparison.lift,
       passRate: bestMetrics.passRate,
@@ -9084,26 +9201,10 @@ export default function Home() {
   }
 
   async function runBuildTimeKnowledgeCompiler(basePlan: CapabilityPlan, capabilityDelta: CapabilityDelta): Promise<KnowledgePack> {
-    const externalGaps = externalCapabilityDeltaGaps(capabilityDelta);
-    const researchDelta: CapabilityDelta = {
-      ...capabilityDelta,
-      skillMustTeach: externalGaps,
-      researchFocus: Array.from(new Set(externalGaps.flatMap((gap) => gap.researchQuestions))).slice(0, 16),
-    };
-    const notRequiredPack = (summary: string, plan = EMPTY_KNOWLEDGE_PACK.plan): KnowledgePack => ({
-      ...EMPTY_KNOWLEDGE_PACK,
-      status: "not-needed",
-      summary,
-      plan,
-      coverage: { target: 0, covered: [], missing: [], score: 100 },
-      categoryCoverage: { covered: [], missing: [], score: 100 },
-      sufficiency: "not-required",
-      generatedAt: new Date().toISOString(),
-    });
-    if (!externalGaps.length) {
-      const skipped = notRequiredPack(capabilityDelta.skillMustTeach.length
-        ? "需要写入 Skill 的行为已由用户要求完整定义，不需要用网页来源重新证明；系统将直接按已确认的工作方式生成。"
-        : "本次按已确认的任务要求生成，不额外声称专业能力提升；需要来源的结论仍须提供证据。");
+    const { policy, researchDelta } = prepareKnowledgeRuntime(capabilityDelta);
+    const externalGaps = policy.externalGaps;
+    if (!policy.required) {
+      const skipped = createNotRequiredKnowledgePack(capabilityDelta);
       setKnowledgePack(skipped);
       return skipped;
     }
@@ -9117,26 +9218,45 @@ export default function Home() {
       capabilityPlan: basePlan,
       capabilityDelta: researchDelta,
     });
-    const rawPlanRequired = Boolean(rawPlan && typeof rawPlan === "object" && (rawPlan as Record<string, unknown>).required === true);
-    const plan = normalizeKnowledgePlan({
+    const normalizedPlan = normalizeKnowledgePlan({
       ...(rawPlan && typeof rawPlan === "object" ? rawPlan as Record<string, unknown> : {}),
       capabilityDeltaGapIds: externalGaps.map((item) => item.id),
       excludedGenericKnowledge: researchDelta.excludedGenericKnowledge,
       userPolicies: ["evidence-policy", "boundary", "autonomy", "output-format"].map((key) => (demoAnswers as Record<string, string>)[key] || "").filter(Boolean),
     }, idea);
+    const plan = alignKnowledgePlanToCapabilityDelta(normalizedPlan, externalGaps, idea);
+    let knowledgeVerificationIncomplete = false;
     const verifyPack = async (candidate: KnowledgePack, prior?: KnowledgePack) => {
       const knowledgeClaims = knowledgeVerificationCandidates(candidate);
       if (!knowledgeClaims.length) return candidate;
       setBusyExecutionNote("正在核对每条规则的来源原文与对应能力差值，不把用户偏好当作外部知识");
-      const verdicts = await callAI<unknown>("knowledge-verify", { capabilityDelta: researchDelta, knowledgeClaims, acceptedKnowledge: knowledgeVerificationContext(prior), knowledgePlan: plan, answers: interviewEvidence });
-      return applyKnowledgeVerification(candidate, verdicts, prior);
+      const verification = await verifyKnowledgeClaimsInBatches({
+        claims: knowledgeClaims,
+        batchSize: 4,
+        call: (claimBatch) => callAI<unknown>("knowledge-verify", {
+          capabilityDelta: researchDelta,
+          knowledgeClaims: claimBatch,
+          acceptedKnowledge: knowledgeVerificationContext(prior),
+          knowledgePlan: plan,
+          answers: interviewEvidence,
+        }),
+      });
+      if (verification.failures.length) {
+        knowledgeVerificationIncomplete = true;
+        reportClientGenerationLoopEvent("generation_loop_failed", {
+          phase: "knowledge-verify-batch",
+          afterCount: verification.verdicts.length,
+          reason: `部分知识核验未完成：${verification.failures.slice(0, 2).join("；")}`,
+        });
+      }
+      return applyKnowledgeVerification(candidate, { verdicts: verification.verdicts }, prior);
     };
     const workflowMcpEnabled = mcpConnections.length > 0;
-    if (rawPlanRequired && !plan.required) {
+    if (!plan.required) {
       const insufficient: KnowledgePack = {
         ...EMPTY_KNOWLEDGE_PACK,
         status: "unavailable",
-        summary: "Capability Delta 已发现专属能力差值，但四类知识检索计划不完整；本 Skill 已标记为知识不足，不会用泛化内容补齐。",
+        summary: "Capability Delta 已发现 external 专业知识差值，但四类知识检索计划不完整；本 Skill 已标记为知识不足，不会用泛化内容补齐。",
         sufficiency: "insufficient",
         plan,
         categoryCoverage: { covered: [], missing: plan.requiredCategories, score: 0 },
@@ -9144,11 +9264,6 @@ export default function Home() {
       };
       setKnowledgePack(insufficient);
       return insufficient;
-    }
-    if (!plan.required) {
-      const skipped = notRequiredPack(plan.reason || "现有用户资料和模型能力已经足够，不额外制造领域知识文件", plan);
-      setKnowledgePack(skipped);
-      return skipped;
     }
     const researching: KnowledgePack = {
       ...EMPTY_KNOWLEDGE_PACK,
@@ -9201,6 +9316,12 @@ export default function Home() {
         const controller = new AbortController();
         const timeout = window.setTimeout(() => controller.abort(), 58_000);
         try {
+          const selectedQueries = selectKnowledgeQueries(plan.queries, plan.preferredDomains);
+          reportClientGenerationLoopEvent("generation_loop_phase", {
+            phase: "knowledge-query-plan",
+            queries: selectedQueries,
+            reason: `围绕 ${plan.capabilityDeltaGapIds.length} 个外部能力缺口执行 ${selectedQueries.length} 条定向检索`,
+          });
           const response = await fetch("/api/research", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -9208,7 +9329,11 @@ export default function Home() {
               provider: researchProvider,
               apiKey: researchApiKey,
               baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
-              queries: selectKnowledgeQueries(plan.queries, plan.preferredDomains),
+              modelProvider: provider,
+              modelApiKey: apiKey,
+              model,
+              preferredDomains: plan.preferredDomains,
+              queries: selectedQueries,
             }),
             signal: controller.signal,
           });
@@ -9254,7 +9379,7 @@ export default function Home() {
         reason: `首轮累计提出 ${pack.diagnostics.candidateCount} 条候选（含分批与重复），保留 ${pack.atoms.length} 条；另有 ${pack.diagnostics.validatorRejectedCount} 条未采用或去重记录`,
       });
       const densityGate = knowledgePackNeedsExpansion(pack);
-      if (densityGate.needsExpansion && !compilationIncomplete) {
+      if (densityGate.needsExpansion && !compilationIncomplete && !knowledgeVerificationIncomplete) {
         setBusyExecutionKind("loop");
         setBusyExecutionNote(`${densityGate.reason}，正在针对未覆盖能力补搜来源；引用不支持规则时，不会只改写同一批证据`);
         try {
@@ -9272,6 +9397,12 @@ export default function Home() {
               const followupController = new AbortController();
               const followupTimeout = window.setTimeout(() => followupController.abort(), 45_000);
               try {
+                const selectedFollowupQueries = selectKnowledgeQueries(followupQueries, plan.preferredDomains);
+                reportClientGenerationLoopEvent("generation_loop_phase", {
+                  phase: "knowledge-query-followup",
+                  queries: selectedFollowupQueries,
+                  reason: `针对 ${densityGate.missingDimensions.length || missingGapIds.size} 个未覆盖知识维度补搜`,
+                });
                 const followupResponse = await fetch("/api/research", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
@@ -9279,7 +9410,11 @@ export default function Home() {
                     provider: researchProvider,
                     apiKey: researchApiKey,
                     baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
-                    queries: selectKnowledgeQueries(followupQueries, plan.preferredDomains),
+                    modelProvider: provider,
+                    modelApiKey: apiKey,
+                    model,
+                    preferredDomains: plan.preferredDomains,
+                    queries: selectedFollowupQueries,
                   }),
                   signal: followupController.signal,
                 });
@@ -9470,12 +9605,7 @@ export default function Home() {
         sourceEvidence: `${sourceInsightText}\n${liveKnowledgeText}`,
         files: liveKnowledgeProjection,
         capabilityDelta: liveCapabilityDelta,
-        knowledgeAssessment: {
-          status: liveKnowledgePack.sufficiency,
-          requiredCategories: liveKnowledgePack.plan.requiredCategories,
-          coveredCategories: liveKnowledgePack.categoryCoverage.covered,
-          missingCategories: liveKnowledgePack.categoryCoverage.missing,
-        },
+        knowledgeAssessment: knowledgeAssessmentFromPack(liveCapabilityDelta, liveKnowledgePack),
       });
       await durableBuild?.complete("knowledge-compile", {
         status: liveKnowledgePack.status,
@@ -9737,7 +9867,7 @@ export default function Home() {
         comparisonStage: current.comparisonStage === "initial" ? "initial" : "optimized",
         comparisonCaseCount: selectionCases.length,
         comparisonVerdict: comparison.verdict,
-        comparisonEvidence: comparison.cases,
+        comparisonEvidence: attachTaskSpecificComparisonEvidence(comparison.cases, baselineHarness, currentHarness, blindResult),
         benchmarkSuiteCases: selectionCases,
         lift: comparison.lift,
         passRate: currentMetrics.passRate,
@@ -10106,7 +10236,15 @@ export default function Home() {
 
   function enterEvaluation() {
     setStep("evaluate");
-    if (!evalRan && !busy) void runEvaluation();
+    if (evalRan || busy || evaluationLaunchPendingRef.current) return;
+    evaluationLaunchPendingRef.current = true;
+    // Let React commit and paint the validation workspace before starting a
+    // potentially long model request. This keeps navigation responsive even
+    // when the evaluation provider or browser connection is slow.
+    window.requestAnimationFrame(() => {
+      evaluationLaunchPendingRef.current = false;
+      void runEvaluation();
+    });
   }
 
   function handleBuildPrimaryAction() {
@@ -10720,11 +10858,24 @@ export default function Home() {
     try {
       const response = await fetch("/api/research", {
         method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
-        body: JSON.stringify({ action: "test", provider: researchProvider, apiKey: researchApiKey, baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl }),
+        body: JSON.stringify({
+          action: "test",
+          provider: researchProvider,
+          apiKey: researchApiKey,
+          baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
+          modelProvider: provider,
+          modelApiKey: apiKey,
+          model,
+        }),
       });
       const result = await response.json() as { ok?: boolean; sourceCount?: number; error?: string };
       if (!response.ok || !result.ok) throw new Error(result.error || "检索服务未返回正文证据");
-      if (!controller.signal.aborted) setResearchProbe({ status: "ok", message: `检索成功：已读取 ${result.sourceCount} 份网页证据；未调用大模型` });
+      if (!controller.signal.aborted) setResearchProbe({
+        status: "ok",
+        message: researchProvider === "deepseek"
+          ? `检索成功：DeepSeek 已发现来源，SkillCanvas 已读取 ${result.sourceCount} 份网页正文；会产生额外模型 Token`
+          : `检索成功：已读取 ${result.sourceCount} 份网页证据；未调用大模型`,
+      });
     } catch (error) {
       if (researchProbeController.current === controller) setResearchProbe({ status: "error", message: controller.signal.aborted ? "检索测试已取消或超时，请重新测试" : error instanceof Error ? error.message : "检索测试失败" });
     } finally {
@@ -10745,6 +10896,10 @@ export default function Home() {
       setToast("SearXNG 地址需要以 http:// 或 https:// 开头");
       return;
     }
+    if (researchProvider === "deepseek" && provider !== "deepseek") {
+      setToast("DeepSeek 联网搜索需要先选择 DeepSeek 模型服务");
+      return;
+    }
     try {
       const response = await fetch("/api/credentials", {
         method: "POST",
@@ -10763,6 +10918,7 @@ export default function Home() {
       if (!response.ok) throw new Error(result.error || "凭据保存失败");
       setCredentialStored(Boolean(result.configured));
       setResearchCredentialStored(Boolean(result.researchConfigured));
+      setConfiguredResearchProvider(result.researchConfigured ? researchProvider : "disabled");
       setApiKey("");
       setResearchApiKey("");
     } catch (error) {
@@ -10790,6 +10946,7 @@ export default function Home() {
     setCredentialStored(false);
     setResearchApiKey("");
     setResearchCredentialStored(false);
+    setConfiguredResearchProvider("disabled");
     setConnectionState("idle");
     setToast("已清除服务端安全存储中的模型与检索凭据");
   }
@@ -10912,28 +11069,29 @@ export default function Home() {
 
   function renderSkillDemoCard(pendingReview: boolean) {
     if (!skillDemo) return null;
-    const completedConversationTurns = demoConversation.filter((message) => message.role === "assistant").length;
     const latestCompletedReplyId = [...demoConversation].reverse().find((message) => message.role === "assistant")?.id || "";
     const conversationScoreIsFresh = Boolean(latestCompletedReplyId) && demoConversationScoredReplyId === latestCompletedReplyId;
     const hasNewConversationEvidence = Boolean(latestCompletedReplyId) && !conversationScoreIsFresh;
     const automaticTurns = demoConversation.filter((message) => message.role === "assistant" && message.source === "mock").length;
-    const visibleComparisonEvals = observedEvals.slice(0, 3);
+    const visibleComparisonRows = formalComparisonRows.slice(0, 3);
     return (
       <section className={`skill-demo-card ${pendingReview ? "review-pending" : ""}`}>
         <div className="skill-demo-head">
           <div className="skill-demo-title"><span>第 {Math.max(1, demoRunCount)} 次试跑</span><h3>{skillDemo.title}</h3><p>{skillDemo.scenario}</p></div>
           <div className="skill-demo-aside">
-            <section className={`demo-improvement-summary ${pendingReview || !observedEvals.length ? "pending" : ""}`} aria-label="相比通用 AI 的具体变化">
+            <section className={`demo-improvement-summary ${pendingReview || !formalComparisonIsCurrent ? "pending" : ""}`} aria-label="相比裸模型的实际变化">
               <div className="demo-improvement-heading">
-                <span>{demoConversationScoredTurns > 0 ? `基于 ${demoConversationScoredTurns} 轮对话` : "相比通用 AI"}</span>
-                <strong>{pendingReview || !observedEvals.length ? "等待分析" : strongEvals.length ? `${strongEvals.length} 个方面表现更好` : "尚未证明有提升"}</strong>
+                <span>同题匿名 A/B</span>
+                <strong>{pendingReview || !formalComparisonIsCurrent ? "等待正式对照" : formalImprovementRows.length ? `${formalImprovementRows.length} 个任务中 Skill 更好` : "尚未证明有提升"}</strong>
               </div>
-              {visibleComparisonEvals.length > 0
-                ? <ul>{visibleComparisonEvals.map((result) => {
-                    const improved = result.score >= DEMO_SCORING_POLICY.observedGoodFloor;
-                    return <li className={improved ? "improved" : "gap"} key={result.label}><span>{improved ? "提升" : "待加强"}</span><div><strong>{result.label}</strong><p>{result.strength || result.detail}</p></div></li>;
-                  })}</ul>
-                : <p>{pendingReview ? "完成本轮试跑后，这里会直接列出具体提升和证据。" : "当前没有足够证据判断它是否优于通用 AI，请换一个场景继续验证。"}</p>}
+              {visibleComparisonRows.length > 0
+                ? <ul>{visibleComparisonRows.map((result) => (
+                    <li className={result.verdict === "candidate" ? "improved" : "gap"} key={result.caseId}>
+                      <span>{result.verdict === "candidate" ? "更好" : result.verdict === "tie" ? "接近" : "待加强"}</span>
+                      <div><strong>{result.title}</strong><p>{result.explanation}</p></div>
+                    </li>
+                  ))}</ul>
+                : <p>{pendingReview ? "完成本轮试跑后，会用生成阶段的裸模型对照给出具体差异。" : "当前版本还没有正式 A/B 证据，重新运行对照后才能判断它是否真的优于裸模型。"}</p>}
             </section>
             {!pendingReview && <div className="demo-head-actions">
               <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="/icons/tabler/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
@@ -11062,6 +11220,7 @@ export default function Home() {
               const canOpen = canNavigateToWorkflowStep(item.id, step, completedSteps);
               return (
                 <button
+                  type="button"
                   key={item.id}
                   className={`step-item ${active ? "active" : ""} ${done ? "done" : ""}`}
                   onClick={() => (canOpen ? openWorkspaceStep(item.id) : setToast("请先完成前面的步骤"))}
@@ -11097,7 +11256,6 @@ export default function Home() {
                   aria-label="Skill 想法"
                 />
                 <div className="composer-footer">
-                  <FileUploadButton onChange={handleSources} loading={sourcesLoading} disabled={busy} label="添加你的资料" />
                   <StartButton onClick={startInterview} disabled={busy || materialsLoading}>
                     {materialsLoading ? "等待资料解析" : busy ? "AI 正在先做一次…" : hasRealModel ? "Let‘s Start！" : "连接模型后开始 AI 理解"}<span>→</span>
                   </StartButton>
@@ -11112,7 +11270,7 @@ export default function Home() {
 
               <div className="starter-row">
                 <button onClick={() => setIdea("根据 JD 定制我的简历")}>根据 JD 定制我的简历</button>
-                <button onClick={() => setIdea("把我的写作习惯做成小红书 Skill")}>把我的写作习惯做成小红书 Skill</button>
+                <button onClick={() => setIdea("根据我的英语水平定制每日学习计划")}>根据我的英语水平定制每日学习计划</button>
                 <button onClick={() => setIdea("根据固定模板帮我做竞品分析")}>根据固定模板帮我做竞品分析</button>
                 <button onClick={() => setIdea("把我的旅行偏好变成长期规划助手")}>把我的旅行偏好变成长期规划助手</button>
               </div>
@@ -11542,7 +11700,7 @@ export default function Home() {
             <div className="build-stage">
               <div className="build-toolbar">
                 <div><span className="stage-kicker">专属 Skill 已生成</span><h2>真正属于你的 Skill</h2></div>
-                <div className="toolbar-actions"><button onClick={copySkill}>复制主文件</button><button className="primary-button compact" onClick={handleBuildPrimaryAction} disabled={busy}>{bundleAudit.blockers.length ? "自动修复并重新生成" : busyTask === "evaluate" ? "正在开始评估…" : "进入评估"} <span>→</span></button></div>
+                <div className="toolbar-actions"><button type="button" onClick={copySkill}>复制主文件</button><button type="button" className="primary-button compact" onClick={handleBuildPrimaryAction} disabled={busy}>{bundleAudit.blockers.length ? "自动修复并重新生成" : busyTask === "evaluate" ? "正在开始评估…" : "进入评估"} <span>→</span></button></div>
               </div>
               <section className="build-product-overview" aria-label="Skill 生成结果摘要">
                 <div className="build-product-status">
@@ -11586,6 +11744,10 @@ export default function Home() {
                     <div className="knowledge-pack-metrics"><span><b>{knowledgePack.sources.length}</b> 个来源</span><span><b>{knowledgePack.atoms.length}</b> 条采用</span><span><b>{knowledgePack.coverage.score}%</b> 维度覆盖</span><span><b>{knowledgePack.valueDensity}</b> 价值密度</span></div>
                   </div>
                   {knowledgePack.plan.knowledgeGaps.length > 0 && <div className="knowledge-gap-row"><span>本次重点寻找</span>{knowledgePack.plan.knowledgeGaps.map((gap) => <em key={gap}>{gap}</em>)}</div>}
+                  {knowledgePack.plan.queries.length > 0 && <details className="knowledge-query-details">
+                    <summary>查看实际发送的检索问题</summary>
+                    <ol>{selectKnowledgeQueries(knowledgePack.plan.queries, knowledgePack.plan.preferredDomains).map((query) => <li key={query}>{query}</li>)}</ol>
+                  </details>}
                   {mcpConnections.length > 0 && knowledgeMcpReport && <div className={`knowledge-mcp-receipt ${knowledgeMcpReceiptState}`}>
                     <div className="knowledge-mcp-receipt-copy">
                       <span>INTERNAL MCP · 生成器取证回执</span>
@@ -11770,51 +11932,46 @@ export default function Home() {
                     )}
                     {renderSkillDemoCard(false)}
                     <section className="eval-report-panel expanded" aria-label="本轮效果报告">
-                    <div className={`eval-report-summary ${needsWorkEvals.length ? "needs-work" : observedEvals.length ? "ready" : "partial"}`}>
+                    <div className={`eval-report-summary ${!formalComparisonIsCurrent || formalGapRows.length ? "needs-work" : "ready"}`}>
                       <div className="eval-report-verdict">
-                        <span>相比通用 AI</span>
+                        <span>裸模型 vs 当前 Skill · 同题匿名对照</span>
                         <strong>{evaluationHeadline}</strong>
                         <p>{evaluationSummary}</p>
                       </div>
                       <div className="eval-report-counts" aria-label="本轮证据状态">
-                        <div><strong>{strongEvals.length}</strong><span>方面已看到提升</span></div>
-                        <div><strong>{needsWorkEvals.length}</strong><span>方面仍需加强</span></div>
+                        <div><strong>{formalImprovementRows.length}</strong><span>任务中 Skill 更好</span></div>
+                        <div><strong>{formalGapRows.length}</strong><span>任务中尚未胜出</span></div>
                       </div>
                     </div>
                     <div id="eval-report-details" className="eval-report-details">
-                      <div className="eval-list" aria-label="本轮效果验证">
-                    {evals.map((result, index) => {
-                      // Hide unobserved rows without shifting optimization indices.
-                      if (result.coverage === "not-covered") return null;
-                      const history = optimizationHistory[result.label];
-                      const analyzingThis = optimizationOpen && optimizationTargetIndex === index && optimizationActive;
-                      const statusLabel = result.score >= DEMO_SCORING_POLICY.observedGoodFloor
-                          ? "已看到明确提升"
-                          : result.score >= DEMO_SCORING_POLICY.observedWarningFloor
-                            ? "提升还不够稳定"
-                            : "尚未看到提升";
-                      return (
-                        <article className={`eval-row ${history ? "optimized" : ""} ${result.tone}`} key={result.label}>
-                          <div className="eval-row-head">
-                            <span className="eval-title-line"><strong>{result.label}</strong>{history && <em>已重新对比</em>}</span>
-                            <span className={`eval-status ${result.tone}`}>{statusLabel}</span>
+                      <div className="ab-comparison-list" aria-label="裸模型与 Skill 的逐任务对照">
+                        {formalComparisonRows.length > 0 ? formalComparisonRows.map((result) => (
+                          <article className={`ab-comparison-row ${result.verdict}`} key={result.caseId}>
+                            <div className="ab-comparison-head">
+                              <div><span>实际测试任务</span><strong>{result.title}</strong></div>
+                              <em>{result.verdict === "candidate" ? "Skill 更好" : result.verdict === "tie" ? "表现接近" : "裸模型更好"}</em>
+                            </div>
+                            <div className="ab-comparison-finding">
+                              <span>{result.verdict === "candidate" ? "这份 Skill 带来的具体提升" : "这次对照发现的问题"}</span>
+                              <p>{result.explanation}</p>
+                            </div>
+                            {(result.baselineOutput || result.skillOutput) && <details className="ab-output-details">
+                              <summary>查看两份实际回答 <span>⌄</span></summary>
+                              <div><section><span>不带 Skill</span><pre>{result.baselineOutput || "没有保存这份历史回答"}</pre></section><section><span>带当前 Skill</span><pre>{result.skillOutput || "没有保存这份历史回答"}</pre></section></div>
+                            </details>}
+                          </article>
+                        )) : (
+                          <div className="ab-comparison-empty">
+                            <strong>当前版本还没有可展示的正式对照</strong>
+                            <p>运行后会把同一任务分别交给裸模型和当前 Skill，并直接显示哪一份更好、具体好在哪里。</p>
+                            <button type="button" onClick={() => void rerunMultiSceneComparison()} disabled={busy}>{busy ? "正在运行对照…" : "运行裸模型对照"}<span>→</span></button>
                           </div>
-                          <div className={`eval-row-body ${result.score < DEMO_SCORING_POLICY.observedGoodFloor ? "has-gap" : "good"}`}>
-                            <div className="eval-observation"><span>比通用 AI 提升在哪里</span><p>{result.strength || result.detail}</p></div>
-                            {result.score < DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-next-gap"><span>还能再提升的地方</span><p>{result.issue || "本轮暂未发现明确差距。"}</p></div>}
-                            {result.score >= DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-good-note"><span>为什么算提升</span><p>{result.detail}</p></div>}
-                          </div>
-                          <div className="eval-row-actions">
-                            <details className="eval-evidence-details">
-                              <summary>查看判断依据 <span>⌄</span></summary>
-                              <div><p><strong>观察依据</strong>{result.evidence || "请结合上面的 Demo 判断。"}</p><p><strong>对实际使用的影响</strong>{result.impact || "这会影响结果是否真正可用。"}</p><p><strong>判断范围</strong>只基于当前试跑中实际出现的行为，不把未测试场景当作已经提升。</p></div>
-                            </details>
-                            {(result.score < DEMO_SCORING_POLICY.observedGoodFloor || history) && <button className="eval-optimize-button" onClick={() => void openOptimization(index)} disabled={optimizationActive || busy}>{analyzingThis ? "正在分析…" : history ? "继续优化" : "优化这一项"}<span>→</span></button>}
-                          </div>
-                        </article>
-                      );
-                    })}
+                        )}
                       </div>
+                      {observedEvals.length > 0 && <details className="eval-internal-diagnostics">
+                        <summary><span><strong>查看单次 Demo 的内部诊断</strong><small>用于定位问题，不作为“优于裸模型”的证明</small></span><i>⌄</i></summary>
+                        <div>{observedEvals.map((result) => <article key={result.label}><strong>{result.label}</strong><p>{result.strength || result.detail}</p>{result.issue && <small>{result.issue}</small>}</article>)}</div>
+                      </details>}
                     </div>
                     </section>
                     {bundleAudit.blockers.length > 0 && <div className="finding-card">
@@ -11923,14 +12080,23 @@ export default function Home() {
             <div className="modal-head"><div><span className="stage-kicker">{credentialManaged ? "MANAGED SERVICE" : "BYOK · Bring your own key"}</span><h2 id="model-settings-title">{credentialManaged ? "平台服务已就绪" : "连接你的 AI 模型"}</h2></div><button className="close-button" aria-label="关闭模型设置" onClick={closeSettings}>×</button></div>
             {credentialManaged ? (
               <div className="managed-service-panel">
-                <div className="privacy-banner"><span>✓</span><p><strong>无需填写任何 API Key</strong><small>{researchCredentialManaged ? "DeepSeek 与 Firecrawl 均由平台在服务器端提供。" : "DeepSeek 由平台在服务器端提供。"}密钥不会发送到浏览器，也不会写入生成的 Skill 或日志。</small></p></div>
+                <div className="privacy-banner"><span>✓</span><p><strong>无需填写任何 API Key</strong><small>AI 与已启用的检索服务均由平台在服务器端提供。密钥不会发送到浏览器，也不会写入生成的 Skill 或日志。</small></p></div>
                 <div className="managed-service-status">
                   <div><span>AI 模型</span><strong>{PROVIDERS[provider].name} · {model}</strong><em>可用</em></div>
-                  <div><span>公开网页检索</span><strong>{researchCredentialManaged ? RESEARCH_PROVIDERS[researchProvider].name : "未启用"}</strong><em className={researchCredentialManaged ? "" : "muted"}>{researchCredentialManaged ? "可用" : "未启用"}</em></div>
+                  <div><span>公开网页检索</span><strong>{researchReady ? RESEARCH_PROVIDERS[researchProvider].name : "未启用"}</strong><em className={researchReady ? "" : "muted"}>{researchReady ? "可用" : "未启用"}</em></div>
                 </div>
+                {managedResearchChoices.length > 0 && (
+                  <div className="provider-options research-provider-options">
+                    {managedResearchChoices.map((id) => (
+                      <button type="button" key={id} aria-pressed={researchProvider === id} className={researchProvider === id ? "selected" : ""} onClick={() => updateResearchProvider(id)}>
+                        <span>{RESEARCH_PROVIDERS[id].mark}</span><strong>{RESEARCH_PROVIDERS[id].name}</strong><i>{researchProvider === id ? "●" : ""}</i><small>{RESEARCH_PROVIDERS[id].detail}</small>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div className="modal-footer">
                   <button className="secondary-button" onClick={testConnection} disabled={connectionState === "testing"}>{connectionState === "testing" ? "正在测试 AI…" : "测试 AI 服务"}</button>
-                  {researchCredentialManaged && <button className="secondary-button" onClick={() => void testResearchConnection()} disabled={researchProbe.status === "testing"}>{researchProbe.status === "testing" ? "正在测试检索…" : "测试网页检索"}</button>}
+                  {researchReady && <button className="secondary-button" onClick={() => void testResearchConnection()} disabled={researchProbe.status === "testing"}>{researchProbe.status === "testing" ? "正在测试检索…" : "测试网页检索"}</button>}
                   <span className={`connection-result ${connectionState}`}>{connectionState === "ok" ? "✓ AI 服务连接成功" : connectionState === "error" ? "AI 服务暂时不可用" : "访客可直接使用，无需自行配置"}</span>
                   <button className="primary-button" onClick={closeSettings}>完成</button>
                 </div>
@@ -11969,7 +12135,7 @@ export default function Home() {
               <p>它用于寻找专业流程、判断规则、例外和失败模式，并写入 Skill 的领域手册与评测；不是给生成后的 Skill 机械添加联网工具。</p>
               <div className="provider-options research-provider-options">
                 {(Object.keys(RESEARCH_PROVIDERS) as ResearchProviderId[]).map((id) => (
-                  <button type="button" key={id} aria-pressed={researchProvider === id} className={researchProvider === id ? "selected" : ""} onClick={() => updateResearchProvider(id)}>
+                  <button type="button" key={id} aria-pressed={researchProvider === id} className={researchProvider === id ? "selected" : ""} disabled={id === "deepseek" && provider !== "deepseek"} onClick={() => updateResearchProvider(id)}>
                     <span>{RESEARCH_PROVIDERS[id].mark}</span><strong>{RESEARCH_PROVIDERS[id].name}</strong><i>{researchProvider === id ? "●" : ""}</i><small>{RESEARCH_PROVIDERS[id].detail}</small>
                   </button>
                 ))}
@@ -11980,7 +12146,7 @@ export default function Home() {
                 <button className="secondary-button" onClick={() => void testResearchConnection()} disabled={!researchReady || researchProbe.status === "testing"}>{researchProbe.status === "testing" ? "正在测试检索…" : "测试检索连接"}</button>
                 <span role="status" className={`connection-result ${researchProbe.status}`}>{researchProbe.message}</span>
               </div>}
-              <small className="research-privacy-note">检索服务只收到 AI 生成的专业问题和它自身的授权凭据；不会收到大模型 API Key、上传文件全文、原始业务材料或个人联系方式。网页证据会经过来源过滤后再交给模型编译。</small>
+              <small className="research-privacy-note">Firecrawl 与 SearXNG 只收到检索问题及其自身配置；DeepSeek 联网搜索会在服务端复用已保存的 DeepSeek Key，但不会把 Key 交给结果网站。任何方式都不会发送上传文件全文、原始业务材料或个人联系方式；网页证据会经过来源过滤后再交给模型编译。</small>
               <details className="internal-mcp-settings">
                 <summary>
                   <span><strong>Workflow MCP 证据源</strong><small>供 Knowledge Compiler 与 Optimization Research 调用</small></span>

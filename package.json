@@ -15,6 +15,7 @@
     "test": "pnpm run build && node --test tests/*.test.mjs",
     "test:mcp-runtime": "node scripts/mcp-runtime-check.mjs",
     "test:workflow-runtime": "node --test tests/workflow-runtime.test.mjs",
+    "probe:deepseek-search": "node scripts/deepseek-web-search-probe.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },

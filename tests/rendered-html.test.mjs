@@ -23,11 +23,13 @@ test("evaluation UI hides unobserved rows and counts without changing optimizati
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const reportStart = page.indexOf('<section className="eval-report-panel expanded"');
   const report = page.slice(reportStart, page.indexOf('<div className="finding-card"', reportStart));
-  assert.match(report, /evals\.map\(\(result, index\) => \{\s*\/\/[^\n]*\n\s*if \(result\.coverage === "not-covered"\) return null;/);
-  assert.match(report, /openOptimization\(index\)/);
+  assert.match(report, /formalComparisonRows\.length > 0 \? formalComparisonRows\.map/);
+  assert.match(report, /formalImprovementRows\.length/);
+  assert.match(report, /formalGapRows\.length/);
+  assert.match(page, /async function openOptimization\(index: number\)/);
   assert.doesNotMatch(report, /pendingEvals|还没测到|还没有测到|为什么还不能判断|换场景验证/);
-  assert.match(page, /相比通用 AI，\$\{demonstratedImprovementLabels\.join\("、"\)\}更可靠/);
-  assert.match(report, /比通用 AI 提升在哪里/);
+  assert.match(report, /裸模型 vs 当前 Skill · 同题匿名对照/);
+  assert.match(report, /这份 Skill 带来的具体提升/);
   assert.doesNotMatch(report, /内部观察分|\/100|验证分/);
   assert.match(css, /\.eval-report-counts\s*\{[^}]*repeat\(2, minmax\(72px, 1fr\)\)/);
 });
@@ -75,11 +77,15 @@ test("server-renders the SkillCanvas creation experience", async () => {
   assert.match(html, /来帮你/);
   assert.doesNotMatch(html, /你希望 AI 在什么事情上/);
   assert.match(html, /描述需求/);
-  assert.match(html, /预演理解/);
+  assert.match(html, /需求细化/);
+  assert.doesNotMatch(html, /预演理解/);
   assert.match(html, /确认工作方式/);
   assert.match(html, /生成并优化/);
   assert.match(html, /验证效果/);
   assert.match(html, /保存并使用/);
+  assert.match(html, /根据我的英语水平定制每日学习计划/);
+  assert.doesNotMatch(html, /把我的写作习惯做成小红书 Skill/);
+  assert.doesNotMatch(html, /添加你的资料/);
   assert.doesNotMatch(html, /理解你的 AI/);
   assert.doesNotMatch(html, /当前建议/);
   assert.doesNotMatch(html, /“AI 建议”只是提示/);
@@ -142,7 +148,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /validation\.issues\.filter\(\(issue\) => issue\.priority === "P0"\)/);
   assert.match(page, /async function runP1ContractRepairLoop\(/);
   assert.match(page, /category: "P1_CONTRACT_BLOCKER"/);
-  assert.match(page, /issuesAreCompilerOwnedEvalCoverage/);
+  assert.match(page, /state\.issues\.some\(isCompilerOwnedEvalCoverageIssue\)/);
+  assert.match(page, /compilerOwnedContractIssues\(state\.issues\)/);
+  assert.match(page, /phase: "compiler-contract-routing"/);
   assert.match(page, /Canonical Eval Compiler 已确定性补齐失败模式与全部激活能力的聚焦 Eval/);
   assert.match(page, /reconcileCapabilityPlanWithCanonicalIR/);
   assert.match(page, /optimization-waiting-note/);
@@ -213,11 +221,11 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /baselineQualityScore:\s*blindResult\.revealedScores/);
   assert.doesNotMatch(page, /user-proof-card|场景正式对照总分|重新跑多场景对照|查看每个冻结场景的真实得分与扣分原因|旧版本分数已隐藏/);
   assert.match(page, /相比通用 AI/);
-  assert.match(page, /aria-label="相比通用 AI 的具体变化"/);
+  assert.match(page, /aria-label="裸模型与 Skill 的逐任务对照"/);
   assert.match(page, /result\.strength \|\| result\.detail/);
   assert.doesNotMatch(page, /查看具体方面/);
   assert.doesNotMatch(page, /hidden=\{!evalDetailsOpen\}/);
-  assert.match(page, /个方面表现更好/);
+  assert.match(page, /这份 Skill 带来的具体提升/);
   assert.doesNotMatch(page, /不与多场景总分直接比较/);
   assert.match(page, /本次提案=\$\{attempted\}/);
   assert.match(page, /optimizationStableAtCeiling/);
@@ -603,6 +611,24 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(css, /font-size:\s*21\.25px/);
 });
 
+test("validation navigation paints before evaluation starts and exposes exact search queries", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /evaluationLaunchPendingRef/);
+  assert.match(page, /setStep\("evaluate"\)[\s\S]{0,500}requestAnimationFrame/);
+  assert.match(page, /查看实际发送的检索问题/);
+  assert.match(page, /phase: "knowledge-query-plan"/);
+  assert.match(page, /queries: selectedQueries/);
+});
+
+test("saved browser sessions are migrated when the pipeline contract changes", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /const SESSION_SCHEMA_VERSION = 2/);
+  assert.match(page, /pipelineContractVersion === PIPELINE_CONTRACT_VERSION/);
+  assert.match(page, /sessionSchemaVersion: SESSION_SCHEMA_VERSION/);
+  assert.match(page, /pipelineContractVersion: PIPELINE_CONTRACT_VERSION/);
+  assert.match(page, /const restoredFiles = restoreFrozenBundleExactly[\s\S]*?: finalizeSkillFiles\(/);
+});
+
 test("keeps the generated Skill editor usable inside the build workspace", async () => {
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const buildStageRule = css.match(/\.build-stage\s*\{([\s\S]*?)\}/)?.[1] ?? "";
@@ -631,6 +657,7 @@ test("records client repair-gate outcomes without bundle content", async () => {
       accepted: true,
       resolved: ["A", "B"],
       blockers: ["C"],
+      queries: ["weekly report fact-preserving rewrite verification"],
       updatedPaths: ["SKILL.md"],
     }),
   }));
@@ -642,6 +669,7 @@ test("records client repair-gate outcomes without bundle content", async () => {
   const diagnosticPayload = await diagnostics.json();
   assert.ok(Array.isArray(diagnosticPayload.entries));
   assert.ok(diagnosticPayload.entries.some((entry) => entry.event === "client_repair_gate_checked"));
+  assert.ok(diagnosticPayload.entries.some((entry) => String(entry.reason || "").includes("weekly report fact-preserving rewrite verification")));
   assert.doesNotMatch(JSON.stringify(diagnosticPayload), /do not log/);
 
   const rejected = await requestWorker(new Request("http://localhost/api/client-log", {

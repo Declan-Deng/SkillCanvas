@@ -18,7 +18,7 @@ const githubUrl = "https://github.com/Declan-Deng/SkillCanvas";
 
 const stages = [
   { title: "描述需求", detail: "一句自然语言即可开始" },
-  { title: "预演理解", detail: "AI 动态生成并预选关键问题" },
+  { title: "需求细化", detail: "AI 动态生成并预选关键问题" },
   { title: "确认工作方式", detail: "四轮校正需求、边界与工作方式" },
   { title: "生成并优化", detail: "从统一蓝图生成并校验 Skill" },
   { title: "验证效果", detail: "用真实 Case 验证并定位缺口" },

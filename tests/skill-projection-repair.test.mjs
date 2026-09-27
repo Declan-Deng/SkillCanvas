@@ -171,6 +171,42 @@ test("invalid Capability Delta is repaired locally and all projections converge"
   assert.deepEqual(repairCapabilityDeltaContract(repaired.files).changedPaths, []);
 });
 
+test("an external knowledge bypass is compiler-owned and repaired without a model mutation", () => {
+  const files = projectSkillIRFiles(fixture());
+  const persisted = JSON.parse(files["evals/skill-ir.json"]);
+  persisted.capabilityDelta = {
+    status: "ready",
+    summary: "周报分类需要任务特定判断",
+    bareModelCan: ["整理普通文本"],
+    skillMustTeach: [{
+      id: "weekly-status-classification",
+      taskDecision: "当零散记录同时像进展与风险时，依据专业判据选择主分类",
+      bareModelBehavior: "裸模型可能按关键词误判，混淆已发生结果与潜在影响",
+      requiredSkillBehavior: "先区分已发生变化、潜在影响和计划动作，再映射到周报栏目",
+      whySkillIsNeeded: "避免同一事实进入错误栏目并造成主管误判项目状态",
+      knowledgeNeed: "external",
+      researchQuestions: ["专业项目状态报告如何区分进展、风险和计划动作"],
+    }],
+    excludedGenericKnowledge: [],
+    researchFocus: ["专业项目状态报告如何区分进展、风险和计划动作"],
+  };
+  persisted.knowledgeAssessment = {
+    status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [],
+  };
+  files["evals/skill-ir.json"] = JSON.stringify(persisted, null, 2);
+
+  const bypass = validateBundleContentCoherence(files).find((issue) => issue.code === "KNOWLEDGE_REQUIREMENT_BYPASSED");
+  assert.ok(bypass);
+  assert.equal(isCapabilityDeltaContractIssue({ type: bypass.code, evidence: bypass.message }), true);
+
+  const repaired = repairCapabilityDeltaContract(files);
+  const restored = JSON.parse(repaired.files["evals/skill-ir.json"]);
+  assert.equal(restored.knowledgeAssessment.status, "insufficient");
+  assert.deepEqual(restored.knowledgeAssessment.requiredGapIds, ["weekly-status-classification"]);
+  assert.equal(validateBundleContentCoherence(repaired.files).some((issue) => issue.code === "KNOWLEDGE_REQUIREMENT_BYPASSED"), false);
+  assert.deepEqual(driftIssues(repaired.files), []);
+});
+
 test("malformed or unknown canonical IR is never replaced with guessed defaults", () => {
   for (const serialized of ["{", "null", "{}", '{"schemaVersion":"99","compiler":"skillcanvas"}']) {
     const files = { "evals/skill-ir.json": serialized, "SKILL.md": "Keep original" };

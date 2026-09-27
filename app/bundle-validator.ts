@@ -1,6 +1,7 @@
 import { auditSkillIRFiles } from "./skill-ir.ts";
 import { hasUnscopedActionPermissionConflict } from "./action-permission.ts";
 import { capabilityDeltaGapIsDefensible, type CapabilityDeltaGap } from "./capability-delta.ts";
+import { knowledgeRequirementBypassReason } from "./knowledge-contract.ts";
 import { danglingPromptDelimiter } from "./eval-prompt.ts";
 import { isFactualScopeAuthorized, type ContentPermission } from "./evidence-gates.ts";
 
@@ -339,9 +340,11 @@ function validateCanonicalSkillValue(files: Record<string, string>, issues: Bund
       }
     });
     const assessment = ir.knowledgeAssessment && typeof ir.knowledgeAssessment === "object" ? ir.knowledgeAssessment as Record<string, unknown> : {};
-    if (gaps.length > 0 && assessment.status === "not-required") {
-      pushIssue(issues, "KNOWLEDGE_REQUIREMENT_BYPASSED", "evals/skill-ir.json", "Capability Delta 已声明专属能力差值，但专业知识被标记为 not-required；必须采集四类知识或明确标记 insufficient");
-    }
+    const assessmentStatus = ["sufficient", "insufficient", "not-required"].includes(String(assessment.status))
+      ? { status: assessment.status as "sufficient" | "insufficient" | "not-required" }
+      : undefined;
+    const bypassReason = knowledgeRequirementBypassReason(delta, assessmentStatus);
+    if (bypassReason) pushIssue(issues, "KNOWLEDGE_REQUIREMENT_BYPASSED", "evals/skill-ir.json", bypassReason);
     const permission = ir.controlModel && typeof ir.controlModel === "object"
       ? (ir.controlModel as Record<string, unknown>).contentPermission
       : null;

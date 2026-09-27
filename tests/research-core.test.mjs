@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   dedupeResearchSources,
   htmlToEvidenceText,
+  parseDeepseekWebSearchResults,
   parseFirecrawlResults,
   parseSearxngResults,
   safeResearchUrl,
@@ -33,4 +34,27 @@ test("provider parsers return inspectable source evidence and deduplicate URLs",
   assert.equal(sources[0].id, "source-1");
   assert.equal(sources[0].retrievedAt, retrievedAt);
   assert.equal(sources[0].authorityTier, "primary");
+});
+
+test("DeepSeek parser accepts only server web-search result records, not model prose or echoed URLs", () => {
+  const results = parseDeepseekWebSearchResults({
+    requested_tool: { type: "web_search_20250305", url: "https://should-not-be-used.example/schema" },
+    content: [
+      { type: "text", text: "I remember https://hallucinated.example from training." },
+      {
+        type: "web_search_tool_result",
+        content: [
+          { type: "web_search_result", title: "Official API guide", url: "https://api-docs.deepseek.com/guides/web-search", page_age: "2026-09-01" },
+          { type: "web_search_result", title: "Unsafe", url: "http://localhost:8787/private" },
+        ],
+      },
+    ],
+  }, "DeepSeek web search documentation");
+
+  assert.deepEqual(results, [{
+    query: "DeepSeek web search documentation",
+    title: "Official API guide",
+    url: "https://api-docs.deepseek.com/guides/web-search",
+    publishedAt: "2026-09-01",
+  }]);
 });

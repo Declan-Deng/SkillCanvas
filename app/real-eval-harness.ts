@@ -238,6 +238,12 @@ export type BenchmarkCaseComparison = {
   skillPassed: boolean;
   failureReason: string;
   dimensionGaps: string[];
+  /** Optional display evidence attached after the anonymous comparison is revealed. */
+  taskPrompt?: string;
+  baselineOutput?: string;
+  skillOutput?: string;
+  blindVerdict?: "baseline" | "candidate" | "tie";
+  comparisonEvidence?: string;
 };
 
 export type BenchmarkComparisonSummary = {

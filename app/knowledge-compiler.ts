@@ -10,6 +10,44 @@ export function knowledgeClientTimeout(provider: string) {
   return knowledgeAttemptTimeout(provider, 1) + knowledgeAttemptTimeout(provider, 2) + 12_000;
 }
 
+/** Verify claims in small bounded batches. A malformed long JSON response is
+ * retried once as two smaller requests; successful verdicts are preserved and
+ * failed batches remain unverified instead of aborting the whole compiler. */
+export async function verifyKnowledgeClaimsInBatches(input: {
+  claims: unknown[];
+  batchSize?: number;
+  call: (claims: unknown[]) => Promise<unknown>;
+}) {
+  const batchSize = Math.max(1, Math.min(6, Math.round(input.batchSize || 4)));
+  const verdicts: unknown[] = [];
+  const failures: string[] = [];
+
+  const visit = async (claims: unknown[], depth = 0): Promise<void> => {
+    if (!claims.length) return;
+    try {
+      const raw = await input.call(claims);
+      const batchVerdicts = raw && typeof raw === "object" && !Array.isArray(raw)
+        ? (raw as Record<string, unknown>).verdicts
+        : null;
+      if (!Array.isArray(batchVerdicts)) throw Object.assign(new Error("知识核验批次缺少完整 verdicts 结构"), { code: "AI_INVALID_JSON" });
+      verdicts.push(...batchVerdicts);
+    } catch (error) {
+      if (claims.length > 1 && depth === 0) {
+        const middle = Math.ceil(claims.length / 2);
+        await visit(claims.slice(0, middle), depth + 1);
+        await visit(claims.slice(middle), depth + 1);
+        return;
+      }
+      failures.push(error instanceof Error ? error.message : "知识核验未完成");
+    }
+  };
+
+  for (let offset = 0; offset < input.claims.length; offset += batchSize) {
+    await visit(input.claims.slice(offset, offset + batchSize));
+  }
+  return { verdicts, failures };
+}
+
 type CompileBatch = { categories: KnowledgeCategory[]; raw: unknown };
 export type KnowledgeCompileCheckpoint = { completed: Record<string, CompileBatch>; split: string[] };
 

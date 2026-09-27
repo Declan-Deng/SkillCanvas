@@ -129,7 +129,7 @@ test("P1 separates research hypotheses from executable permission while preservi
   assert.equal(validateBundleContentCoherence(files).some((issue) => issue.code === "CONTRADICTORY_ACTION_PERMISSION"), true);
 });
 
-test("P1 gate blocks regressed generated Skills with generic delta, bypassed knowledge, truncated evals, and fabricated facts", () => {
+test("P1 gate blocks regressed generated Skills with generic delta, truncated evals, and fabricated facts", () => {
   const files = baseBundle();
   files["evals/skill-ir.json"] = JSON.stringify({
     capabilityDelta: {
@@ -152,10 +152,50 @@ test("P1 gate blocks regressed generated Skills with generic delta, bypassed kno
   const issues = validateBundleContentCoherence(files);
   const codes = new Set(issues.map((issue) => issue.code));
   assert.equal(codes.has("NON_DEFENSIBLE_CAPABILITY_DELTA"), true);
-  assert.equal(codes.has("KNOWLEDGE_REQUIREMENT_BYPASSED"), true);
+  assert.equal(codes.has("KNOWLEDGE_REQUIREMENT_BYPASSED"), false);
   assert.equal(codes.has("UNSUPPORTED_FACT_CREATION"), true);
   assert.equal(codes.has("INCOMPLETE_PROMPT"), true);
   assert.equal(codes.has("BOILERPLATE_INPUT_OVERLAP"), true);
+});
+
+test("knowledge gate accepts contract-only gaps and blocks only external gaps marked not-required", () => {
+  const contractOnly = baseBundle();
+  contractOnly["evals/skill-ir.json"] = JSON.stringify({
+    capabilityDelta: {
+      status: "ready",
+      skillMustTeach: [{
+        id: "wait-for-confirmation",
+        taskDecision: "先交付草稿，再等待真实用户确认后继续修改",
+        bareModelBehavior: "裸模型可能把尚未确认的草稿直接当作最终版本",
+        requiredSkillBehavior: "没有真实用户回复时必须停止，不得自动确认或继续修改",
+        whySkillIsNeeded: "避免把用户尚未确认的内容错误提交为最终结果",
+        knowledgeNeed: "contract-only",
+        researchQuestions: [],
+      }],
+    },
+    knowledgeAssessment: { status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [] },
+  });
+  const contractCodes = new Set(validateBundleContentCoherence(contractOnly).map((issue) => issue.code));
+  assert.equal(contractCodes.has("KNOWLEDGE_REQUIREMENT_BYPASSED"), false);
+
+  const external = structuredClone(contractOnly);
+  external["evals/skill-ir.json"] = JSON.stringify({
+    capabilityDelta: {
+      status: "ready",
+      skillMustTeach: [{
+        id: "weekly-status-classification",
+        taskDecision: "当零散记录同时像进展与风险时，依据专业判据选择主分类",
+        bareModelBehavior: "裸模型可能按关键词误判，混淆已经发生的结果与潜在影响",
+        requiredSkillBehavior: "先区分已发生变化、潜在影响和计划动作，再映射到周报栏目",
+        whySkillIsNeeded: "避免同一事实进入错误栏目并造成主管误判项目状态",
+        knowledgeNeed: "external",
+        researchQuestions: ["专业项目状态报告如何区分进展、风险和计划动作"],
+      }],
+    },
+    knowledgeAssessment: { status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [] },
+  });
+  const externalCodes = new Set(validateBundleContentCoherence(external).map((issue) => issue.code));
+  assert.equal(externalCodes.has("KNOWLEDGE_REQUIREMENT_BYPASSED"), true);
 });
 
 test("source-evidence creation gate respects the user's factual scope", () => {

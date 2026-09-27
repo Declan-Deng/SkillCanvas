@@ -1,7 +1,8 @@
 import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport, isExcludedKnowledge, knowledgeClaimFingerprint, knowledgeDecisionKey, knowledgeSupportChecks, knowledgeGroundingGaps, knowledgeVerificationFailures, type KnowledgeSourceSupport, type KnowledgeVerification } from "./knowledge-evidence.ts";
 import { rankedSourcePassages, sourcePassages, type EvidencePassage } from "./knowledge-passages.ts";
+import { REQUIRED_KNOWLEDGE_CATEGORIES as CONTRACT_KNOWLEDGE_CATEGORIES } from "./knowledge-contract.ts";
 
-export type ResearchProviderId = "disabled" | "firecrawl" | "searxng";
+export type ResearchProviderId = "disabled" | "firecrawl" | "searxng" | "deepseek";
 export type SourceAuthorityTier = "official" | "primary" | "reputable_secondary" | "community" | "unknown";
 
 export type KnowledgePlan = {
@@ -42,7 +43,7 @@ export type KnowledgeAtomType = "official_rule" | "evidence_backed_practice" | "
 export type KnowledgeCategory = "decision_rules" | "failure_modes" | "edge_cases" | "verification_methods";
 export type KnowledgeApplicationMode = "enforced" | "conditional" | "advisory";
 
-export const REQUIRED_KNOWLEDGE_CATEGORIES: KnowledgeCategory[] = ["decision_rules", "failure_modes", "edge_cases", "verification_methods"];
+export const REQUIRED_KNOWLEDGE_CATEGORIES: KnowledgeCategory[] = [...CONTRACT_KNOWLEDGE_CATEGORIES];
 
 export type KnowledgeAtom = {
   id: string;
@@ -266,6 +267,56 @@ export function normalizeKnowledgePlan(value: unknown, taskContext = ""): Knowle
     capabilityDeltaGapIds: list(raw.capabilityDeltaGapIds, 16, 80),
     excludedGenericKnowledge: list(raw.excludedGenericKnowledge, 16, 400),
     userPolicies: list(raw.userPolicies, 32, 600),
+  };
+}
+
+type ExternalKnowledgeGap = {
+  id: string;
+  taskDecision: string;
+  researchQuestions: string[];
+};
+
+/** Keep the model-authored research plan inside the compiler-owned Capability
+ * Delta. The planner may improve publisher vocabulary, but it may not replace
+ * the actual missing decision with nearby presentation or workflow questions. */
+export function alignKnowledgePlanToCapabilityDelta(
+  plan: KnowledgePlan,
+  externalGaps: ExternalKnowledgeGap[],
+  taskContext = "",
+): KnowledgePlan {
+  const gaps = externalGaps.filter((gap) => gap.id && gap.researchQuestions.length > 0);
+  if (!gaps.length) return plan;
+
+  const categoryQueryLabels: Record<KnowledgeCategory, string> = {
+    decision_rules: "decision rules criteria",
+    failure_modes: "failure modes common errors",
+    edge_cases: "edge cases exceptions",
+    verification_methods: "verification methods checklist",
+  };
+  const questions = Array.from(new Set(gaps.flatMap((gap) => list(gap.researchQuestions, 8, 220)))).slice(0, 8);
+  const decisions = Array.from(new Set(gaps.map((gap) => clean(gap.taskDecision, "", 180)).filter(Boolean))).slice(0, 12);
+  const anchor = clean(taskContext, "", 48);
+  const domain = clean(plan.domain, "", 40);
+  const queries = REQUIRED_KNOWLEDGE_CATEGORIES.map((category, index) => {
+    const gap = gaps[index % gaps.length];
+    const question = gap.researchQuestions[index % gap.researchQuestions.length] || gap.taskDecision;
+    // Put the category before the question so the actual missing decision is
+    // never truncated away by the search endpoint's 180-character boundary.
+    return [anchor, domain, categoryQueryLabels[category], clean(question, gap.taskDecision, 100)]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 180);
+  });
+
+  return {
+    ...plan,
+    required: true,
+    knowledgeGaps: decisions.length ? decisions : questions,
+    decisionDimensions: decisions.length ? decisions : questions,
+    capabilityDeltaGapIds: gaps.map((gap) => gap.id),
+    queries,
   };
 }
 

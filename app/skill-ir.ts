@@ -9,10 +9,16 @@ import {
   normalizeAnswerEvidence,
   type ContentPermission,
 } from "./evidence-gates.ts";
-import { EMPTY_CAPABILITY_DELTA, externalCapabilityDeltaGapIds, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta.ts";
+import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta.ts";
 import { EVAL_COMPILER_VERSION } from "./eval-prompt.ts";
 import { hostEvidenceAdapter } from "./host-evidence-adapters.ts";
-import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
+import { hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
+import {
+  REQUIRED_KNOWLEDGE_CATEGORIES,
+  knowledgeRequirementPolicy,
+  normalizeKnowledgeAssessmentForPolicy,
+  type KnowledgeAssessment,
+} from "./knowledge-contract.ts";
 import { assertWorkflowDag, bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, isReadOnlyHostEvidence, normalizeWorkflowDagSteps, workflowCapabilityRouteIssues, WORKFLOW_TERMINALS, type WorkflowDagStep } from "./workflow-dag.ts";
 import { hasUnscopedActionPermissionConflict, reconcileActionPermissionText, reconcileProjectedActionPermissionMarkdown } from "./action-permission.ts";
 import { confirmationCheckpoints, confirmationConflicts, negativeExampleStatement, requirementEvidence, type EvidenceMetadata } from "./user-evidence.ts";
@@ -88,18 +94,7 @@ export type SkillIR = {
     observableIndicators: string[];
   };
   capabilityDelta: CapabilityDelta;
-  knowledgeAssessment: {
-    status: "sufficient" | "insufficient" | "not-required";
-    requiredCategories: string[];
-    coveredCategories: string[];
-    missingCategories: string[];
-    requiredGapIds?: string[];
-    coveredGapIds?: string[];
-    missingGapIds?: string[];
-    observedCategories?: string[];
-    verifiedRuleCount?: number;
-    advisoryRuleCount?: number;
-  };
+  knowledgeAssessment: KnowledgeAssessment;
   tasks: Array<{
     id: string;
     intent: string;
@@ -207,22 +202,16 @@ export type SkillIR = {
   }>;
 };
 
-const REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES = ["decision_rules", "failure_modes", "edge_cases", "verification_methods"];
-
 /** Recompute sufficiency from canonical atoms. Caller-supplied coverage is a
  * hint only; it cannot claim sufficient/not-required while the IR disagrees. */
 export function normalizeKnowledgeAssessment(value: SkillIR["knowledgeAssessment"] | undefined, domainEvidence: unknown[], knowledgeRequired = false, requiredGapIds: string[] = value?.requiredGapIds || []): SkillIR["knowledgeAssessment"] {
-  if (!knowledgeRequired && !requiredGapIds.length && (!value || value.status === "not-required") && domainEvidence.length === 0) {
-    return { status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [] };
-  }
-  const requiredCategories = Array.from(new Set((value?.requiredCategories?.length ? value.requiredCategories : REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES)
-    .filter((category) => REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES.includes(category))));
-  const coverage = assessKnowledgeEvidence(domainEvidence, requiredGapIds, requiredCategories);
-  return {
-    status: coverage.missingCategories.length || coverage.missingGapIds.length || !requiredGapIds.length ? "insufficient" : "sufficient",
-    requiredCategories,
-    ...coverage,
-  };
+  const legacyExplicitRequirement = Boolean(value && value.status !== "not-required" && value.requiredCategories?.length);
+  const required = knowledgeRequired || legacyExplicitRequirement;
+  return normalizeKnowledgeAssessmentForPolicy(value, domainEvidence, {
+    required,
+    requiredGapIds,
+    requiredCategories: required ? [...REQUIRED_KNOWLEDGE_CATEGORIES] : [],
+  });
 }
 
 function permissionEvidenceFingerprint(ir: SkillIR) {
@@ -1067,8 +1056,8 @@ export function compileSkillIR(input: {
   // Normalize at the IR boundary as well as at the API call site so restored
   // sessions and alternate callers cannot persist a gap the validator rejects.
   const capabilityDelta = normalizeCapabilityDelta(input.capabilityDelta || EMPTY_CAPABILITY_DELTA);
-  const externalGapIds = externalCapabilityDeltaGapIds(capabilityDelta);
-  const knowledgeAssessment = normalizeKnowledgeAssessment(input.knowledgeAssessment, domainEvidence, externalGapIds.length > 0, externalGapIds);
+  const knowledgePolicy = knowledgeRequirementPolicy(capabilityDelta);
+  const knowledgeAssessment = normalizeKnowledgeAssessmentForPolicy(input.knowledgeAssessment, domainEvidence, knowledgePolicy);
   const capabilities: SkillIRCapability[] = input.plan.items.filter(activeCapability).map((item) => {
     const necessity = item.necessity ? { ...item.necessity, reason: item.reason || item.deterministicAdvantage || "由资源必要性分析决定" } : fallbackNecessity(item);
     const scope = item.scope || (item.kind === "llm" ? "task-specific" : /当|如果|若|when|if/i.test(item.activationCondition || item.routingCondition) ? "conditional" : "task-specific");
@@ -1969,15 +1958,14 @@ export function projectSkillIRFiles(ir: SkillIR, files: Record<string, string> =
   // validator. This is intentionally deterministic: never ask a repair model
   // to edit compiler-owned Capability Delta rationale.
   const normalizedDelta = normalizeCapabilityDelta(ir.capabilityDelta);
-  const externalGapIds = externalCapabilityDeltaGapIds(normalizedDelta);
+  const knowledgePolicy = knowledgeRequirementPolicy(normalizedDelta);
   const normalizedIR: SkillIR = reconcileSkillIRStateLoops({
     ...ir,
     capabilityDelta: normalizedDelta,
-    knowledgeAssessment: normalizeKnowledgeAssessment(
+    knowledgeAssessment: normalizeKnowledgeAssessmentForPolicy(
       ir.knowledgeAssessment,
       Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
-      externalGapIds.length > 0,
-      externalGapIds,
+      knowledgePolicy,
     ),
   });
   const persistedIR = JSON.parse(JSON.stringify(normalizedIR)) as SkillIR;
@@ -2096,12 +2084,11 @@ export function auditSkillIRFiles(files: Record<string, string>) {
     },
   );
   issues.push(...dag.issues.map((item) => item.message), ...workflowCapabilityRouteIssues(ir.runtimeContract.workflow, ir.capabilities));
-  const externalGapIds = externalCapabilityDeltaGapIds(normalizeCapabilityDelta(ir.capabilityDelta));
-  const canonicalKnowledgeAssessment = normalizeKnowledgeAssessment(
+  const knowledgePolicy = knowledgeRequirementPolicy(ir.capabilityDelta);
+  const canonicalKnowledgeAssessment = normalizeKnowledgeAssessmentForPolicy(
     ir.knowledgeAssessment,
     Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
-    externalGapIds.length > 0,
-    externalGapIds,
+    knowledgePolicy,
   );
   for (const item of ir.domainEvidence || []) {
     if (item && typeof item === "object" && Array.isArray((item as Record<string, unknown>).source_urls)

@@ -1,6 +1,7 @@
 import { normalizeKnowledgeAssessment, projectSkillIRFiles, type SkillIR } from "./skill-ir.ts";
 import type { PipelineIssue } from "./skill-pipeline-core.ts";
-import { externalCapabilityDeltaGapIds, normalizeCapabilityDelta } from "./capability-delta.ts";
+import { normalizeCapabilityDelta } from "./capability-delta.ts";
+import { knowledgeRequirementPolicy } from "./knowledge-contract.ts";
 
 type ContractIssue = Pick<PipelineIssue, "type" | "evidence">;
 
@@ -11,7 +12,8 @@ export function isSkillIRProjectionIssue(issue: ContractIssue) {
 
 export function isCapabilityDeltaContractIssue(issue: ContractIssue) {
   return issue.type === "NON_DEFENSIBLE_CAPABILITY_DELTA"
-    || /\[NON_DEFENSIBLE_CAPABILITY_DELTA\]/.test(issue.evidence);
+    || issue.type === "KNOWLEDGE_REQUIREMENT_BYPASSED"
+    || /\[(?:NON_DEFENSIBLE_CAPABILITY_DELTA|KNOWLEDGE_REQUIREMENT_BYPASSED)\]/.test(issue.evidence);
 }
 
 /** Migrate an already persisted bundle through the same Capability Delta
@@ -25,15 +27,15 @@ export function repairCapabilityDeltaContract(files: Record<string, string>) {
     throw new Error("无法修复 Capability Delta：缺少受支持的 Canonical SkillIR");
   }
   const capabilityDelta = normalizeCapabilityDelta(ir.capabilityDelta);
-  const externalGapIds = externalCapabilityDeltaGapIds(capabilityDelta);
+  const knowledgePolicy = knowledgeRequirementPolicy(capabilityDelta);
   const repairedIR: SkillIR = {
     ...ir,
     capabilityDelta,
     knowledgeAssessment: normalizeKnowledgeAssessment(
       ir.knowledgeAssessment,
       Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
-      externalGapIds.length > 0,
-      externalGapIds,
+      knowledgePolicy.required,
+      knowledgePolicy.requiredGapIds,
     ),
   };
   const candidate = projectSkillIRFiles(repairedIR, files);

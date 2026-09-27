@@ -5048,6 +5048,31 @@ h3 {
   padding: 5px 8px;
 }
 
+.knowledge-query-details {
+  border-top: 1px solid #e5dfd4;
+  color: #46534f;
+  padding: 9px 16px 11px;
+}
+
+.knowledge-query-details summary {
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 750;
+}
+
+.knowledge-query-details ol {
+  display: grid;
+  gap: 6px;
+  margin: 9px 0 0;
+  padding-left: 20px;
+}
+
+.knowledge-query-details li {
+  color: #25332f;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
 .knowledge-validation-note {
   background: rgba(255, 255, 255, 0.56);
   border-top: 1px solid #e5dfd4;
@@ -7668,6 +7693,236 @@ h3 {
   display: block;
   margin-top: 0;
   overflow: hidden;
+}
+
+.ab-comparison-list {
+  display: grid;
+}
+
+.ab-comparison-row {
+  border-bottom: 1px solid #e6e2d9;
+  display: grid;
+  gap: 13px;
+  padding: 19px 20px;
+}
+
+.ab-comparison-row:last-child {
+  border-bottom: 0;
+}
+
+.ab-comparison-head {
+  align-items: start;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.ab-comparison-head > div {
+  display: grid;
+  gap: 5px;
+}
+
+.ab-comparison-head span,
+.ab-comparison-finding > span {
+  color: #70807a;
+  font-size: 8px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+}
+
+.ab-comparison-head strong {
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+.ab-comparison-head em {
+  background: #e2f3ed;
+  border-radius: 999px;
+  color: #137c64;
+  font-size: 8px;
+  font-style: normal;
+  font-weight: 820;
+  padding: 6px 9px;
+  white-space: nowrap;
+}
+
+.ab-comparison-row.tie .ab-comparison-head em {
+  background: #eeece6;
+  color: #69726e;
+}
+
+.ab-comparison-row.baseline .ab-comparison-head em {
+  background: #fee8e3;
+  color: #b74738;
+}
+
+.ab-comparison-finding {
+  background: #f6f8f6;
+  border-radius: 11px;
+  display: grid;
+  gap: 5px;
+  padding: 12px 13px;
+}
+
+.ab-comparison-row.baseline .ab-comparison-finding,
+.ab-comparison-row.tie .ab-comparison-finding {
+  background: #faf7f0;
+}
+
+.ab-comparison-finding p {
+  color: #36453f;
+  font-size: 10px;
+  line-height: 1.6;
+  margin: 0;
+}
+
+.ab-output-details summary,
+.eval-internal-diagnostics summary {
+  align-items: center;
+  color: #65716c;
+  cursor: pointer;
+  display: flex;
+  font-size: 8px;
+  font-weight: 760;
+  justify-content: space-between;
+  list-style: none;
+}
+
+.ab-output-details summary::-webkit-details-marker,
+.eval-internal-diagnostics summary::-webkit-details-marker {
+  display: none;
+}
+
+.ab-output-details summary span,
+.eval-internal-diagnostics summary i {
+  transition: transform 160ms ease;
+}
+
+.ab-output-details[open] summary span,
+.eval-internal-diagnostics[open] summary i {
+  transform: rotate(180deg);
+}
+
+.ab-output-details > div {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-top: 10px;
+}
+
+.ab-output-details section {
+  background: #f8f6f1;
+  border: 1px solid #e7e2d8;
+  border-radius: 10px;
+  min-width: 0;
+  padding: 10px;
+}
+
+.ab-output-details section > span {
+  color: #68736f;
+  display: block;
+  font-size: 8px;
+  font-weight: 800;
+  margin-bottom: 7px;
+}
+
+.ab-output-details pre {
+  color: #32423c;
+  font-family: inherit;
+  font-size: 9px;
+  line-height: 1.55;
+  margin: 0;
+  max-height: 210px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.ab-comparison-empty {
+  align-items: start;
+  display: grid;
+  gap: 7px;
+  justify-items: start;
+  padding: 22px 20px;
+}
+
+.ab-comparison-empty strong {
+  font-size: 13px;
+}
+
+.ab-comparison-empty p {
+  color: #66726d;
+  font-size: 9px;
+  line-height: 1.55;
+  margin: 0;
+}
+
+.ab-comparison-empty button {
+  align-items: center;
+  background: var(--ink);
+  border-radius: 9px;
+  color: white;
+  display: inline-flex;
+  font-size: 9px;
+  font-weight: 780;
+  gap: 8px;
+  margin-top: 4px;
+  padding: 9px 12px;
+}
+
+.eval-internal-diagnostics {
+  border-top: 1px solid #e6e2d9;
+  padding: 14px 20px;
+}
+
+.eval-internal-diagnostics summary > span {
+  display: grid;
+  gap: 2px;
+}
+
+.eval-internal-diagnostics summary strong {
+  color: #4a5953;
+  font-size: 9px;
+}
+
+.eval-internal-diagnostics summary small {
+  color: #89918e;
+  font-size: 8px;
+  font-weight: 500;
+}
+
+.eval-internal-diagnostics summary i {
+  font-style: normal;
+}
+
+.eval-internal-diagnostics > div {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.eval-internal-diagnostics article {
+  background: #f8f7f3;
+  border-radius: 9px;
+  display: grid;
+  gap: 4px;
+  padding: 10px 11px;
+}
+
+.eval-internal-diagnostics article strong {
+  font-size: 9px;
+}
+
+.eval-internal-diagnostics article p,
+.eval-internal-diagnostics article small {
+  color: #69736f;
+  font-size: 8px;
+  line-height: 1.5;
+  margin: 0;
+}
+
+.eval-internal-diagnostics article small {
+  color: #936b1b;
 }
 
 .eval-row {
@@ -11766,6 +12021,26 @@ h3 {
   .eval-report-counts span {
     line-height: 1.35;
     white-space: normal;
+  }
+
+  .ab-comparison-row {
+    padding: 16px 14px;
+  }
+
+  .ab-comparison-head {
+    grid-template-columns: 1fr;
+  }
+
+  .ab-comparison-head em {
+    justify-self: start;
+  }
+
+  .ab-output-details > div {
+    grid-template-columns: 1fr;
+  }
+
+  .eval-internal-diagnostics {
+    padding: 13px 14px;
   }
 
   .eval-row-body {

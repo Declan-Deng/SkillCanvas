@@ -13,7 +13,9 @@ export async function GET(request: Request) {
   const stored = state.config;
   return withSession(tenant, {
     configured: Boolean(stored?.apiKey),
-    researchConfigured: Boolean(stored?.researchApiKey) || stored?.researchProvider === "searxng",
+    researchConfigured: Boolean(stored?.researchApiKey)
+      || stored?.researchProvider === "searxng"
+      || (stored?.researchProvider === "deepseek" && stored.provider === "deepseek" && Boolean(stored.apiKey)),
     managed: state.managed,
     researchManaged: state.researchManaged,
     config: stored ? { ...stored, apiKey: undefined, researchApiKey: undefined } : null,
@@ -47,7 +49,7 @@ export async function POST(request: Request) {
         : "请输入有效的模型 API Key",
     }, 400);
   }
-  const researchProvider = (["disabled", "firecrawl", "searxng"] as string[]).includes(String(body.researchProvider))
+  const researchProvider = (["disabled", "firecrawl", "searxng", "deepseek"] as string[]).includes(String(body.researchProvider))
     ? body.researchProvider as ServerCredentialConfig["researchProvider"]
     : stored?.researchProvider || "disabled";
   const suppliedResearchKey = typeof body.researchApiKey === "string" ? body.researchApiKey.trim() : "";
@@ -55,6 +57,9 @@ export async function POST(request: Request) {
     || (stored?.researchProvider === researchProvider ? stored.researchApiKey : "");
   if (researchProvider === "firecrawl" && researchApiKey.length < 8) {
     return withSession(tenant, { error: "请输入有效的 Firecrawl API Key" }, 400);
+  }
+  if (researchProvider === "deepseek" && provider !== "deepseek") {
+    return withSession(tenant, { error: "DeepSeek 联网搜索需要先选择并配置 DeepSeek 模型服务" }, 400);
   }
   const value: ServerCredentialConfig = {
     provider,
@@ -66,7 +71,13 @@ export async function POST(request: Request) {
     researchBaseUrl: String(body.researchBaseUrl || (stored?.researchProvider === researchProvider ? stored.researchBaseUrl : "") || "").trim().slice(0, 500),
   };
   await saveServerCredentials(tenant.tenantId, value);
-  return withSession(tenant, { ok: true, configured: true, researchConfigured: Boolean(value.researchApiKey) || value.researchProvider === "searxng" });
+  return withSession(tenant, {
+    ok: true,
+    configured: true,
+    researchConfigured: Boolean(value.researchApiKey)
+      || value.researchProvider === "searxng"
+      || (value.researchProvider === "deepseek" && value.provider === "deepseek"),
+  });
 }
 
 export async function DELETE(request: Request) {

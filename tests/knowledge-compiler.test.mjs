@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { compileKnowledgeBatches, knowledgeAttemptTimeout, knowledgeClientTimeout, retainKnowledgeFailure } from "../app/knowledge-compiler.ts";
+import { compileKnowledgeBatches, knowledgeAttemptTimeout, knowledgeClientTimeout, retainKnowledgeFailure, verifyKnowledgeClaimsInBatches } from "../app/knowledge-compiler.ts";
 import { EMPTY_KNOWLEDGE_PACK, normalizeKnowledgePlan, normalizeRetrievedSources } from "../app/knowledge-research.ts";
 
 test("knowledge deadlines cover both attempts without lengthening either attempt", () => {
@@ -48,6 +48,23 @@ test("missing atoms isn't accepted as successful empty knowledge; unrelated erro
   });
   assert.equal(calls, 4);
   assert.equal(result.failures.length, 3);
+});
+
+test("knowledge verification preserves successful verdicts and bounds malformed JSON recovery", async () => {
+  const calls = [];
+  const result = await verifyKnowledgeClaimsInBatches({
+    claims: [1, 2, 3, 4, 5].map((id) => ({ id })),
+    batchSize: 4,
+    call: async (claims) => {
+      calls.push(claims.map((claim) => claim.id));
+      if (claims.length === 4) throw Object.assign(new Error("invalid json"), { code: "AI_INVALID_JSON" });
+      if (claims.some((claim) => claim.id === 3)) throw Object.assign(new Error("still invalid"), { code: "AI_INVALID_JSON" });
+      return { verdicts: claims.map((claim) => ({ id: claim.id })) };
+    },
+  });
+  assert.deepEqual(calls, [[1, 2, 3, 4], [1, 2], [3, 4], [5]]);
+  assert.deepEqual(result.verdicts.map((item) => item.id), [1, 2, 5]);
+  assert.deepEqual(result.failures, ["still invalid"]);
 });
 
 test("compilation failure preserves retrieved sources and verified rules, not false sufficiency", () => {

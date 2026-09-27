@@ -14,7 +14,8 @@ import { contentPermissionConflictLocations, resolveContentPermission } from "..
 import { auditCrossArtifactConsistency } from "../app/skill-pipeline-core.ts";
 import { capabilities, workflow } from "./fixtures/blueprint.mjs";
 import { providerRepairNeedsUserAction } from "../app/eval-prompt.ts";
-import { issuesAreCompilerOwnedEvalCoverage } from "../app/eval-repair-routing.ts";
+import { isCompilerOwnedEvalCoverageIssue } from "../app/eval-repair-routing.ts";
+import { compilerOwnedContractIssues } from "../app/contract-repair-routing.ts";
 
 function fixture(inputName = "合同 PDF", path = "references/contract.pdf") {
   const plan = structuredClone(capabilities.capabilityPlan);
@@ -288,7 +289,7 @@ async function runRepairScenario(responses, options = {}) {
       return { ...files, ...projectSkillIRFiles(bound) };
     },
     validateBundle: async (files) => validate(files), collectP1ContractState: collect,
-    issuesAreCompilerOwnedEvalCoverage,
+    isCompilerOwnedEvalCoverageIssue, compilerOwnedContractIssues,
     isSafeSkillFilePath: (path) => !path.includes(".."),
     allowedP1MutationTypes: () => ["identity.update", "capability.update"], canonicalMutationTargetCatalog: () => ({}),
     setBuildLoop: () => {}, setGenerationLoop: () => {}, setFiles: (files) => events.push({ event: "preserved-files", files }),

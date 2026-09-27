@@ -129,6 +129,52 @@ export function parseFirecrawlResults(payload: unknown, query: string, retrieved
   });
 }
 
+export type DiscoveredResearchSource = {
+  query: string;
+  title: string;
+  url: string;
+  publishedAt: string;
+};
+
+/**
+ * DeepSeek's Anthropic-compatible server tool returns discovery records rather
+ * than trustworthy page text. Only accept records emitted by the
+ * `web_search_result` tool; deliberately ignore the model's final prose so a
+ * hallucinated citation can never enter the evidence pipeline.
+ */
+export function parseDeepseekWebSearchResults(payload: unknown, query: string): DiscoveredResearchSource[] {
+  const discovered: DiscoveredResearchSource[] = [];
+  const seen = new Set<string>();
+  const walk = (value: unknown) => {
+    if (Array.isArray(value)) {
+      value.forEach(walk);
+      return;
+    }
+    if (!value || typeof value !== "object") return;
+    const item = value as Record<string, unknown>;
+    if (item.type === "web_search_result") {
+      const url = cleanText(item.url, 1_200);
+      const safe = safeResearchUrl(url);
+      const normalizedUrl = safe?.toString();
+      if (safe && normalizedUrl && !seen.has(normalizedUrl)) {
+        seen.add(normalizedUrl);
+        discovered.push({
+          query,
+          title: cleanText(item.title, 240) || safe.hostname,
+          url: normalizedUrl,
+          publishedAt: cleanText(item.page_age ?? item.published_at ?? item.publishedAt, 80),
+        });
+      }
+    }
+    Object.values(item).forEach(walk);
+  };
+  // Restrict traversal to returned content. Some APIs echo the requested tool
+  // schema elsewhere in the envelope, which is not proof that a search ran.
+  const content = payload && typeof payload === "object" ? (payload as { content?: unknown }).content : undefined;
+  walk(content);
+  return discovered;
+}
+
 export function dedupeResearchSources(sources: RetrievedKnowledgeSource[], limit = 12, preferredUrls: string[] = []) {
   const seen = new Set<string>();
   const rank = { official: 5, primary: 4, reputable_secondary: 3, community: 2, unknown: 1 } as const;
