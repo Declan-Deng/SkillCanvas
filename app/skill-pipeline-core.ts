@@ -325,6 +325,20 @@ export function capabilityOwnsArtifacts(item: ScopedCapability) {
   return list(item.affects).some((entry) => /^(?:artifact-output|file-output)$/i.test(entry.trim()));
 }
 
+/** Optional catalog tools describe what the host *could* do. They must not
+ * silently turn a text-only task into a file-delivery contract just because a
+ * planner copied a broad `artifact-output` tag. Explicit artifact requests are
+ * promoted later by reconcileArtifactProducerCapabilities, which also makes
+ * the real writer required and testable. */
+export function removeUnrequestedOptionalArtifactOwnership<T extends ScopedCapability>(capabilities: T[], requiresArtifact: boolean) {
+  if (requiresArtifact) return capabilities.map((item) => ({ ...item }));
+  return capabilities.map((item) => {
+    if (item.optional === false || !item.affects?.some((entry) => /^(?:artifact-output|file-output)$/i.test(entry.trim()))) return { ...item };
+    const affects = item.affects.filter((entry) => !/^(?:artifact-output|file-output)$/i.test(entry.trim()));
+    return { ...item, affects } as T;
+  });
+}
+
 /** Close an explicit file-delivery contract with a real runtime owner.
  * The semantic model creates content; a runtime file capability creates the
  * inspectable artifact. Reuse an existing disabled declaration when present

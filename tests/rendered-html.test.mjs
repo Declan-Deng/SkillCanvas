@@ -21,11 +21,16 @@ async function render() {
 test("evaluation UI hides unobserved rows and counts without changing optimization targets", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
-  const report = page.slice(page.indexOf('<section className={`eval-report-panel'), page.indexOf('<div className="finding-card"', page.indexOf('<section className={`eval-report-panel')));
-  assert.match(report, /evals\.map\(\(result, index\) => \{\s*\/\/[^\n]*\n\s*if \(result\.coverage === "not-covered"\) return null;/);
-  assert.match(report, /openOptimization\(index\)/);
+  const reportStart = page.indexOf('<section className="eval-report-panel expanded"');
+  const report = page.slice(reportStart, page.indexOf('<div className="finding-card"', reportStart));
+  assert.match(report, /formalComparisonRows\.length > 0 \? formalComparisonRows\.map/);
+  assert.match(report, /formalImprovementRows\.length/);
+  assert.match(report, /formalGapRows\.length/);
+  assert.match(page, /async function openOptimization\(index: number\)/);
   assert.doesNotMatch(report, /pendingEvals|还没测到|还没有测到|为什么还不能判断|换场景验证/);
-  assert.match(page, /: observedEvals\.length\s*\? "这次表现符合要求"\s*: "本轮结果待评估"/);
+  assert.match(report, /裸模型 vs 当前 Skill · 同题匿名对照/);
+  assert.match(report, /这份 Skill 带来的具体提升/);
+  assert.doesNotMatch(report, /内部观察分|\/100|验证分/);
   assert.match(css, /\.eval-report-counts\s*\{[^}]*repeat\(2, minmax\(72px, 1fr\)\)/);
 });
 
@@ -72,11 +77,15 @@ test("server-renders the SkillCanvas creation experience", async () => {
   assert.match(html, /来帮你/);
   assert.doesNotMatch(html, /你希望 AI 在什么事情上/);
   assert.match(html, /描述需求/);
-  assert.match(html, /预演理解/);
+  assert.match(html, /需求细化/);
+  assert.doesNotMatch(html, /预演理解/);
   assert.match(html, /确认工作方式/);
   assert.match(html, /生成并优化/);
   assert.match(html, /验证效果/);
   assert.match(html, /保存并使用/);
+  assert.match(html, /根据我的英语水平定制每日学习计划/);
+  assert.doesNotMatch(html, /把我的写作习惯做成小红书 Skill/);
+  assert.doesNotMatch(html, /添加你的资料/);
   assert.doesNotMatch(html, /理解你的 AI/);
   assert.doesNotMatch(html, /当前建议/);
   assert.doesNotMatch(html, /“AI 建议”只是提示/);
@@ -122,24 +131,26 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /loop-continue-on-observed-gap/);
   assert.match(page, /loop-stop-or-human-checkpoint/);
   assert.match(page, /Quality gates are acceptance checks/);
-  assert.match(page, /最多 \{loopPlan\.maxRounds\} 回合/);
+  assert.doesNotMatch(page, /最多 \{loopPlan\.maxRounds\} 回合/);
   assert.match(page, /DEFAULT_CAPABILITY_PLAN/);
   assert.match(page, /function createExpandedGoal\(/);
   assert.match(page, /body = reconcileConfirmedContentPolicy\(body, answers\);\s*body = ensureMeaningfulGoal\(body, createExpandedGoal/);
-  assert.match(page, /compilerFixable.*总目标为空、过短或仍是占位内容.*内容限制与用户确认的润色或扩写权限冲突/s);
+  assert.match(page, /compilerFixable.*总目标为空、过短或仍是占位内容.*内容限制与用户确认的事实补写权限冲突/s);
   assert.match(page, /compilerFixable.*USER_PERMISSION_IR_CONFLICT.*USER_PERMISSION_RUNTIME_CONFLICT.*USER_PERMISSION_EVAL_CONFLICT.*UNCONFIRMED_CONTENT_RESTRICTION/s);
   assert.match(page, /function reconcileCapabilityPlanContentPermission\(/);
   assert.match(page, /allMatch\(\/PERMISSION[\s\S]*"capability\.update"[\s\S]*"input\.update"[\s\S]*"risk-branch\.update"/);
   assert.match(page, /function reconcileKnowledgePackContentPermission\(/);
   assert.match(page, /const groundingRubric = contentGroundingRubric\(contentPermission\)/);
   assert.match(page, /const contentPolicyExpected = contentPolicyEvalExpectations\(contentPermission\)/);
-  assert.match(page, /初始 Bundle 尚未通过契约检查/);
-  assert.match(page, /继续修复 Bundle/);
+  assert.match(page, /outcome: "build-blocked"/);
+  assert.match(page, /generationCopy\.action/);
   assert.match(page, /while \(!validation\.executionReady/);
   assert.match(page, /validation\.issues\.filter\(\(issue\) => issue\.priority === "P0"\)/);
   assert.match(page, /async function runP1ContractRepairLoop\(/);
   assert.match(page, /category: "P1_CONTRACT_BLOCKER"/);
-  assert.match(page, /issuesAreCompilerOwnedEvalCoverage/);
+  assert.match(page, /state\.issues\.some\(isCompilerOwnedEvalCoverageIssue\)/);
+  assert.match(page, /compilerOwnedContractIssues\(state\.issues\)/);
+  assert.match(page, /phase: "compiler-contract-routing"/);
   assert.match(page, /Canonical Eval Compiler 已确定性补齐失败模式与全部激活能力的聚焦 Eval/);
   assert.match(page, /reconcileCapabilityPlanWithCanonicalIR/);
   assert.match(page, /optimization-waiting-note/);
@@ -156,7 +167,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /function normalizeSkillDemo\(/);
   assert.match(page, /function createPersonalizedFeedbackOptions\(/);
   assert.match(page, /function createDemoFeedbackFallback\(/);
-  assert.match(page, /function createContextualThinkingWords\(/);
+  assert.match(page, /function WaitingDotField\(/);
+  assert.match(page, /setBusyOutputText\(data\.content\.slice\(0, 16_000\)\)/);
+  assert.doesNotMatch(page, /function createContextualThinkingWords\(/);
   assert.doesNotMatch(page, /THINKING_WORDS/);
   assert.match(page, /function normalizeFeedbackOptions\(/);
   assert.match(page, /function removeGeneratedToolSections\(/);
@@ -178,6 +191,10 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /本地确定性检查/);
   assert.match(page, /Loop 自动推进/);
   assert.match(page, /不代表当前请求超时或正在重试/);
+  assert.match(page, /生成大概需要 5–7 分钟/);
+  assert.match(page, /const BUILD_ESTIMATED_SECONDS = 7 \* 60/);
+  assert.match(page, /Math\.min\(99, Math\.max\(1, Math\.ceil\(\(busyElapsed \/ BUILD_ESTIMATED_SECONDS\) \* 100\)\)\)/);
+  assert.match(page, /aria-label="预计生成进度"/);
   assert.doesNotMatch(page, /busyElapsedSeconds >= 70[\s\S]{0,100}正在执行紧凑重试/);
   assert.match(page, /等待超过 \$\{Math\.round\(timeoutMs \/ 1_000\)\} 秒/);
   assert.match(page, /重试当前步骤/);
@@ -194,7 +211,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /\["build", "repair", "eval-execute", "eval-grade", "eval-compare", "optimization-diagnose", "optimization-patch-plan", "optimization-research", "personalize", "optimization-evidence", "demo", "evaluate"\]\.includes\(mode\)/);
   assert.match(page, /ai_client_transport_retry/);
   assert.match(page, /请求连续两次中断/);
-  assert.match(page, /再次尝试优化/);
+  assert.match(page, /setToast\(resultCopy\.body\)/);
   assert.match(page, /evalBankMatchesCurrentContract/);
   assert.match(page, /Canonical Mutation 无效，正在携带失败证据重规划/);
   assert.match(page, /baselineQualityScore:\s*initialComparison\.baselineScore/);
@@ -203,14 +220,19 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /bestQualityScore:\s*comparison\.skillScore/);
   assert.doesNotMatch(page, /baselineQualityScore:\s*blindResult\.revealedScores/);
   assert.doesNotMatch(page, /user-proof-card|场景正式对照总分|重新跑多场景对照|查看每个冻结场景的真实得分与扣分原因|旧版本分数已隐藏/);
-  assert.match(page, /当前单场景 ·/);
-  assert.match(page, /不与多场景总分直接比较/);
+  assert.match(page, /相比通用 AI/);
+  assert.match(page, /aria-label="裸模型与 Skill 的逐任务对照"/);
+  assert.match(page, /result\.strength \|\| result\.detail/);
+  assert.doesNotMatch(page, /查看具体方面/);
+  assert.doesNotMatch(page, /hidden=\{!evalDetailsOpen\}/);
+  assert.match(page, /这份 Skill 带来的具体提升/);
+  assert.doesNotMatch(page, /不与多场景总分直接比较/);
   assert.match(page, /本次提案=\$\{attempted\}/);
-  assert.match(page, /评测已完成，当前版本处于稳定上限/);
-  assert.match(page, /✓ 已保留最佳版/);
+  assert.match(page, /optimizationStableAtCeiling/);
+  assert.match(page, /generationCopy\.badge/);
   assert.match(page, /generationLoop\.status === "attention" && !optimizationStableAtCeiling/);
-  assert.match(page, /正在运行 Optimization Loop/);
-  assert.match(page, /generationLoop\.status === "running" \? "执行中"/);
+  assert.match(page, /visibleGenerationOutcome/);
+  assert.match(page, /generationCopy\.tone/);
   assert.match(page, /generation_loop_failed/);
   assert.match(page, /ai_client_timeout/);
   assert.match(page, /deliverBrowserNotification/);
@@ -219,7 +241,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /notification_delivery_failed/);
   assert.match(page, /registration\.getNotifications/);
   assert.match(page, /completion-browser-fallback/);
-  assert.match(page, /document\.title = `● \$\{title\} · SkillCanvas`/);
+  assert.match(page, /document\.title = `● \$\{copy\.title\} · SkillCanvas`/);
   assert.match(page, /SkillCanvas 通知已开启/);
   assert.match(page, /compilerClosedArtifactContract/);
   assert.match(page, /reconcileArtifactOutputContract/);
@@ -256,9 +278,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /文件发布检查已通过|还有少量不会阻止下载的提醒/);
   assert.match(page, /bundleAudit.blockers.length > 0 && <div className="finding-card">/);
   assert.match(page, /能力选型结果/);
-  assert.match(page, /目标、子目标与循环/);
-  assert.match(page, /AI 已推荐并采用一条可执行流程/);
-  assert.match(page, /推荐工作流：目标、子目标与循环/);
+  assert.doesNotMatch(page, /AI 已推荐并采用一条可执行流程/);
+  assert.doesNotMatch(page, /✓ 已采用 · \{loopPlan\.label\}/);
+  assert.match(page, /<h3>工作流<\/h3>/);
   assert.match(page, /本次无需额外安装/);
   assert.match(page, /没有为了显得“专业”而机械添加 MCP/);
   assert.match(page, /if \(!normalizedQueries\.length \|\| !mcpConnections\.length\) return empty/);
@@ -285,7 +307,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /mode === "optimization-patch-plan"/);
   assert.match(route, /mode === "optimization-research"/);
   assert.match(route, /compactSkillBundleForOptimization/);
-  assert.match(route, /!\["eval-grade", "eval-execute"\]\.includes\(body\.mode\)/);
+  assert.match(route, /attempt === 1 && body\.mode !== "eval-execute"/);
+  assert.match(route, /"eval-grade", "eval-compare"\]\.includes\(body\.mode\)/);
   assert.match(route, /BASELINE MODE/);
   assert.match(route, /Obey the supplied mutation budget exactly/);
   assert.match(page, /DEFAULT_MUTATION_BUDGET/);
@@ -301,8 +324,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /riskBranches\.slice\(0, 3\)\.map\(friendlyProductRisk\)/);
   assert.match(page, /按条件使用来源可追溯的专业知识/);
   assert.match(css, /-webkit-line-clamp:\s*3/);
-  assert.match(page, /BUILD LOOP · 负责生成并冻结初始架构/);
-  assert.match(page, /OPTIMIZATION LOOP · 只做有证据的局部优化/);
+  assert.match(page, /生成文件检查/);
+  assert.match(page, /自动测试与优化/);
   assert.match(page, /查看已采纳的 \{knowledgePack\.atoms\.length\} 条知识明细/);
   assert.match(page, /<details className="knowledge-atom-details">/);
   assert.match(page, /Notification\.requestPermission\(\)/);
@@ -310,9 +333,14 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /requireInteraction:\s*true/);
   assert.match(page, /renotify:\s*true/);
   assert.match(page, /notifyGenerationLoopResult\(state\)/);
+  assert.match(page, /generationResultCopy\(\{ outcome: state\.outcome/);
+  assert.match(page, /candidateEvalCompletions > 0/);
+  assert.match(page, /generationCopy\.panelBody/);
+  assert.doesNotMatch(page, /const candidateSafelyRejected = state\.status === "attention"/);
   assert.match(page, /完成后通过浏览器通知你/);
   assert.match(page, /项运行能力已采用/);
-  assert.match(page, /adoptedRuntimeCapabilities\.map/);
+  assert.match(page, /coreRuntimeCapabilities\.map/);
+  assert.match(page, /optionalToolCapabilities\.map/);
   assert.match(page, /完成这个任务实际会用到什么/);
   assert.match(page, /runIsolatedEvalHarness/);
   assert.match(page, /三用例执行未完成，仅拆分当前小批次/);
@@ -346,16 +374,21 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /For an expected\.mustNot item, assertion\.passed=true when the forbidden behavior is absent/);
   assert.match(route, /blind A\/B Comparator/);
   assert.match(page, /function enterEvaluation\(\)/);
-  assert.match(page, /onClick=\{enterEvaluation\}/);
-  assert.match(page, /function sendDemoChatMessage\(\)/);
+  assert.match(page, /function handleBuildPrimaryAction\(\)/);
+  assert.match(page, /onClick=\{handleBuildPrimaryAction\}/);
+  assert.match(page, /自动修复并重新生成/);
+  assert.match(page, /function sendDemoChatMessage\(/);
+  assert.match(page, /function continueDemoWithInspiration\(\)/);
   assert.match(page, /function runAutomaticDemoTurns\(/);
   assert.match(page, /demoReplyNeedsUserTurn\(latestReply\)/);
   assert.match(page, /conversationEvidence: episodeConversation/);
   assert.match(page, /已自动续跑/);
   assert.match(page, /自动补充的测试输入/);
+  assert.match(page, /AI 生成并自动发送的测试输入/);
+  assert.match(page, /让 AI 帮我继续/);
   assert.match(page, /function handleDemoChatFiles\(/);
   assert.match(page, /function reevaluateDemoConversation\(/);
-  assert.match(page, /更新评分/);
+  assert.match(page, /更新对比结论/);
   assert.doesNotMatch(page, /次试跑完成/);
   assert.match(page, /restoreFrozenBundleExactly/);
   assert.match(page, /current-format snapshots byte-for-byte/);
@@ -363,11 +396,14 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /async function rerunMultiSceneComparison\(\)/);
   assert.match(page, /demoConversationScoredReplyId/);
   assert.match(page, /hasNewConversationEvidence/);
-  assert.match(page, /先继续对话一轮，AI 回复后即可更新评分/);
+  assert.match(page, /先继续对话一轮，AI 回复后即可更新对比结论/);
   assert.doesNotMatch(page, /completedConversationTurns < 2/);
   assert.match(page, /accept="\.pdf,\.md,\.txt,\.json,\.csv,\.html,\.js,\.ts,\.tsx,\.py"/);
   assert.doesNotMatch(page, /继续试用这个 Skill/);
   assert.match(route, /mode === "demo-chat"/);
+  assert.match(route, /mode === "demo-inspiration"/);
+  assert.match(route, /one plausible next user message/);
+  assert.match(route, /ai_demo_inspiration_invalid/);
   assert.match(route, /continuing the same visible trial/);
   assert.match(route, /"mockTurns"/);
   assert.match(route, /one or two mockTurns/);
@@ -421,8 +457,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /busyProgress/);
   assert.doesNotMatch(page, /current >= 92/);
   assert.match(page, /gateOutcomes\.build\.verdict !== "satisfied"/);
-  assert.match(page, /确定性结构验证完成，初始架构已冻结/);
-  assert.match(page, /当前候选已被保留集与回归证据接受/);
+  assert.match(page, /文件结构检查通过/);
+  assert.match(page, /generationCopy\.panelTitle/);
   assert.doesNotMatch(page, /Demo 不使用“通过”结论/);
   assert.doesNotMatch(route, /Reserve scores above 92/);
   assert.doesNotMatch(page, /const rawContextBundle/);
@@ -541,7 +577,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(css, /\.eval-optimize-button/);
   assert.match(css, /\.optimization-backdrop/);
   assert.match(css, /\.optimization-score-change/);
-  assert.match(css, /\.capability-plan-card/);
+  assert.doesNotMatch(page, /className="capability-plan-card"/);
   assert.match(css, /\.capability-plan-grid/);
   assert.match(css, /grid-template-columns:\s*repeat\(4, minmax\(0, 1fr\)\)/);
   assert.match(css, /\.question-options\.single \.choice-indicator/);
@@ -575,6 +611,24 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(css, /font-size:\s*21\.25px/);
 });
 
+test("validation navigation paints before evaluation starts and exposes exact search queries", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /evaluationLaunchPendingRef/);
+  assert.match(page, /setStep\("evaluate"\)[\s\S]{0,500}requestAnimationFrame/);
+  assert.match(page, /查看实际发送的检索问题/);
+  assert.match(page, /phase: "knowledge-query-plan"/);
+  assert.match(page, /queries: selectedQueries/);
+});
+
+test("saved browser sessions are migrated when the pipeline contract changes", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  assert.match(page, /const SESSION_SCHEMA_VERSION = 2/);
+  assert.match(page, /pipelineContractVersion === PIPELINE_CONTRACT_VERSION/);
+  assert.match(page, /sessionSchemaVersion: SESSION_SCHEMA_VERSION/);
+  assert.match(page, /pipelineContractVersion: PIPELINE_CONTRACT_VERSION/);
+  assert.match(page, /const restoredFiles = restoreFrozenBundleExactly[\s\S]*?: finalizeSkillFiles\(/);
+});
+
 test("keeps the generated Skill editor usable inside the build workspace", async () => {
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const buildStageRule = css.match(/\.build-stage\s*\{([\s\S]*?)\}/)?.[1] ?? "";
@@ -603,6 +657,7 @@ test("records client repair-gate outcomes without bundle content", async () => {
       accepted: true,
       resolved: ["A", "B"],
       blockers: ["C"],
+      queries: ["weekly report fact-preserving rewrite verification"],
       updatedPaths: ["SKILL.md"],
     }),
   }));
@@ -614,6 +669,7 @@ test("records client repair-gate outcomes without bundle content", async () => {
   const diagnosticPayload = await diagnostics.json();
   assert.ok(Array.isArray(diagnosticPayload.entries));
   assert.ok(diagnosticPayload.entries.some((entry) => entry.event === "client_repair_gate_checked"));
+  assert.ok(diagnosticPayload.entries.some((entry) => String(entry.reason || "").includes("weekly report fact-preserving rewrite verification")));
   assert.doesNotMatch(JSON.stringify(diagnosticPayload), /do not log/);
 
   const rejected = await requestWorker(new Request("http://localhost/api/client-log", {
@@ -678,7 +734,7 @@ test("P0 Execution Gate compiles every generated Python file before contract opt
   assert.ok(result.issues.some((issue) => issue.priority === "P0" && issue.code === "PYTHON_COMPILE_ERROR" && issue.path === "evals/artifact_checker.py"));
 });
 
-test("preserves a confirmed permissive content policy instead of injecting generic restrictions", async () => {
+test("distinguishes creative expansion from permission to invent facts", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const start = page.indexOf("function confirmedContentPolicy");
   const end = page.indexOf("function reconcileKnowledgePackContentPermission");
@@ -688,9 +744,11 @@ test("preserves a confirmed permissive content policy instead of injecting gener
     .replaceAll(": string", "");
   const reconcile = new Function("resolveContentPermission", "reconcileContentPermissionText", `${executable}; return reconcileConfirmedContentPolicy;`)(resolveContentPermission, reconcileContentPermissionText);
   const generated = "## Rules\n\n- 禁止编造真实事实、数字、日期、成就。\n- 不虚构经历、数据或资质。\n- 若用户要求编造，礼貌拒绝并解释真实性原则。\n- 保持结构清楚。";
-  const permissive = reconcile(generated, { "evidence-policy": "可以适当润色、修改和合理扩写" });
-  assert.doesNotMatch(permissive, /禁止编造|不虚构|真实性原则/);
-  assert.match(permissive, /保持结构清楚/);
+  const creativeOnly = reconcile(generated, { "evidence-policy": "可以适当润色、修改和合理扩写" });
+  assert.match(creativeOnly, /禁止编造真实事实/);
+  const factualCreation = reconcile(generated, { "evidence-policy": "可以自由补充量化数据和经历" });
+  assert.doesNotMatch(factualCreation, /禁止编造|不虚构|真实性原则/);
+  assert.match(factualCreation, /保持结构清楚/);
   const restrictive = reconcile(generated, { "evidence-policy": "只润色表达，不新增事实，不编造数字" });
   assert.match(restrictive, /禁止编造真实事实/);
   const englishConflict = reconcile("## Rules\n\n- Do not fabricate specific facts, numbers, or proprietary names.\n- You may expand existing content, but do not invent concrete facts.\n- 不把来源没有支持的具体事实补写成确定结论。", { "evidence-policy": "可以随意润色扩写增加经历，帮我更厉害就行" });

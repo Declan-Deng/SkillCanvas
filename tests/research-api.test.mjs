@@ -49,3 +49,51 @@ test("research connection test exercises the actual retrieval path with one resu
   assert.deepEqual(await response.json(), { ok: true, sourceCount: 1 });
   assert.equal(calls, 1);
 });
+
+test("DeepSeek research uses server web search only for discovery and reads source pages before returning evidence", async (t) => {
+  let searchCalls = 0;
+  let evidenceCalls = 0;
+  t.mock.method(globalThis, "fetch", async (url, options = {}) => {
+    if (String(url) === "https://api.deepseek.com/anthropic/v1/messages") {
+      searchCalls++;
+      assert.equal(options.headers["x-api-key"], "test-deepseek-model-key");
+      const request = JSON.parse(options.body);
+      assert.equal(request.model, "deepseek-v4-flash");
+      assert.equal(request.tools[0].type, "web_search_20250305");
+      assert.equal(request.tools[0].max_uses, 1);
+      return Response.json({
+        content: [{
+          type: "web_search_tool_result",
+          content: [{ type: "web_search_result", title: "Official evidence", url: "https://docs.deepseek.example/evidence" }],
+        }, { type: "text", text: "A model-authored summary must not become evidence." }],
+      });
+    }
+    assert.equal(String(url), "https://docs.deepseek.example/evidence");
+    evidenceCalls++;
+    return new Response(`<main><h1>Official evidence</h1><p>${"A concrete professional rule with a condition, action, and exception. ".repeat(8)}</p></main>`, {
+      headers: { "content-type": "text/html; charset=utf-8" },
+    });
+  });
+  const { default: worker } = await import("../dist/server/index.js");
+  const response = await worker.fetch(new Request("http://localhost/api/research", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      provider: "deepseek",
+      modelProvider: "deepseek",
+      modelApiKey: "test-deepseek-model-key",
+      model: "deepseek-v4-flash",
+      preferredDomains: ["docs.deepseek.example"],
+      queries: ["find a verified professional rule"],
+    }),
+  }), { ASSETS: { fetch: async () => new Response("Not found", { status: 404 }) } }, { waitUntil() {}, passThroughOnException() {} });
+
+  assert.equal(response.status, 200);
+  const payload = await response.json();
+  assert.equal(payload.sources.length, 1);
+  assert.equal(payload.sources[0].url, "https://docs.deepseek.example/evidence");
+  assert.match(payload.sources[0].excerpt, /concrete professional rule/);
+  assert.doesNotMatch(payload.sources[0].excerpt, /model-authored summary/);
+  assert.equal(searchCalls, 1);
+  assert.equal(evidenceCalls, 1);
+});

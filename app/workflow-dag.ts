@@ -168,12 +168,17 @@ export function isOptionalToolAvailability(capability: RoutableCapability) {
     && !capability.affects?.some((effect) => /artifact-output|file-output/.test(effect));
 }
 
+function validOptionalCapabilityPlacement(step: WorkflowDagStep, capability: RoutableCapability | undefined, capabilities: RoutableCapability[]) {
+  return Boolean(capability && isOptionalToolAvailability(capability)
+    && ["read", "transform"].includes(step.role || "transform")
+    && !step.mutates.length
+    && step.capabilityIds.some((owner) => capabilities.some((item) => item.id === owner && item.kind === "llm")));
+}
+
 export function workflowCapabilityRouteIssues(steps: WorkflowDagStep[], capabilities: RoutableCapability[]) {
   return steps.flatMap((step) => (step.availableCapabilityIds || []).flatMap((id) => {
     const capability = capabilities.find((item) => item.id === id);
-    return !capability || !isOptionalToolAvailability(capability)
-      || !["read", "transform"].includes(step.role || "transform") || step.mutates.length
-      || !step.capabilityIds.some((owner) => capabilities.some((item) => item.id === owner && item.kind === "llm"))
+    return !validOptionalCapabilityPlacement(step, capability, capabilities)
       ? [`Workflow step ${step.id} 的可选能力 ${id} 无效；必需操作、产物写入与确认不能降级为能力可用性声明`] : [];
   }));
 }
@@ -192,7 +197,28 @@ export function isReadOnlyHostEvidence(capability: RoutableCapability) {
 /** Bind missing runtime steps using declared data, never array position.
  * Ambiguity is intentionally left as an unmet dependency for targeted repair. */
 export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabilities: RoutableCapability[]) {
-  const steps = existing.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], delivers: [...(step.delivers || [])] }));
+  const steps = bindOwnerlessWorkflowSteps(existing.map((step) => ({
+    ...step,
+    requires: [...step.requires],
+    produces: [...step.produces],
+    delivers: [...(step.delivers || [])],
+  })), capabilities);
+  // Restored plans may contain optional providers on a checkpoint, delivery,
+  // mutation, or a capability whose planner-authored metadata drifted. Remove
+  // only the invalid availability edge here. The unrouted provider is then
+  // deterministically rebound below to a real semantic consumer (or remains a
+  // strict explicit operation when it is genuinely required).
+  for (const step of steps) if (step.availableCapabilityIds?.length) {
+    const valid = unique(step.availableCapabilityIds.filter((id) => {
+      const capability = capabilities.find((item) => item.id === id);
+      // Unknown or required providers stay visible to the strict validator;
+      // silently removing them could disguise a missing real operation.
+      if (!capability || !isOptionalToolAvailability(capability)) return true;
+      return validOptionalCapabilityPlacement(step, capability, capabilities);
+    }));
+    if (valid.length) step.availableCapabilityIds = valid;
+    else delete step.availableCapabilityIds;
+  }
   const needsBinding = new Set<string>();
   for (const step of steps) {
     const owners = capabilities.filter((item) => step.capabilityIds.includes(item.id));
@@ -205,8 +231,12 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
   }
   const routed = new Set(steps.flatMap((step) => [...step.capabilityIds, ...(step.availableCapabilityIds || [])]));
   const missing = capabilities.filter((item) => !routed.has(item.id));
+  const autoAddedOptional = new Set<string>();
   for (const item of missing) {
-    if (item.kind === "reference" && item.affects?.includes("runtime-workflow")) {
+    if (item.kind === "reference") {
+      // A reference is guidance consumed by a semantic operation regardless
+      // of optional affects metadata. Its activation/fallback contract stays
+      // on the capability; do not manufacture an unused data-producing task.
       const consumers = steps.filter((step) => step.capabilityIds.some((id) => capabilities.some((capability) => capability.id === id && capability.kind === "llm")) && !pauseTerminalForStep(step));
       if (consumers.length) {
         // Reference reading is part of its consumer's operation, not a
@@ -215,8 +245,28 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
         continue;
       }
     }
-    const persist = /artifact-output|file-output/.test((item.affects || []).join(" "))
-      || (!isOptionalToolAvailability(item) && /(?:保存|写入|导出|save|write|export).{0,24}(?:文件|file|artifact|pdf|docx|csv)/i.test(`${item.requirement} ${item.output}`));
+    // A planner may describe a deterministic validator with the exact script
+    // name/action but omit its capability id. Bind a single strong semantic
+    // match to that existing operation instead of manufacturing a duplicate
+    // helper node. Ties remain explicit compiler errors.
+    if (item.kind === "script") {
+      const scored = steps.filter((step) => !["await-input", "await-approval", "deliver"].includes(step.role || ""))
+        .map((step) => ({ step, score: ownerMatchScore(step, item) }));
+      const best = scored.length ? Math.max(...scored.map((entry) => entry.score)) : 0;
+      const matches = scored.filter((entry) => entry.score === best && entry.score >= 8);
+      if (matches.length === 1) {
+        matches[0].step.capabilityIds = unique([...matches[0].step.capabilityIds, item.id]);
+        continue;
+      }
+    }
+    // A catalog capability that is explicitly optional is runtime
+    // availability, even if it *can* write files. The artifact compiler turns
+    // it into optional=false when this particular task really promises a file;
+    // only that required form becomes a persist node.
+    const persist = !isOptionalToolAvailability(item) && (
+      /artifact-output|file-output/.test((item.affects || []).join(" "))
+      || /(?:保存|写入|导出|save|write|export).{0,24}(?:文件|file|artifact|pdf|docx|csv)/i.test(`${item.requirement} ${item.output}`)
+    );
     const step: WorkflowDagStep = {
       id: `step-capability-${item.id}`, capabilityIds: [item.id], when: item.activationCondition || item.routingCondition || "执行相关任务时",
       input: item.input, action: item.purpose || item.requirement || item.id, output: item.output, fallback: item.fallback,
@@ -224,6 +274,7 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
       role: persist ? "persist" : item.kind === "reference" ? "read" : "transform",
     };
     steps.push({ ...step, delivers: [] });
+    if (isOptionalToolAvailability(item)) autoAddedOptional.add(step.id);
     needsBinding.add(step.id);
   }
   for (const step of steps.filter((entry) => needsBinding.has(entry.id))) {
@@ -310,7 +361,16 @@ export function bindWorkflowCapabilities(existing: WorkflowDagStep[], capabiliti
     });
     folded.add(helper.id);
   }
-  return bindOwnerlessWorkflowSteps(steps.filter((step) => !folded.has(step.id)), capabilities);
+  // Optional availability is not a scheduled operation. When no real consumer
+  // can absorb an auto-created helper, retaining its fake output makes an
+  // otherwise valid workflow fail as an orphan. Required tools and any helper
+  // whose product is actually consumed remain strict graph operations.
+  const unusedOptional = new Set(steps.filter((helper) => autoAddedOptional.has(helper.id)
+    && !folded.has(helper.id) && !helper.mutates.length && !helper.delivers?.length && !helper.resumeProduces?.length
+    && !steps.some((consumer) => consumer.id !== helper.id && helper.produces.some((token) => [
+      ...consumer.requires, ...consumer.mutates, ...(consumer.delivers || []),
+    ].includes(token)))).map((helper) => helper.id));
+  return bindOwnerlessWorkflowSteps(steps.filter((step) => !folded.has(step.id) && !unusedOptional.has(step.id)), capabilities);
 }
 
 /** Compile a real DAG. Dependencies may be satisfied only by declared initial
@@ -363,7 +423,11 @@ export function compileWorkflowDag(steps: WorkflowDagStep[], initialInputs: stri
   const indegree = new Map(steps.map((step) => [step.id, 0]));
   const outgoing = new Map(steps.map((step) => [step.id, new Set<string>()]));
   for (const step of steps) {
+    const pause = pauseTerminalForStep(step);
     for (const token of step.input.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || []) {
+      // A checkpoint may name its own emitted pause marker as the UI/control
+      // input. It is not business data and must not create a self-dependency.
+      if (token === pause) continue;
       if (!step.requires.some((dependency) => dependency === token || token.startsWith(`${dependency}.`))) issues.push({ type: "unmet-dependency", stepId: step.id, dependency: token, message: `Workflow step ${step.id} 读取 ${token}，但 requires[] 未声明该输入` });
     }
     for (const target of step.mutates) {
@@ -411,9 +475,33 @@ export function compileWorkflowDag(steps: WorkflowDagStep[], initialInputs: stri
     seen.add(from);
     return [...(outgoing.get(from) || [])].some((next) => next === to || precedes(next, to, seen));
   };
+  const isTerminalBranch = (step: WorkflowDagStep) => ["deliver", "persist"].includes(step.role || "")
+    && step.produces.some((token) => terminalOutputSet.has(token));
+  // Only content handoffs separated by a real user-feedback event may commit
+  // alternative versions of the same internal result. Terminal status alone
+  // proves neither exclusivity nor ordering. External writes always require
+  // normal dependency ordering, including writes in a revision path.
+  const isFeedbackVersionPair = (earlier: WorkflowDagStep, later: WorkflowDagStep) => {
+    if (earlier.role !== "deliver" || later.role !== "deliver"
+      || !earlier.delivers?.length || !later.delivers?.length
+      || earlier.delivers.some((token) => later.delivers!.includes(token))) return false;
+    return steps.some((checkpoint) => {
+      if (!pauseTerminalForStep(checkpoint) || !checkpoint.resumeProduces?.length
+        || !precedes(checkpoint.id, later.id) || precedes(checkpoint.id, earlier.id)) return false;
+      // The pre-feedback handoff must derive from the very artifact being
+      // reviewed, not merely share a request or a state field.
+      return checkpoint.requires.some((token) => {
+        if (initial.has(token) || isTerminal(token)) return false;
+        const owner = producerByToken.get(token);
+        return earlier.delivers!.includes(token) || Boolean(owner && precedes(owner, earlier.id));
+      });
+    });
+  };
   for (const writer of steps) for (const token of writer.mutates) {
     for (const other of steps) {
       if (other.id === writer.id || (!other.requires.includes(token) && !other.mutates.includes(token))) continue;
+      if (other.mutates.includes(token) && isTerminalBranch(writer) && isTerminalBranch(other)
+        && (isFeedbackVersionPair(writer, other) || isFeedbackVersionPair(other, writer))) continue;
       if (!precedes(writer.id, other.id) && !precedes(other.id, writer.id)) issues.push({
         type: "unordered-mutation", stepId: writer.id, dependency: token,
         message: `${writer.id} 与 ${other.id} 对 ${token} 存在未排序的读写/写写冲突；请用产生的版本或完成令牌声明先后依赖`,

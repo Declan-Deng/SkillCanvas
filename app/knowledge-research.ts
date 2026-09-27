@@ -1,7 +1,8 @@
-import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport, isExcludedKnowledge, knowledgeClaimFingerprint, knowledgeDecisionKey, knowledgeSupportChecks, knowledgeGroundingGaps, type KnowledgeSourceSupport, type KnowledgeVerification } from "./knowledge-evidence.ts";
+import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport, isExcludedKnowledge, knowledgeClaimFingerprint, knowledgeDecisionKey, knowledgeSupportChecks, knowledgeGroundingGaps, knowledgeVerificationFailures, type KnowledgeSourceSupport, type KnowledgeVerification } from "./knowledge-evidence.ts";
 import { rankedSourcePassages, sourcePassages, type EvidencePassage } from "./knowledge-passages.ts";
+import { REQUIRED_KNOWLEDGE_CATEGORIES as CONTRACT_KNOWLEDGE_CATEGORIES } from "./knowledge-contract.ts";
 
-export type ResearchProviderId = "disabled" | "firecrawl" | "searxng";
+export type ResearchProviderId = "disabled" | "firecrawl" | "searxng" | "deepseek";
 export type SourceAuthorityTier = "official" | "primary" | "reputable_secondary" | "community" | "unknown";
 
 export type KnowledgePlan = {
@@ -42,7 +43,7 @@ export type KnowledgeAtomType = "official_rule" | "evidence_backed_practice" | "
 export type KnowledgeCategory = "decision_rules" | "failure_modes" | "edge_cases" | "verification_methods";
 export type KnowledgeApplicationMode = "enforced" | "conditional" | "advisory";
 
-export const REQUIRED_KNOWLEDGE_CATEGORIES: KnowledgeCategory[] = ["decision_rules", "failure_modes", "edge_cases", "verification_methods"];
+export const REQUIRED_KNOWLEDGE_CATEGORIES: KnowledgeCategory[] = [...CONTRACT_KNOWLEDGE_CATEGORIES];
 
 export type KnowledgeAtom = {
   id: string;
@@ -228,12 +229,13 @@ function clampConfidence(value: unknown) {
   return Math.max(0, Math.min(1, Math.round(number * 100) / 100));
 }
 
-export function normalizeKnowledgePlan(value: unknown): KnowledgePlan {
+export function normalizeKnowledgePlan(value: unknown, taskContext = ""): KnowledgePlan {
   const raw = record(value);
   const freshness = ["stable", "recent", "live"].includes(String(raw.freshness)) ? raw.freshness as KnowledgePlan["freshness"] : "stable";
   const rawQueries = list(raw.queries, 4, 180);
   const gaps = list(raw.knowledgeGaps, 8, 220);
   const domain = clean(raw.domain, "当前任务领域", 100);
+  const taskAnchor = clean(taskContext || raw.taskContext, "", 180);
   const categoryQueryLabels: Record<KnowledgeCategory, string> = {
     decision_rules: "决策规则 判断条件",
     failure_modes: "失败模式 常见错误",
@@ -241,7 +243,14 @@ export function normalizeKnowledgePlan(value: unknown): KnowledgePlan {
     verification_methods: "验证方法 验收检查",
   };
   const queries = rawQueries.length
-    ? REQUIRED_KNOWLEDGE_CATEGORIES.map((category, index) => rawQueries[index] || `${domain} ${gaps[index % Math.max(1, gaps.length)] || "核心任务"} ${categoryQueryLabels[category]}`.trim())
+    ? REQUIRED_KNOWLEDGE_CATEGORIES.map((category, index) => {
+      const rawQuery = rawQueries[index] || rawQueries[0] || "";
+      const gap = gaps[index % Math.max(1, gaps.length)] || "核心任务";
+      // Keep every search tied to the actual task and one capability gap.
+      // Generic protocol words such as “schedule” or “format” otherwise drift
+      // into unrelated standards while still looking authoritative.
+      return [taskAnchor, domain, gap, categoryQueryLabels[category], rawQuery].filter(Boolean).join(" ").trim().slice(0, 420);
+    })
     : [];
   const explicitDimensions = list(raw.decisionDimensions, 12, 120);
   const decisionDimensions = Array.from(new Set([...explicitDimensions, ...gaps])).slice(0, 12);
@@ -258,6 +267,56 @@ export function normalizeKnowledgePlan(value: unknown): KnowledgePlan {
     capabilityDeltaGapIds: list(raw.capabilityDeltaGapIds, 16, 80),
     excludedGenericKnowledge: list(raw.excludedGenericKnowledge, 16, 400),
     userPolicies: list(raw.userPolicies, 32, 600),
+  };
+}
+
+type ExternalKnowledgeGap = {
+  id: string;
+  taskDecision: string;
+  researchQuestions: string[];
+};
+
+/** Keep the model-authored research plan inside the compiler-owned Capability
+ * Delta. The planner may improve publisher vocabulary, but it may not replace
+ * the actual missing decision with nearby presentation or workflow questions. */
+export function alignKnowledgePlanToCapabilityDelta(
+  plan: KnowledgePlan,
+  externalGaps: ExternalKnowledgeGap[],
+  taskContext = "",
+): KnowledgePlan {
+  const gaps = externalGaps.filter((gap) => gap.id && gap.researchQuestions.length > 0);
+  if (!gaps.length) return plan;
+
+  const categoryQueryLabels: Record<KnowledgeCategory, string> = {
+    decision_rules: "decision rules criteria",
+    failure_modes: "failure modes common errors",
+    edge_cases: "edge cases exceptions",
+    verification_methods: "verification methods checklist",
+  };
+  const questions = Array.from(new Set(gaps.flatMap((gap) => list(gap.researchQuestions, 8, 220)))).slice(0, 8);
+  const decisions = Array.from(new Set(gaps.map((gap) => clean(gap.taskDecision, "", 180)).filter(Boolean))).slice(0, 12);
+  const anchor = clean(taskContext, "", 48);
+  const domain = clean(plan.domain, "", 40);
+  const queries = REQUIRED_KNOWLEDGE_CATEGORIES.map((category, index) => {
+    const gap = gaps[index % gaps.length];
+    const question = gap.researchQuestions[index % gap.researchQuestions.length] || gap.taskDecision;
+    // Put the category before the question so the actual missing decision is
+    // never truncated away by the search endpoint's 180-character boundary.
+    return [anchor, domain, categoryQueryLabels[category], clean(question, gap.taskDecision, 100)]
+      .filter(Boolean)
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 180);
+  });
+
+  return {
+    ...plan,
+    required: true,
+    knowledgeGaps: decisions.length ? decisions : questions,
+    decisionDimensions: decisions.length ? decisions : questions,
+    capabilityDeltaGapIds: gaps.map((gap) => gap.id),
+    queries,
   };
 }
 
@@ -374,7 +433,6 @@ export function buildKnowledgeEvidencePayload(sources: RetrievedKnowledgeSource[
 function behaviorChanging(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" | "action" | "type">) {
   const combined = `${atom.knowledge} ${atom.appliesWhen} ${atom.action}`;
   const onlyGeneric = /^(?:保持|做到|确保|需要|应该|尽量|注意)?\s*(?:专业|清晰|准确|自然|简洁|高质量|有逻辑|吸引人|完整)[，。、\s]*(?:专业|清晰|准确|自然|简洁|高质量|有逻辑|吸引人|完整)*[。.!！]?$/i.test(combined.trim());
-  const hasOperation = /检查|比较|识别|计算|验证|询问|停止|升级|记录|读取|引用|标记|分类|排序|保留|排除|转换|匹配|分支|触发|采用|使用|依据|按照|拆分|合并|重组|重写|改写|补充|删除|替换|提取|校准|映射|分配|选择|优先|降低|增加|输出|生成|review|verify|compare|calculate|classify|route|stop|use|apply|select|rank|rewrite|extract|map/i.test(atom.action);
   const hasDecisionMechanism = /分为|分级|等级|矩阵|权重|优先级|证据强度|信号|阈值|比较|记录.{0,20}缺口|先.{0,20}再|若.{0,40}则|当.{0,40}时|冲突|例外|取舍|回退|失败|映射|覆盖率|taxonomy|matrix|weight|priority|evidence tier|threshold|exception|trade-?off|fallback/i.test(combined);
   const hasNamedMechanism = /\b[A-Z][A-Z0-9/+.-]{2,12}\b|[\u4e00-\u9fff]{2,12}(?:法则|方法|模型|矩阵|框架|分层|分级|分类|结构|检查表|清单|评分卡)/i.test(combined);
   const genericRestatement = /(?:分析|提取|理解|识别).{0,24}(?:关键词|要求|信息|重点).{0,40}(?:突出|匹配|优化|调整|生成).{0,24}(?:内容|结果|表达|方案)/i.test(combined);
@@ -384,6 +442,10 @@ function behaviorChanging(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" 
   const specializedType = ["official_rule", "failure_pattern", "exception", "terminology"].includes(atom.type);
   const presentationContractRestatement = /(?:列名|表头|字段顺序|章节顺序|column names).{0,20}(?:固定|必须为|指定为|must be)|(?:固定|指定).{0,20}(?:列名|表头|字段顺序|章节顺序)/i.test(combined)
     && !/(?:标准|规范|协议|schema.org|RFC|ISO|国家标准|行业标准).{0,40}(?:字段|格式|结构)/i.test(combined);
+  // Keep this deterministic pass recall-oriented. Domain verbs and methods are
+  // open-ended (and multilingual), so a finite action vocabulary must never be
+  // an admission requirement. Evidence entailment and executability are judged
+  // by the downstream semantic verifier before anything is published.
   return !onlyGeneric
     && !presentationContractRestatement
     && !genericQualityAdvice
@@ -391,7 +453,6 @@ function behaviorChanging(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" 
     && atom.knowledge.length >= 12
     && atom.appliesWhen.length >= 4
     && atom.action.length >= 10
-    && hasOperation
     && (hasDecisionMechanism || hasNamedMechanism || specializedType || atom.action.length >= 24);
 }
 
@@ -401,14 +462,12 @@ function behaviorChanging(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" 
 function referenceValuable(atom: Pick<KnowledgeAtom, "knowledge" | "appliesWhen" | "action">) {
   const combined = `${atom.knowledge} ${atom.appliesWhen} ${atom.action}`;
   const genericQualityAdvice = /^(?:保持|确保|使用|采用|提升|优化)?\s*(?:专业|清晰|准确|自然|简洁|高质量|有逻辑|吸引人|完整)[，。、\s]*$/i.test(atom.action);
-  const hasConcreteMethod = /检查|比较|识别|计算|验证|询问|记录|读取|引用|标记|分类|排序|保留|排除|转换|匹配|分支|触发|采用|拆分|合并|重组|重写|改写|补充|删除|替换|提取|校准|映射|分配|选择|优先|降低|增加|输出|生成|review|verify|compare|calculate|classify|route|use|apply|select|rank|rewrite|extract|map/i.test(atom.action);
   const hasSpecificStructure = /分为|分级|等级|矩阵|权重|优先级|信号|阈值|先.{0,20}再|若.{0,40}则|当.{0,40}时|冲突|例外|取舍|回退|失败|映射|覆盖率|taxonomy|matrix|weight|priority|threshold|exception|fallback|\b[A-Z][A-Z0-9/+.-]{2,12}\b|[\u4e00-\u9fff]{2,12}(?:法则|方法|模型|矩阵|框架|分层|分级|分类|结构|检查表|清单|评分卡)/i.test(combined);
   return !genericQualityAdvice
     && atom.knowledge.length >= 12
     && atom.appliesWhen.length >= 4
     && atom.action.length >= 10
-    && hasConcreteMethod
-    && hasSpecificStructure;
+    && (hasSpecificStructure || atom.action.length >= 24);
 }
 
 function knowledgeApplicationMode(input: {
@@ -914,12 +973,24 @@ export function applyKnowledgeVerification(pack: KnowledgePack, raw: unknown, pr
       verifiedGapIds: list(result.verifiedGapIds, 16, 80), reason: clean(result.reason, "知识证据核验缺失或未通过", 400),
       supportChecks: (Array.isArray(result.supportChecks) ? result.supportChecks : []).map(record).map((check) => ({
         id: String(check.id || ""), reason: clean(check.reason, "", 400),
+        ...(typeof check.supported === "boolean" ? { supported: check.supported } : {}),
         sourceIndexes: Array.isArray(check.sourceIndexes) ? check.sourceIndexes.filter((index): index is number => typeof index === "number") : [],
       })),
     };
-    const verified = { ...atom, verification };
+    // A claim may be relevant to several planned gaps while the independent
+    // reviewer verifies only some of them. Keep that supported subset instead
+    // of discarding the whole source-backed rule. No wording or evidence is
+    // changed, and every other verification gate still applies.
+    const supportedGapIds = atom.gapIds.filter((id) => verification.verifiedGapIds.includes(id));
+    const narrowed = result.fingerprint === knowledgeClaimFingerprint(atom)
+      && supportedGapIds.length > 0 && supportedGapIds.length < atom.gapIds.length
+      ? { ...atom, gapIds: supportedGapIds }
+      : atom;
+    if (narrowed !== atom) verification.fingerprint = knowledgeClaimFingerprint(narrowed);
+    const verified = { ...narrowed, verification };
     if (hasVerifiedKnowledgeSupport(verified)) return [verified];
-    rejected.push(`「${atom.title}」未采用：${verification.reason}`);
+    const failures = knowledgeVerificationFailures(verified);
+    rejected.push(`「${atom.title}」未采用：${failures.slice(0, 3).join("；") || "核验未通过"}；核验说明：${verification.reason}`);
     return [];
   });
   const distinct = atoms.filter((atom) => {

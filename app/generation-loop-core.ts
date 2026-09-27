@@ -103,7 +103,11 @@ export function artifactDeliveryRequested(description: string) {
 export function reusableOutputAssetRequested(description: string) {
   const outputShape = /模板|范本|版式|表头|字段顺序|输出格式|交付格式|template|layout|schema/i;
   const reuse = /复用|保存|固定|以后|后续|每次|默认|长期|写入技能包|remember|reuse/i;
-  return description.split(/[\n；;]/).some((segment) => outputShape.test(segment) && reuse.test(segment));
+  // A fixed Markdown layout can live in the Skill instructions. Creating a
+  // runtime asset requires evidence of a reusable file, not just a recurring
+  // formatting preference such as "固定模板格式".
+  const file = /\b(?:csv|xlsx?|excel|docx?|pptx?|pdf|json|html?)\b|\.md\b|模板文件|文件模板|可下载.{0,8}模板|template file/i;
+  return description.split(/[\n；;]/).some((segment) => outputShape.test(segment) && reuse.test(segment) && file.test(segment));
 }
 
 export function reconcileArtifactOutputContract(input: {

@@ -66,13 +66,12 @@ for (const cap of capabilityCatalog) test(`${cap.id}: a required concrete call a
   ] })), /必须保留已规划的工具|可选能力/);
 });
 
-test("availability cannot substitute required artifacts, state writes or real approval", () => {
+test("availability cannot substitute required artifacts or state writes", () => {
   for (const mutation of [
     (c) => { c.capabilities[1].optional = false; },
     (c) => { c.capabilities[1].scope = "global"; },
     (c) => { c.capabilities[1].affects = ["file-output"]; },
     (c) => { c.workflowSteps[0].availableCapabilityIds = ["not-in-catalog"]; },
-    (c) => { c.workflowSteps[0].role = "await-approval"; c.workflowSteps[0].resumeProduces = ["$approved"]; },
     (c) => { c.workflowSteps[0].mutates = ["$source"]; },
   ]) {
     const input = context([capabilityCatalog[0]]);

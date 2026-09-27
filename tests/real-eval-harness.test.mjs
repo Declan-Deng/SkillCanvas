@@ -122,6 +122,23 @@ test("collapses capability cases into bounded two-turn episodes", () => {
   assert.ok(episodes.some((item) => item.expected.behaviors.some((behavior) => /最终一轮交付/.test(behavior))));
 });
 
+test("an episode waiting for a real reply checks safe intermediate work, not a premature final report", () => {
+  const source = [{
+    ...cases()[0],
+    context: { workflow_checkpoint: "required-value-missing", actual_task: "整理本周记录" },
+    expected: {
+      behaviors: ["交付与当前工作流阶段一致、可检查的安全中间结果；必要输入或确认缺失时，不要求最终产物，且不得提前越过用户指定的成稿或定稿节点"],
+      mustNot: ["缺口未补齐时生成完整周报"],
+      artifacts: [],
+    },
+  }];
+  const episode = composeEvaluationEpisodes(source, 1)[0];
+  assert.equal(episode.context.expectedStage, "await-user-reply");
+  assert.match(episode.expected.behaviors.join("；"), /符合当前工作流阶段的可检查中间结果/);
+  assert.doesNotMatch(episode.expected.behaviors.join("；"), /最终一轮交付可直接检查的任务结果/);
+  assert.deepEqual(episode.expected.mustNot.filter((item) => /完整周报/.test(item)), ["缺口未补齐时生成完整周报"]);
+});
+
 test("grading payload keeps final artifacts without repeating executor metadata", () => {
   const compact = compactHarnessExecutionsForGrade([{
     runId: "run-1",

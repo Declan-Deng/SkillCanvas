@@ -24,7 +24,7 @@ export type ServerCredentialConfig = {
   model: string;
   baseUrl: string;
   apiKey: string;
-  researchProvider: "disabled" | "firecrawl" | "searxng";
+  researchProvider: "disabled" | "firecrawl" | "searxng" | "deepseek";
   researchApiKey: string;
   researchBaseUrl: string;
 };
@@ -238,7 +238,9 @@ export function sharedServerCredentialsFromEnv(source: RuntimeEnv): ServerCreden
     : "deepseek";
   const researchApiKey = source.SKILLCANVAS_SHARED_RESEARCH_API_KEY?.trim() || "";
   const requestedResearchProvider = source.SKILLCANVAS_SHARED_RESEARCH_PROVIDER?.trim().toLowerCase();
-  const researchProvider: ServerCredentialConfig["researchProvider"] = requestedResearchProvider === "searxng"
+  const researchProvider: ServerCredentialConfig["researchProvider"] = requestedResearchProvider === "deepseek" && provider === "deepseek"
+    ? "deepseek"
+    : requestedResearchProvider === "searxng"
     ? "searxng"
     : requestedResearchProvider === "firecrawl" && researchApiKey.length >= 8
       ? "firecrawl"

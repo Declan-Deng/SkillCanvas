@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { sourcePassages, selectKnowledgeQueries } from "../app/knowledge-passages.ts";
-import { buildKnowledgeEvidencePayload, normalizeKnowledgePack, normalizeKnowledgePlan, normalizeRetrievedSources, applyKnowledgeVerification, knowledgeVerificationCandidates } from "../app/knowledge-research.ts";
+import { alignKnowledgePlanToCapabilityDelta, buildKnowledgeEvidencePayload, normalizeKnowledgePack, normalizeKnowledgePlan, normalizeRetrievedSources, applyKnowledgeVerification, knowledgeVerificationCandidates } from "../app/knowledge-research.ts";
 import { dedupeResearchSources } from "../app/research-core.ts";
 
 const url = "https://docs.example.com/import";
@@ -61,6 +61,25 @@ test("preferred publishers guide half the queries without removing open discover
   assert.match(queries[2], /site:standards.org/);
   assert.equal(queries[3], "verification");
   assert.equal(selectKnowledgeQueries(["query"], ["bad.example OR arbitrary query"])[0], "query");
+});
+
+test("research planning cannot drift away from the external capability delta", () => {
+  const modelPlan = normalizeKnowledgePlan({
+    required: true,
+    domain: "管理周报",
+    knowledgeGaps: ["Markdown 表格格式", "空段占位符"],
+    queries: ["weekly report markdown", "TBD placeholder", "formatting", "minimal edits"],
+  }, "我要做一个每周汇报助手");
+  const aligned = alignKnowledgePlanToCapabilityDelta(modelPlan, [{
+    id: "no-fabricated-facts-numbers",
+    taskDecision: "区分安全补写与新增事实",
+    researchQuestions: ["如何在改写零散工作记录时区分语言补全、推断和新增事实或数字"],
+  }], "我要做一个每周汇报助手");
+  assert.deepEqual(aligned.capabilityDeltaGapIds, ["no-fabricated-facts-numbers"]);
+  assert.deepEqual(aligned.knowledgeGaps, ["区分安全补写与新增事实"]);
+  assert.equal(aligned.queries.length, 4);
+  assert.ok(aligned.queries.every((query) => /区分语言补全、推断和新增事实或数字/.test(query)));
+  assert.ok(aligned.queries.every((query) => !/Markdown|占位符|TBD/i.test(query)));
 });
 
 test("a concrete file-parsing failure is not rejected as a user presentation preference", () => {

@@ -1,24 +1,28 @@
 "use client";
 
 import { classifyUserEvidence, describeUserEvidence, requirementEvidence } from "./user-evidence";
+import { StartButton } from "./start-button";
 import { repairWorkflowPlan } from "./workflow-plan-repair";
 import { interviewCompletionGate } from "./interview-completion";
 import { EVAL_COMPILER_VERSION, providerRepairNeedsUserAction } from "./eval-prompt";
 import { generationClientBudget } from "./generation-request";
 import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract, contractRepairFailureReason } from "./skill-projection-repair";
 import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases, recommendedHostCapabilityIds } from "./capability-routing";
-import { compileKnowledgeBatches, knowledgeClientTimeout, retainKnowledgeFailure } from "./knowledge-compiler";
+import { pickRecommendedInterviewOption } from "./interview-discovery";
+import { compileKnowledgeBatches, knowledgeClientTimeout, retainKnowledgeFailure, verifyKnowledgeClaimsInBatches } from "./knowledge-compiler";
 import { selectKnowledgeQueries } from "./knowledge-passages";
 import { runBlueprintPlanning, type BlueprintCheckpoint } from "./blueprint-planner";
 import { HOST_FILE_WORKSPACE_CAPABILITY } from "./host-file-capability";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "./bundle-resource-repair";
 import { validateImplementationFiles } from "./canonical-mutations";
+import { generationResultCopy, type GenerationLoopOutcome } from "./generation-result-copy";
 
-import { ChangeEvent, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { ChangeEvent, Fragment, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import { FileUploadButton, MaterialInput, type MaterialUploadState } from "./material-input";
 import { appendReferenceFiles, readReferenceFiles } from "./reference-upload";
 import { enableMultipleSelection, toggleInterviewAnswer } from "./interview-selection";
 import { capabilityIconPath, CAPABILITY_CATEGORY_ICONS } from "./capability-icons";
+import { insertWorkflowStep, removeWorkflowStep, updateWorkflowStep, workflowStepDraft, type WorkflowStepDraft } from "./workflow-editor";
 import {
   OPTIMIZATION_EDIT_BUDGET,
   OPTIMIZATION_SELECTION_SAMPLE,
@@ -111,6 +115,7 @@ import {
   optimizationPolicyFor,
   pruneBundleDeterministically,
   reconcileArtifactProducerCapabilities,
+  removeUnrequestedOptionalArtifactOwnership,
   validatePatchPlan,
   type CapabilityScope,
   type EvalFamily,
@@ -119,7 +124,8 @@ import {
 } from "./skill-pipeline-core";
 import { classifyBundleIssue, validateBundleContentCoherence, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
 import { demoReplyNeedsUserTurn, normalizePlannedDemoTurns, type PlannedDemoUserTurn } from "./demo-episode";
-import { isCompilerOwnedEvalCoverageIssue, issuesAreCompilerOwnedEvalCoverage } from "./eval-repair-routing";
+import { isCompilerOwnedEvalCoverageIssue } from "./eval-repair-routing";
+import { compilerOwnedContractIssues } from "./contract-repair-routing";
 import {
   applySkillIRMutations,
   feedbackRequirementMutations,
@@ -134,6 +140,7 @@ import {
   buildRequirementProvenance,
   confirmedAnswerEvidenceText,
   contentGroundingRubric,
+  contentPermissionConflictLocations,
   contentPolicyEvalExpectations,
   deriveDomainEvidence,
   deriveScopeProvenance,
@@ -141,7 +148,6 @@ import {
   finalMinimalityPass,
   hardNegativePrompts,
   hasContentPermissionConflict,
-  isUnconfirmedGenericFactRestriction,
   reconcileContentPermissionText,
   realisticFailureFixtures,
   reconcileValidationVisibility,
@@ -161,10 +167,12 @@ import {
   reconcileSkillIRContentPermission,
   reconcileSkillIRInputResolutions,
   reconcileSkillIRSourceEvidence,
+  reconcileSkillIRStateLoops,
   type SkillIR,
 } from "./skill-ir";
 import {
   EMPTY_KNOWLEDGE_PACK,
+  alignKnowledgePlanToCapabilityDelta,
   applyKnowledgePackToFiles,
   buildKnowledgeEvidencePayload,
   buildFollowupResearchQueries,
@@ -189,7 +197,14 @@ import {
   type ResearchProviderId,
 } from "./knowledge-research";
 import { dedupeResearchSources } from "./research-core";
-import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta";
+import { EMPTY_CAPABILITY_DELTA, externalCapabilityDeltaGaps, mergeCapabilityDeltas, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta";
+import {
+  PIPELINE_CONTRACT_VERSION,
+  createNotRequiredKnowledgePack,
+  knowledgeAssessmentFromPack,
+  prepareKnowledgeRuntime,
+  reconcileKnowledgePackWithCapabilityDelta,
+} from "./knowledge-runtime";
 import { bindWorkflowCapabilities, normalizeWorkflowDagSteps, type WorkflowDagStep } from "./workflow-dag";
 import { verifyBundleScriptTests, verifyExecutionsInLocalSandbox } from "./eval-workflow-service";
 import { DurableWorkflowJournal } from "./workflow-client";
@@ -216,7 +231,6 @@ import {
   EMPTY_INTERVIEW_READINESS,
   normalizeDiscoveryPreview,
   normalizeInterviewReadiness,
-  optionConflictsWithPriorEvidence,
   previewFeedbackEvidence,
   type DiscoveryPreview,
   type InterviewReadiness,
@@ -297,6 +311,7 @@ const EMPTY_AI_TOKEN_USAGE: AiTokenUsage = {
 };
 
 const SESSION_STORAGE_KEY = "skillcanvas.current-tab.v1";
+const SESSION_SCHEMA_VERSION = 2;
 const NO_SKILL_HARNESS_CACHE_KEY = `skillcanvas.no-skill-harness.v${EVAL_COMPILER_VERSION}`;
 // One-time migration key from the early prototype. Secrets are removed from
 // browser storage immediately and persisted through /api/credentials instead.
@@ -481,6 +496,7 @@ type GenerationSemanticAudit = {
 
 type GenerationLoopState = {
   evaluationContractVersion: typeof EVAL_COMPILER_VERSION;
+  outcome: GenerationLoopOutcome;
   status: "idle" | "running" | "passed" | "stable" | "attention";
   phase: "idle" | "contract" | "static" | "rollout" | "diagnose" | "patch" | "validate" | "complete";
   rounds: number;
@@ -502,6 +518,8 @@ type GenerationLoopState = {
   closureScore: number;
   acceptedPatches: number;
   rejectedPatches: number;
+  candidateEvalAttempts: number;
+  candidateEvalCompletions: number;
   contractDigest: string;
   benchmarkCases: number;
   benchmarkRepeatsPerCase: number;
@@ -551,7 +569,7 @@ type DemoChatMessage = {
   role: "user" | "assistant";
   content: string;
   attachments?: DemoChatAttachment[];
-  source?: "owner" | "mock";
+  source?: "owner" | "mock" | "inspiration";
 };
 
 type CapabilityCatalogItem = CapabilityItem & {
@@ -729,6 +747,8 @@ const BUSY_STAGES: Record<BusyTask, { title: string; stages: string[] }> = {
   personalize: { title: "AI 正在验证下一版候选", stages: ["读取你确认的不满意点", "定向生成候选 Skill", "用冻结任务检查既有能力", "用新任务生成并复评 Demo", "原子提交已验证版本"] },
 };
 
+const BUILD_ESTIMATED_SECONDS = 7 * 60;
+
 const AI_MODE_LABELS: Record<string, string> = {
   "knowledge-plan": "识别专业知识缺口",
   "knowledge-compile": "把来源编译成专业规则",
@@ -798,6 +818,7 @@ function ProviderLogo({ id }: { id: ProviderId }) {
 const RESEARCH_PROVIDERS: Record<ResearchProviderId, { name: string; mark: string; detail: string; baseUrl: string }> = {
   disabled: { name: "暂不联网", mark: "—", detail: "仍会识别知识缺口，但不会把模型常识伪装成来源知识", baseUrl: "" },
   firecrawl: { name: "Firecrawl", mark: "FC", detail: "搜索并提取网页正文，适合直接形成可引用知识", baseUrl: "https://api.firecrawl.dev" },
+  deepseek: { name: "DeepSeek 联网搜索", mark: "DS", detail: "复用 DeepSeek Key 搜索，再由 SkillCanvas 读取原文并核验来源", baseUrl: "" },
   searxng: { name: "SearXNG", mark: "SX", detail: "连接你自部署的开源搜索服务，再读取公开结果正文", baseUrl: "" },
 };
 
@@ -886,6 +907,7 @@ const BUILD_LOOP_PHASE_INDEX: Record<BuildLoopState["phase"], number> = { idle: 
 const OPTIMIZATION_LOOP_STEPS = ["冻结评测", "隔离执行", "隔离评分", "无 Skill 基线", "问题诊断", "有限修改", "匿名 A/B", "保留集回归", "保留任务", "精简冗余"] as const;
 const DEFAULT_GENERATION_LOOP: GenerationLoopState = {
   evaluationContractVersion: EVAL_COMPILER_VERSION,
+  outcome: "not-run",
   status: "idle",
   phase: "idle",
   rounds: 0,
@@ -906,6 +928,8 @@ const DEFAULT_GENERATION_LOOP: GenerationLoopState = {
   closureScore: 0,
   acceptedPatches: 0,
   rejectedPatches: 0,
+  candidateEvalAttempts: 0,
+  candidateEvalCompletions: 0,
   contractDigest: "",
   benchmarkCases: 0,
   benchmarkRepeatsPerCase: 0,
@@ -953,10 +977,10 @@ const INTERVIEW_ROUND_META = [
 ] as const;
 
 const CONTEXT_FIELDS: Array<{ id: ContextFieldId; tabLabel: string; label: string; description: string; placeholder: string; tag: string; icon: string }> = [
-  { id: "existingPrompt", tabLabel: "方法 / SOP", label: "方法 / SOP", description: "粘贴你已经在使用的方法、步骤、检查清单或 Prompt。", placeholder: "把常用 Prompt、SOP、操作步骤或检查清单粘贴到这里……", tag: "提取可复用步骤", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/file-description.svg" },
-  { id: "idealOutput", tabLabel: "理想样例", label: "理想产出示例", description: "粘贴你觉得很好的结果、文章片段、报告、方案或代码。", placeholder: "把理想的文章、报告、方案、代码或其他结果粘贴到这里……", tag: "让 AI 知道“好”的样子", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/star.svg" },
-  { id: "negativeOutput", tabLabel: "避免什么", label: "你不希望出现什么", description: "粘贴反例，或者直接说明哪些表达、判断和做法会让你不满意。", placeholder: "粘贴反例，或写下你最不喜欢的做法……", tag: "告诉 AI 哪些不能做", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/shield-check.svg" },
-  { id: "background", tabLabel: "背景资料", label: "背景资料", description: "补充业务背景、目标用户、专业术语、规则或其他判断依据。", placeholder: "例如：产品背景、目标用户、专业术语、品牌规则、业务限制……", tag: "补足判断所需信息", icon: "https://unpkg.com/@tabler/icons@3.46.0/icons/outline/folder.svg" },
+  { id: "existingPrompt", tabLabel: "方法 / SOP", label: "方法 / SOP", description: "粘贴你已经在使用的方法、步骤、检查清单或 Prompt。", placeholder: "把常用 Prompt、SOP、操作步骤或检查清单粘贴到这里……", tag: "提取可复用步骤", icon: "/icons/tabler/file-description.svg" },
+  { id: "idealOutput", tabLabel: "理想样例", label: "理想产出示例", description: "粘贴你觉得很好的结果、文章片段、报告、方案或代码。", placeholder: "把理想的文章、报告、方案、代码或其他结果粘贴到这里……", tag: "让 AI 知道“好”的样子", icon: "/icons/tabler/star.svg" },
+  { id: "negativeOutput", tabLabel: "避免什么", label: "你不希望出现什么", description: "粘贴反例，或者直接说明哪些表达、判断和做法会让你不满意。", placeholder: "粘贴反例，或写下你最不喜欢的做法……", tag: "告诉 AI 哪些不能做", icon: "/icons/tabler/shield-check.svg" },
+  { id: "background", tabLabel: "背景资料", label: "背景资料", description: "补充业务背景、目标用户、专业术语、规则或其他判断依据。", placeholder: "例如：产品背景、目标用户、专业术语、品牌规则、业务限制……", tag: "补足判断所需信息", icon: "/icons/tabler/folder.svg" },
 ];
 
 const DEFAULT_INTERVIEW_ROUNDS: InterviewRound[] = [
@@ -1362,6 +1386,23 @@ function capabilityIsActive(item: CapabilityItem) {
   return item.status !== "not-needed" && item.enabled !== false && item.necessity?.decision !== "exclude";
 }
 
+const EXTERNAL_DECISION_AUDIT_SIGNAL = /(?:分类|区分|诊断|评估|评分|优先级|排序|推荐|决策|判定|审核|验证|比较|归因|预测|风险|合规|取舍|映射|classif|distinguish|diagnos|assess|evaluat|priorit|rank|recommend|decid|audit|verif|compar|attribute|forecast|risk|compliance|map)/i;
+
+/** A zero-external-gap result deserves one bounded second look when the task
+ * contains semantic judgment. This is an audit, not a forced web-search gate:
+ * the model may still return no external gap when the contract is sufficient. */
+function capabilityPlanNeedsExternalDecisionAudit(plan: CapabilityPlan) {
+  const capabilityText = plan.items
+    .filter((item) => capabilityIsActive(item) && item.kind !== "eval")
+    .map((item) => [item.requirement, item.purpose, item.routingCondition, item.fallback, ...(item.evaluationCriteria || [])].filter(Boolean).join(" "))
+    .join(" ");
+  return EXTERNAL_DECISION_AUDIT_SIGNAL.test([
+    capabilityText,
+    ...(plan.failureModes || []),
+    ...(plan.riskBranches || []).flatMap((branch) => [branch.condition, branch.action, branch.stopOrRedirect]),
+  ].filter(Boolean).join(" "));
+}
+
 function capabilityNecessity(item: CapabilityItem) {
   if (item.necessity?.decision) return item.necessity;
   const deterministicNeed = item.kind === "script" && /计算|公式|排序|筛选|去重|校验|转换|批量|deterministic|calculate|sort|validate/i.test(`${item.requirement} ${item.purpose}`);
@@ -1513,6 +1554,7 @@ function createCanonicalSkillIR(input: {
       allowCreativeExpansion: contentPolicyAllowsExpansion(input.answers),
       allowFactualCreation: contentPolicyAllowsFactualCreation(input.answers),
       explicitRestriction: contentPolicyExplicitlyRestrictsExpansion(input.answers),
+      restrictedFactualScopes: resolveContentPermission(input.answers).restrictedFactualScopes,
       missingBehavior: activePlan.stateModel.missingBehavior || "标注缺失并请求最少必要信息",
     }),
     domainEvidence: deriveDomainEvidence(files["evals/knowledge-contract.json"] || files["references/domain-playbook.md"] || "", userEvidence, sourceEvidence),
@@ -1534,44 +1576,6 @@ function createCanonicalSkillIR(input: {
   // semantic capability. Record the path in Canonical SkillIR so the runtime
   // projector can route to it without a post-projection file edit.
   return ensureCanonicalBundledResources(ir, files, input.answers);
-}
-
-function compactThinkingPhrase(value: string) {
-  const phrase = value
-    .replace(/^[#>*\-\d.)、\s]+/, "")
-    .replace(/[：:].*$/, "")
-    .replace(/[，。；、!?！？]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-  return phrase.length > 16 ? `${phrase.slice(0, 16)}…` : phrase;
-}
-
-function createContextualThinkingWords(input: {
-  task: BusyTask;
-  idea: string;
-  stage: string;
-  questions: Question[];
-  answers: Record<string, string>;
-  blueprint: BlueprintSection[];
-  capabilities: CapabilityItem[];
-  loopPlan: LoopPlan;
-  issues: string[];
-  feedback: string[];
-  demo: SkillDemo | null;
-}) {
-  const answeredChoices = input.questions.map((question) => input.answers[question.id]).filter(Boolean);
-  const taskSources: Record<BusyTask, string[]> = {
-    interview: [input.idea, ...input.questions.map((question) => question.dimension), ...answeredChoices],
-    blueprint: [...input.blueprint.map((section) => section.title), ...answeredChoices, ...input.capabilities.map((item) => item.name)],
-    build: [input.loopPlan.goal, ...input.loopPlan.subgoals.map((item) => item.title), ...input.capabilities.filter(capabilityIsActive).map((item) => item.name)],
-    repair: [...input.issues, ...input.capabilities.filter(capabilityIsActive).map((item) => item.name), input.loopPlan.stopConditions[0] || ""],
-    evaluate: [input.idea, input.demo?.title || "", ...(input.demo?.uncertainties || []), ...input.capabilities.filter(capabilityIsActive).map((item) => item.name)],
-    personalize: [...input.feedback, input.demo?.title || "", ...(input.demo?.uncertainties || []), ...input.loopPlan.qualityGates.map((item) => item.criterion)],
-  };
-  const words = [input.stage, ...taskSources[input.task]]
-    .map(compactThinkingPhrase)
-    .filter((word) => word.length >= 2);
-  return Array.from(new Set(words)).slice(0, 8);
 }
 
 function deriveLoopPlan(idea: string, answers: Record<string, string>, capabilityPlan: CapabilityPlan = DEFAULT_CAPABILITY_PLAN): LoopPlan {
@@ -1743,7 +1747,7 @@ ${plan.scopes.map((item) => `- **${item.scope}** — trigger: ${item.trigger}; a
 }
 
 function reconcileLoopPlanState(plan: LoopPlan, capabilityPlan: CapabilityPlan): LoopPlan {
-  if (capabilityPlan.stateModel.scope === "persistent") return plan;
+  if (capabilityPlan.stateModel.needed && capabilityPlan.stateModel.scope === "persistent") return plan;
   return {
     ...plan,
     scopes: plan.scopes.filter((scope) => scope.scope !== "longitudinal"),
@@ -1879,7 +1883,18 @@ function sanitizeSkillFiles(files: Record<string, string>) {
 
 function friendlyReleaseBlocker(item: string) {
   return item
+    .replace(/P0(?:\s+Execution Gate)?/gi, "无法运行的问题")
+    .replace(/P1(?:\s+Contract Gate)?/gi, "关键逻辑问题")
+    .replace(/held-out Eval/gi, "独立测试任务")
+    .replace(/held-out/gi, "独立测试")
+    .replace(/Optimization Loop/gi, "自动优化")
+    .replace(/Build Loop/gi, "生成文件检查")
+    .replace(/Bundle/gi, "生成文件")
+    .replace(/Candidate/gi, "修改版")
+    .replace(/Canonical IR/gi, "核心数据结构")
+    .replace(/Patch Plan/gi, "修改方案")
     .replace(/Eval Harness/gi, "自动测试系统")
+    .replace(/Eval/gi, "自动测试")
     .replace(/SKILL\.md/gi, "主文件")
     .replace(/Tools?\/MCP/gi, "外部工具或 MCP")
     .replace(/grader/gi, "评分规则")
@@ -1925,7 +1940,10 @@ function friendlyProductRisk(branch: RiskBranch) {
 
 function firstTaskExample(answers: Record<string, string>, fallback: string) {
   const trigger = answers["trigger-language"]?.trim();
-  return answers.__previewTask?.trim() || answers["real-task"]?.trim() || trigger || fallback;
+  // A generated preview is weaker evidence than the owner's later confirmed
+  // task/trigger. Never let an early example reintroduce rejected recipients
+  // or actions into the frozen evaluation task.
+  return trigger || answers["real-task"]?.trim() || answers.__previewTask?.trim() || fallback;
 }
 
 function reconcileGeneratedScriptCapabilityClaims(plan: CapabilityPlan, files: Record<string, string>): CapabilityPlan {
@@ -2058,24 +2076,25 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
   const correctionBehaviors = confirmedCorrection ? [`落实用户在真实任务预演中确认的纠正：${confirmedCorrection}`] : [];
   const correctionMustNot = confirmedCorrection ? ["重新采用用户已在真实任务预演中否定或纠正的方案"] : [];
   const checkpointBehaviors = executableProductiveCheckpoint
-    ? ["关键决策值缺失时先交付不依赖该值的可用草稿，再提出一个最小必要问题；值已提供时不得重复询问"]
+    ? ["待确认内容缺失时先展示不依赖确认的安全中间结果并逐项列出当前缺口；若用户要求补齐后再成稿，不得提前生成完整草稿；收到真实答复前不执行依赖确认的步骤"]
     : productiveCheckpoint ? ["核心输入缺失时只请求当前执行必需的材料；收到材料后先完成不依赖后续决策的部分，到达决策检查点时再询问一个最小必要问题"]
-    : hasHumanCheckpoint ? ["只暂停依赖缺失决策值的步骤，并提出一个最小必要问题；值已提供时不得重复询问"]
+    : hasHumanCheckpoint ? ["只暂停确实依赖用户确认的步骤，明确列出待确认项；用户已确认时不得重复询问"]
     : [];
   const checkpointMustNot = executableProductiveCheckpoint
-    ? ["在关键决策值缺失时假装该值已经确认或擅自选择默认值", "只提问而不交付任何可逆的已完成部分"]
+    ? ["在待确认内容尚未得到真实答复时假装已经确认或擅自选择默认值", "只提问而不交付任何可逆的已完成部分"]
     : productiveCheckpoint ? ["在没有核心材料时虚构具体产出", "把尚未到达的后续决策与当前核心输入合并成一轮问题"]
-    : hasHumanCheckpoint ? ["在关键决策值缺失时假装该值已经确认或擅自选择默认值"]
+    : hasHumanCheckpoint ? ["在尚未得到真实确认时假装已经确认或擅自选择默认值"]
     : [];
+  const missingDecisionFixture = executableProductiveCheckpoint
+    ? "本用例尚未提供工作流后续确认节点所需的真实答复。先用上述材料完成并展示不依赖确认的安全中间结果，再逐项列出当前确实存在的缺口并暂停相应后续步骤；若用户要求补齐后再成稿，不得提前生成完整草稿；不得把尚未收到的答复说成已经确认。"
+    : productiveCheckpoint ? "本用例没有携带核心输入材料，也没有提供后续决策值。先只请求当前执行必需的核心材料；不要把尚未到达的后续决策合并进同一轮问题。收到材料后，先交付不依赖后续决策的可逆部分。"
+    : hasHumanCheckpoint ? "本用例尚未提供工作流后续确认节点所需的真实答复。先处理不依赖确认的部分，到达确认节点时明确列出待确认项并暂停相应后续步骤；不得把尚未收到的答复说成已经确认。" : "";
   const executionFixture = [
     `这是本次实际任务：${concreteTask}。`,
     triggerExample && triggerExample !== concreteTask ? `用户原话示例：${triggerExample}。` : "",
     `本次输入契约：${inputs}。`,
     representativeInput ? `本用例携带的代表性输入材料如下，必须实际处理这些内容：\n${representativeInput}` : "",
-    executableProductiveCheckpoint
-      ? "本用例没有提供优先级规则等关键决策的具体取值；“每次确认规则”只是协作要求，不是本次规则值。先用上述材料完成并交付不依赖该值的可逆草稿，再只询问一个最小必要问题；不得把缺失值说成已经确认。"
-      : productiveCheckpoint ? "本用例没有携带核心输入材料，也没有提供后续决策值。先只请求当前执行必需的核心材料；不要把尚未到达的后续决策合并进同一轮问题。收到材料后，先交付不依赖后续决策的可逆部分。"
-      : hasHumanCheckpoint ? "本用例没有提供优先级规则等关键决策的具体取值；“每次确认规则”只是协作要求，不是本次规则值。只暂停依赖该值的步骤，并只询问一个最小必要问题；不得把缺失值说成已经确认。" : "",
+    missingDecisionFixture,
     confirmedCorrection ? `此前真实任务预演中，用户已经明确纠正：${confirmedCorrection}。本轮必须继续遵守。` : "",
     `内容处理权限：${contentPolicy}。`,
     "请执行当前步骤并交付可观察结果；不要只复述工作流或返回空模板。",
@@ -2114,23 +2133,33 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
   [...semanticCapabilities, ...groundingCapabilities, ...integrationCapabilities].forEach((item) => {
     const expectedArtifacts = artifactsForCapability(item);
     const evalFamily = familyForCapability(item);
+    // A file writer cannot be proven by the pre-approval pause fixture. Give
+    // its focused integration case a separate, explicitly approved test turn;
+    // this is synthetic Eval state, never permission for the live workflow.
+    const approvedArtifactCase = evalFamily === "integration" && capabilityOwnsArtifacts(item)
+      && hasHumanCheckpoint && executionFixtureReady;
+    const capabilityFixture = approvedArtifactCase
+      ? `${executionFixture.replace(missingDecisionFixture, "")} 隔离评测前置回合：用户已补齐当前任务的必要输入，并对已展示的草稿明确回复“确认，请按草稿写入并交付文件”。这一确认仅属于本测试用例；现在验证真实文件写入及可检查的交付路径。`
+      : executionFixture;
     evals.push({
       id: `core-${item.id}`,
       eval_family: evalFamily,
       category: "core_capability",
       should_trigger: true,
-      prompt: `${executionFixture} 本用例重点验证：${item.requirement}。${evalFamily === "integration" ? `本用例明确满足激活条件：${item.activationCondition || item.routingCondition}。` : ""}`,
-      context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", workflow_checkpoint: executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", capability_scope: item.scope || normalizeCapabilityScope(item), activation_condition: item.activationCondition || item.routingCondition, routing_condition: item.routingCondition, input_contract: item.input, output_contract: item.output },
+      prompt: `${capabilityFixture} 本用例重点验证：${item.requirement}。${evalFamily === "integration" ? `本用例明确满足激活条件：${item.activationCondition || item.routingCondition}。` : ""}`,
+      context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", workflow_checkpoint: approvedArtifactCase ? "required-value-provided" : executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", capability_scope: item.scope || normalizeCapabilityScope(item), activation_condition: item.activationCondition || item.routingCondition, routing_condition: item.routingCondition, input_contract: item.input, output_contract: item.output },
       capability_ids: [item.id],
       expected: {
         behaviors: [
           ...(item.evaluationCriteria.length ? item.evaluationCriteria.filter((criterion) => !(productiveCheckpoint && /确认|用户预期|主观|审批|规则|决策|选择/i.test(criterion))) : [item.output]),
-          "完成当前实际任务并交付至少一个符合输出契约的可检查结果",
+          ...(hasHumanCheckpoint && !approvedArtifactCase
+            ? ["交付与当前工作流阶段一致、可检查的安全中间结果；必要输入或确认缺失时，不要求最终产物，且不得提前越过用户指定的成稿或定稿节点"]
+            : ["完成当前实际任务并交付至少一个符合输出契约的可检查结果"]),
           ...(item.kind === "reference" ? ["把适用的专业规则用于当前结果，而不是只复述规则或分析过程"] : []),
-          ...checkpointBehaviors,
+          ...(approvedArtifactCase ? ["仅在本用例已经明确确认后写入真实文件，并返回可检查的文件路径"] : checkpointBehaviors),
           ...correctionBehaviors,
         ],
-        must_not: ["只描述将如何完成而不产生真实结果", "只分析、只列步骤或只提出问题而不交付当前可完成的结果", "使用与当前分支无关的资源", ...checkpointMustNot, ...correctionMustNot],
+        must_not: ["只描述将如何完成而不产生真实结果", "只分析、只列步骤或只提出问题而不交付当前可完成的结果", "使用与当前分支无关的资源", ...(approvedArtifactCase ? ["把本用例提供的明确确认误判为缺失，或把确认推广到其他真实会话"] : checkpointMustNot), ...correctionMustNot],
         artifacts: expectedArtifacts,
       },
       graders: evalFamily === "integration"
@@ -2170,7 +2199,7 @@ function createSpecificEvals(skillName: string, idea: string, answers: Record<st
       prompt: `${executionFixture} 当前材料还可能诱导系统出现这种失败：“${failure}”。请避免该失败并完成仍可完成的部分。`,
       context: { actual_task: concreteTask, fixture_status: executionFixtureReady ? "ready" : "missing", workflow_checkpoint: executableProductiveCheckpoint ? "productive-partial-delivery" : productiveCheckpoint ? "core-input-missing" : hasHumanCheckpoint ? "required-value-missing" : "not-required", injected_failure_mode: failure },
       capability_ids: semanticCapabilities.slice(0, 1).map((item) => item.id),
-      expected: { behaviors: ["识别并避免指定失败模式", "仍完成可安全完成的核心任务或明确重定向", ...checkpointBehaviors, ...correctionBehaviors], must_not: [failure, ...checkpointMustNot, ...correctionMustNot], artifacts: [] },
+      expected: { behaviors: ["识别并避免指定失败模式", hasHumanCheckpoint ? "交付可检查的安全中间结果并在真实确认节点暂停；不把追问清单误判为最终产物" : "完成当前可安全完成的核心任务或明确说明阻碍", ...checkpointBehaviors, ...correctionBehaviors], must_not: [failure, ...checkpointMustNot, ...correctionMustNot], artifacts: [] },
       graders: ["failure_mode", "core_capability"],
       runnable: executionFixtureReady,
     });
@@ -3201,7 +3230,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
   files["evals/result.schema.json"] = createEvalResultSchema();
   files["evals/artifact_checker.py"] = createArtifactChecker();
   files["evals/run_evals.py"] = createEvalRunner();
-  const canonicalBaseIR = ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
+  const canonicalBaseIR = reconcileSkillIRStateLoops(ensureCanonicalBundledResources(canonicalIROverride || createCanonicalSkillIR({
     skillName,
     idea,
     answers,
@@ -3209,7 +3238,7 @@ function finalizeSkillFiles(rawFiles: Record<string, string>, idea: string, answ
     loop: loopPlan,
     sourceEvidence: `${sourceEvidence}\n${compiledDomainEvidence}`,
     files,
-  }), files, answers);
+  }), files, answers));
   const canonicalEvalSeed = evalNeedsRebuild
     ? files["evals/evals.json"]
     : canonicalIROverride ? projectEvalBank(canonicalBaseIR) : files["evals/evals.json"];
@@ -3361,7 +3390,6 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
     .filter(([path]) => path.startsWith("scripts/"))
     .map(([, content]) => content)
     .join("\n");
-  const contentPolicyRuntimeText = `${narrativeRuntimeText}\n${scriptRuntimeText}`;
   if (hasUnsafeDynamicExecution(scriptRuntimeText)) blockers.push("业务脚本使用了不安全的动态执行（eval、exec、os.system 或 shell=True）");
   if (hasUnboundedFormulaParser(scriptRuntimeText)) blockers.push("自定义公式解析没有表达式长度上限，超长输入可能耗尽资源");
   scripts.forEach((path) => {
@@ -3392,12 +3420,18 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
       && stored.allowCreativeExpansion === expected.allowCreativeExpansion
       && stored.allowFactualCreation === expected.allowFactualCreation
       && stored.explicitRestriction === expected.explicitRestriction
+      && JSON.stringify(stored.allowedFactualScopes || []) === JSON.stringify(expected.allowedFactualScopes || [])
+      && JSON.stringify(stored.restrictedFactualScopes || []) === JSON.stringify(expected.restrictedFactualScopes || [])
       && allText.includes(expected.sourceText));
   } catch {
     canonicalPermissionPreserved = Boolean(contentPolicy && allText.includes(contentPolicy));
   }
   if (!canonicalPermissionPreserved) blockers.push("没有保留用户确认的内容改动范围");
-  if (contentPolicyAllowsExpansion(answers) && !contentPolicyExplicitlyRestrictsExpansion(answers) && contentPolicyRuntimeText.split("\n").some(isUnconfirmedGenericFactRestriction)) blockers.push("内容限制与用户确认的润色或扩写权限冲突");
+  const permissionConflicts = contentPermissionConflictLocations(files, resolveContentPermission(answers), true);
+  if (permissionConflicts.length) {
+    const first = permissionConflicts[0];
+    blockers.push(`内容限制与用户确认的事实补写权限冲突：${first.path}:${first.line}`);
+  }
   blockers.push(...confirmedPersonalizationConflicts(files));
   if (files["references/requirements.md"] || files["references/capability-plan.json"]) blockers.push("构建期需求或能力计划被混入运行时 references");
   if (/(?:analy[sz]e|research|研究|分析|诊断|评估)/i.test(description) && !/(?:explicit fact|user claim|inference|hypothesis|unknown|明确事实|用户陈述|推断|假设|未知)/i.test(skill)) blockers.push("分析型 Skill 没有区分事实、用户陈述、推断、假设与未知");
@@ -4280,9 +4314,10 @@ function allowedP1MutationTypes(issues: PipelineIssue[]) {
   if (allMatch(/OUTPUT|ARTIFACT|PRODUCER|输出|产物/i)) return ["output.add", "output.update", "output.remove", "capability.update", "task.update"];
   if (allMatch(/STATE|PERSIST|状态|持久/i)) return ["state.update", "requirement.update", "constraint.update"];
   if (allMatch(/PERMISSION|CONTENT|权限|补写|扩写|编造/i)) return [
-    "requirement.add", "requirement.update",
+    "requirement.add", "requirement.update", "requirement.remove",
     "constraint.add", "constraint.update", "constraint.remove",
     "capability.update", "input.update", "risk-branch.update", "state.update",
+    "domain-evidence.remove",
   ];
   return [
     "identity.update",
@@ -4546,6 +4581,7 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
       items.push({ ...catalogItem, status: "use-provided", enabled: true, recommended: true, selectionSource: "ai" });
     }
   }
+  items = removeUnrequestedOptionalArtifactOwnership(items, userRequiresArtifact);
   const explicitAssetNeed = reusableArtifact || /品牌资产|素材包|logo|字体文件|图片素材|provided asset/i.test(taskEvidence);
   const requestedAssetExtensions = new Set(inferArtifactPatterns(`${answers["output-format"] || ""}；${plan.outputContract.format}`)
     .flatMap((pattern) => pattern.toLowerCase().match(/\.(?:pdf|docx?|pptx?|xlsx?|csv|json|html?|md|png|jpe?g)\b/g) || []));
@@ -4603,7 +4639,9 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
     });
   }
 
-  if (reusableArtifact && !items.some((item) => item.kind === "asset" && capabilityIsActive(item))) {
+  // This compiler-owned asset is a CSV file. A reusable prose or Markdown
+  // layout belongs in the Skill contract, not an unrelated CSV runtime step.
+  if (reusableArtifact && requestedAssetExtensions.has(".csv") && !items.some((item) => item.kind === "asset" && capabilityIsActive(item))) {
     items.splice(Math.max(1, items.findIndex((item) => item.kind === "eval")), 0, {
       id: "reusable-output-template",
       kind: "asset",
@@ -4725,6 +4763,15 @@ function stripCompiledKnowledgeSummary(summary: string) {
     .replace(/\s*在需要[^。.!！？?]{0,180}?判断时，?按条件使用来源可追溯的专业知识[。.!！？?]?/g, "")
     .replace(/\s{2,}/g, " ")
     .trim();
+}
+
+function comparisonTaskTitle(value: string, fallback: string) {
+  const normalized = value
+    .replace(/\s*本用例重点验证：[\s\S]*$/u, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  const title = normalized || fallback;
+  return title.length > 76 ? `${title.slice(0, 76).trim()}…` : title;
 }
 
 function normalizedCompiledKnowledgeSummary(summary: string, domain?: string) {
@@ -4925,9 +4972,7 @@ function normalizeInterviewQuestions(raw: unknown, roundIndex: number, priorEvid
     // asks for one. The prompt requires the safest recommendation to be the
     // first option, so the normalizer can recover without losing the beginner
     // experience or guessing outside the model-proposed choices.
-    const recommendedOption = typeof value.recommendedOption === "string" && options.includes(value.recommendedOption) && !optionConflictsWithPriorEvidence(value.recommendedOption, priorEvidence)
-      ? value.recommendedOption
-      : options.find((option) => option !== UNSURE_OPTION && !optionConflictsWithPriorEvidence(option, priorEvidence));
+    const recommendedOption = pickRecommendedInterviewOption(options, value.recommendedOption, priorEvidence, UNSURE_OPTION);
     return {
       id: `ai-round-${roundIndex + 1}-question-${index + 1}`,
       dimension,
@@ -5027,6 +5072,47 @@ function reportClientGenerationLoopEvent(
   });
 }
 
+const DOT_PROGRESS_COUNT = 36;
+const WAITING_DOT_COUNT = 120;
+
+function DotMatrixProgress({ progress, tone = "light", label = "正在处理" }: { progress?: number; tone?: "light" | "dark"; label?: string }) {
+  const determinate = typeof progress === "number";
+  const normalized = determinate ? Math.min(1, Math.max(0, progress)) : 0;
+  const settled = Math.round(normalized * DOT_PROGRESS_COUNT);
+  return (
+    <div
+      className={`dot-matrix-progress ${tone} ${determinate ? "determinate" : "indeterminate"}`}
+      role="progressbar"
+      aria-label={label}
+      aria-valuemin={determinate ? 0 : undefined}
+      aria-valuemax={determinate ? 100 : undefined}
+      aria-valuenow={determinate ? Math.round(normalized * 100) : undefined}
+    >
+      {Array.from({ length: DOT_PROGRESS_COUNT }, (_, index) => (
+        <i
+          className={determinate && index < settled ? "settled" : "pending"}
+          key={index}
+          style={{
+            "--dot-index": index,
+            "--dot-distance": Math.max(0, index - settled),
+            "--dot-color": `hsl(${8 + (index / (DOT_PROGRESS_COUNT - 1)) * 28} 82% 58%)`,
+          } as CSSProperties}
+        />
+      ))}
+    </div>
+  );
+}
+
+function WaitingDotField() {
+  return (
+    <div className="ai-wind-field" aria-hidden="true">
+      {Array.from({ length: WAITING_DOT_COUNT }, (_, index) => (
+        <i key={index} style={{ "--wind-dot": index, "--wind-column": index % 20, "--wind-row": Math.floor(index / 20) } as CSSProperties} />
+      ))}
+    </div>
+  );
+}
+
 export default function Home() {
   const [sessionHydrated, setSessionHydrated] = useState(false);
   const [step, setStep] = useState<StepId>("brief");
@@ -5041,7 +5127,6 @@ export default function Home() {
   const [aiGenerationIssue, setAiGenerationIssue] = useState("");
   const [contextPanelOpen, setContextPanelOpen] = useState(false);
   const [activeContextField, setActiveContextField] = useState<ContextFieldId>("idealOutput");
-  const [interviewEvidenceOpen, setInterviewEvidenceOpen] = useState(false);
   const [contextNotes, setContextNotes] = useState<ContextNotes>({ idealOutput: "", negativeOutput: "", existingPrompt: "", background: "" });
   const [contextUploads, setContextUploads] = useState<Partial<Record<ContextFieldId, MaterialUploadState>>>({});
   const materialsLoading = sourcesLoading || Object.values(contextUploads).some((upload) => upload?.loading);
@@ -5062,6 +5147,7 @@ export default function Home() {
   const blueprintGridRef = useRef<HTMLDivElement | null>(null);
   const blueprintCheckpointRef = useRef<BlueprintCheckpoint>({});
   const [capabilityPlan, setCapabilityPlan] = useState<CapabilityPlan>(DEFAULT_CAPABILITY_PLAN);
+  const [workflowStepEditor, setWorkflowStepEditor] = useState<{ stepId: string; draft: WorkflowStepDraft } | null>(null);
   const [loopPlan, setLoopPlan] = useState<LoopPlan>(DEFAULT_LOOP_PLAN);
   const [buildLoop, setBuildLoop] = useState<BuildLoopState>(DEFAULT_BUILD_LOOP);
   const [generationLoop, setGenerationLoop] = useState<GenerationLoopState>(DEFAULT_GENERATION_LOOP);
@@ -5071,7 +5157,6 @@ export default function Home() {
   const [selectedFile, setSelectedFile] = useState("SKILL.md");
   const [evals, setEvals] = useState<EvalResult[]>(DEFAULT_EVALS);
   const [evalRan, setEvalRan] = useState(false);
-  const [evalDetailsOpen, setEvalDetailsOpen] = useState(false);
   const [skillDemo, setSkillDemo] = useState<SkillDemo | null>(null);
   const [demoReviewPending, setDemoReviewPending] = useState(false);
   const [demoExpanded, setDemoExpanded] = useState(true);
@@ -5081,6 +5166,7 @@ export default function Home() {
   const [demoChatSequence, setDemoChatSequence] = useState(0);
   const [demoChatInput, setDemoChatInput] = useState("");
   const [demoChatBusy, setDemoChatBusy] = useState(false);
+  const [demoInspirationBusy, setDemoInspirationBusy] = useState(false);
   const [demoChatError, setDemoChatError] = useState("");
   const [demoChatAttachments, setDemoChatAttachments] = useState<DemoChatAttachment[]>([]);
   const [demoChatFilesLoading, setDemoChatFilesLoading] = useState(false);
@@ -5114,10 +5200,15 @@ export default function Home() {
   const busyCloseTimer = useRef<number | null>(null);
   const autoOptimizationResumeKey = useRef("");
   const optimizationRunInFlight = useRef(false);
+  const evaluationLaunchPendingRef = useRef(false);
   const [busyPhaseIndex, setBusyPhaseIndex] = useState(0);
   const [busyElapsed, setBusyElapsed] = useState(0);
   const [busyExecutionKind, setBusyExecutionKind] = useState<BusyExecutionKind>("local");
   const [busyExecutionNote, setBusyExecutionNote] = useState("正在准备当前步骤");
+  const [busyOutputText, setBusyOutputText] = useState("");
+  const [busyOutputRevision, setBusyOutputRevision] = useState(0);
+  const busyOutputArrivedAt = useRef(0);
+  const busyOutputViewportRef = useRef<HTMLDivElement | null>(null);
   const [activeAiMode, setActiveAiMode] = useState("");
   const [busyTokenUsage, setBusyTokenUsage] = useState<AiTokenUsage>(EMPTY_AI_TOKEN_USAGE);
   const [sessionTokenUsage, setSessionTokenUsage] = useState<AiTokenUsage>(EMPTY_AI_TOKEN_USAGE);
@@ -5144,6 +5235,7 @@ export default function Home() {
   const [researchApiKey, setResearchApiKey] = useState("");
   const [researchCredentialStored, setResearchCredentialStored] = useState(false);
   const [researchCredentialManaged, setResearchCredentialManaged] = useState(false);
+  const [configuredResearchProvider, setConfiguredResearchProvider] = useState<ResearchProviderId>("disabled");
   const [researchBaseUrl, setResearchBaseUrl] = useState("");
   const [researchProbe, setResearchProbe] = useState<{ status: "idle" | "testing" | "ok" | "error"; message: string }>({ status: "idle", message: "检索连接与模型连接需要分别测试" });
   const researchProbeController = useRef<AbortController | null>(null);
@@ -5212,7 +5304,7 @@ export default function Home() {
         if (typeof legacy.model === "string") setModel(legacy.model);
         if (typeof legacy.baseUrl === "string") setBaseUrl(legacy.baseUrl);
         if (typeof legacy.apiKey === "string") setApiKey(legacy.apiKey);
-        if (["disabled", "firecrawl", "searxng"].includes(String(legacy.researchProvider))) setResearchProvider(legacy.researchProvider as ResearchProviderId);
+        if (["disabled", "firecrawl", "searxng", "deepseek"].includes(String(legacy.researchProvider))) setResearchProvider(legacy.researchProvider as ResearchProviderId);
         if (typeof legacy.researchApiKey === "string") setResearchApiKey(legacy.researchApiKey);
         if (typeof legacy.researchBaseUrl === "string") setResearchBaseUrl(legacy.researchBaseUrl);
         try {
@@ -5225,8 +5317,10 @@ export default function Home() {
             setCredentialStored(typeof legacy.apiKey === "string" && legacy.apiKey.trim().length > 8);
             setResearchCredentialStored(
               legacy.researchProvider === "searxng"
+              || legacy.researchProvider === "deepseek"
               || (typeof legacy.researchApiKey === "string" && legacy.researchApiKey.trim().length > 7),
             );
+            if (["disabled", "firecrawl", "searxng", "deepseek"].includes(String(legacy.researchProvider))) setConfiguredResearchProvider(legacy.researchProvider as ResearchProviderId);
             setApiKey("");
             setResearchApiKey("");
           }
@@ -5250,13 +5344,14 @@ export default function Home() {
           if (["deepseek", "openai", "compatible"].includes(String(result.config.provider))) setProvider(result.config.provider as ProviderId);
           if (typeof result.config.model === "string") setModel(result.config.model);
           if (typeof result.config.baseUrl === "string") setBaseUrl(result.config.baseUrl);
-          if (["disabled", "firecrawl", "searxng"].includes(String(result.config.researchProvider))) setResearchProvider(result.config.researchProvider as ResearchProviderId);
+          if (["disabled", "firecrawl", "searxng", "deepseek"].includes(String(result.config.researchProvider))) setResearchProvider(result.config.researchProvider as ResearchProviderId);
           if (typeof result.config.researchBaseUrl === "string") setResearchBaseUrl(result.config.researchBaseUrl);
         }
         setCredentialStored(Boolean(result.configured));
         setResearchCredentialStored(Boolean(result.researchConfigured));
         setCredentialManaged(Boolean(result.managed));
         setResearchCredentialManaged(Boolean(result.researchManaged));
+        if (result.config?.researchProvider) setConfiguredResearchProvider(result.config.researchProvider);
         if (result.configured) setApiKey("");
         if (result.researchConfigured) setResearchApiKey("");
       } catch {
@@ -5273,11 +5368,20 @@ export default function Home() {
         const savedLoopSnapshot = saved.generationLoop && typeof saved.generationLoop === "object"
           ? saved.generationLoop as Partial<GenerationLoopState>
           : {};
+        const savedCanonicalIRSnapshot = parseCanonicalSkillIR(savedFilesSnapshot);
+        const restoreSavedKnowledgePack = (value: unknown, restoredAnswers: Record<string, string>) => {
+          const restored = reconcileKnowledgePackContentPermission(restoreKnowledgePack(value), restoredAnswers);
+          return savedCanonicalIRSnapshot
+            ? reconcileKnowledgePackWithCapabilityDelta(restored, savedCanonicalIRSnapshot.capabilityDelta)
+            : restored;
+        };
         let savedEvalVersion = "";
         try {
           savedEvalVersion = String((JSON.parse(savedFilesSnapshot["evals/evals.json"] || "{}") as { version?: unknown }).version || "");
         } catch { /* Invalid or legacy Eval bundles are migrated below. */ }
-        const restoreFrozenBundleExactly = savedEvalVersion === EVAL_COMPILER_VERSION
+        const restoreFrozenBundleExactly = saved.sessionSchemaVersion === SESSION_SCHEMA_VERSION
+          && saved.pipelineContractVersion === PIPELINE_CONTRACT_VERSION
+          && savedEvalVersion === EVAL_COMPILER_VERSION
           && savedLoopSnapshot.evaluationContractVersion === EVAL_COMPILER_VERSION
           && savedLoopSnapshot.status !== "running";
         const restoredStep = normalizeWorkflowStep(saved.step);
@@ -5335,13 +5439,17 @@ export default function Home() {
           const savedRounds = restoredInterviewRounds;
           const restoredAnswers = { ...createDemoAnswers(savedRounds, savedAnswers), __idea: typeof saved.idea === "string" ? saved.idea : "", __previewInput: restoredPreviewInput };
           const restoredPack = saved.knowledgePack && typeof saved.knowledgePack === "object"
-            ? reconcileKnowledgePackContentPermission(restoreKnowledgePack(saved.knowledgePack), restoredAnswers)
+            ? restoreSavedKnowledgePack(saved.knowledgePack, restoredAnswers)
             : EMPTY_KNOWLEDGE_PACK;
           const restoredPlan = attachCompiledKnowledgeCapability(normalizeCapabilityPlan(saved.capabilityPlan) || DEFAULT_CAPABILITY_PLAN, restoredPack);
           setCapabilityPlan(ensureTaskCapabilities(restoredPlan, typeof saved.idea === "string" ? saved.idea : "", restoredAnswers));
         }
         if (saved.loopPlan && typeof saved.loopPlan === "object") setLoopPlan(saved.loopPlan as LoopPlan);
-        if (saved.buildLoop && typeof saved.buildLoop === "object") setBuildLoop({ ...DEFAULT_BUILD_LOOP, ...saved.buildLoop as Partial<BuildLoopState> });
+        if (saved.buildLoop && typeof saved.buildLoop === "object") {
+          setBuildLoop(restoreFrozenBundleExactly
+            ? { ...DEFAULT_BUILD_LOOP, ...saved.buildLoop as Partial<BuildLoopState> }
+            : DEFAULT_BUILD_LOOP);
+        }
         if (saved.generationLoop && typeof saved.generationLoop === "object") {
           const savedLoop = savedLoopSnapshot;
           setGenerationLoop(restoreFrozenBundleExactly
@@ -5353,7 +5461,7 @@ export default function Home() {
         if (saved.knowledgePack && typeof saved.knowledgePack === "object") {
           const savedAnswers = saved.answers && typeof saved.answers === "object" ? saved.answers as Record<string, string> : {};
           const restoredAnswers = { ...createDemoAnswers(restoredInterviewRounds, savedAnswers), __idea: typeof saved.idea === "string" ? saved.idea : "", __previewInput: restoredPreviewInput };
-          setKnowledgePack(reconcileKnowledgePackContentPermission(restoreKnowledgePack(saved.knowledgePack), restoredAnswers));
+          setKnowledgePack(restoreSavedKnowledgePack(saved.knowledgePack, restoredAnswers));
         }
         if (saved.internalMcpEvidenceReports && typeof saved.internalMcpEvidenceReports === "object") {
           setInternalMcpEvidenceReports(saved.internalMcpEvidenceReports as InternalMcpEvidenceReports);
@@ -5363,7 +5471,7 @@ export default function Home() {
           const savedRounds = restoredInterviewRounds;
           const restoredAnswers = { ...createDemoAnswers(savedRounds, savedAnswers), __idea: typeof saved.idea === "string" ? saved.idea : "", __previewInput: restoredPreviewInput };
           const restoredPack = saved.knowledgePack && typeof saved.knowledgePack === "object"
-            ? reconcileKnowledgePackContentPermission(restoreKnowledgePack(saved.knowledgePack), restoredAnswers)
+            ? restoreSavedKnowledgePack(saved.knowledgePack, restoredAnswers)
             : EMPTY_KNOWLEDGE_PACK;
           const restoredPlan = attachCompiledKnowledgeCapability(normalizeCapabilityPlan(saved.capabilityPlan) || DEFAULT_CAPABILITY_PLAN, restoredPack);
           const restoredLoop = saved.loopPlan && typeof saved.loopPlan === "object" ? saved.loopPlan as LoopPlan : DEFAULT_LOOP_PLAN;
@@ -5380,7 +5488,7 @@ export default function Home() {
               Array.isArray(saved.sourceInsights) ? serializeSourceInsights(saved.sourceInsights as SourceInsight[]) : "",
               restoredPlan,
               restoredLoop,
-              parseCanonicalSkillIR(savedFilesSnapshot) || undefined,
+              savedCanonicalIRSnapshot || undefined,
             );
           setFiles(restoredFiles);
           if (["passed", "stable"].includes((saved.generationLoop as Partial<GenerationLoopState> | undefined)?.status || "")) {
@@ -5388,10 +5496,10 @@ export default function Home() {
           }
         }
         if (typeof saved.selectedFile === "string") setSelectedFile(saved.selectedFile);
-        if (Array.isArray(saved.evals)) setEvals(saved.evals as EvalResult[]);
-        if (typeof saved.evalRan === "boolean") setEvalRan(saved.evalRan);
-        if (saved.skillDemo && typeof saved.skillDemo === "object") setSkillDemo(normalizeSkillDemo(saved.skillDemo));
-        if (typeof saved.demoReviewPending === "boolean") setDemoReviewPending(saved.demoReviewPending);
+        if (Array.isArray(saved.evals)) setEvals(restoreFrozenBundleExactly ? saved.evals as EvalResult[] : []);
+        if (typeof saved.evalRan === "boolean") setEvalRan(restoreFrozenBundleExactly ? saved.evalRan : false);
+        if (saved.skillDemo && typeof saved.skillDemo === "object") setSkillDemo(restoreFrozenBundleExactly ? normalizeSkillDemo(saved.skillDemo) : null);
+        if (typeof saved.demoReviewPending === "boolean") setDemoReviewPending(restoreFrozenBundleExactly ? saved.demoReviewPending : false);
         if (typeof saved.demoExpanded === "boolean") setDemoExpanded(saved.demoExpanded);
         if (typeof saved.personalizationRound === "number") setPersonalizationRound(saved.personalizationRound);
         if (typeof saved.demoRunCount === "number") setDemoRunCount(saved.demoRunCount);
@@ -5460,12 +5568,17 @@ export default function Home() {
         if (typeof saved.model === "string") setModel(saved.model);
         if (Array.isArray(saved.availableModels)) setAvailableModels(saved.availableModels.filter((item): item is string => typeof item === "string"));
         if (typeof saved.baseUrl === "string") setBaseUrl(saved.baseUrl);
-        if (["disabled", "firecrawl", "searxng"].includes(String(saved.researchProvider))) setResearchProvider(saved.researchProvider as ResearchProviderId);
+        if (["disabled", "firecrawl", "searxng", "deepseek"].includes(String(saved.researchProvider))) setResearchProvider(saved.researchProvider as ResearchProviderId);
         if (typeof saved.researchBaseUrl === "string") setResearchBaseUrl(saved.researchBaseUrl);
         if (saved.sessionTokenUsage && typeof saved.sessionTokenUsage === "object") setSessionTokenUsage(normalizeAiTokenUsage(saved.sessionTokenUsage));
         if (Array.isArray(saved.platforms)) setPlatforms(saved.platforms.filter((item): item is string => typeof item === "string"));
         if (typeof saved.allowSensitiveExport === "boolean") setAllowSensitiveExport(saved.allowSensitiveExport);
-        if (Array.isArray(saved.completedSteps)) setCompletedSteps(new Set(saved.completedSteps.filter((item): item is StepId => ["brief", "interview", "blueprint", "build", "evaluate", "ship"].includes(String(item)))));
+        if (Array.isArray(saved.completedSteps)) {
+          const restoredCompletedSteps = saved.completedSteps.filter((item): item is StepId => ["brief", "interview", "blueprint", "build", "evaluate", "ship"].includes(String(item)));
+          setCompletedSteps(new Set(restoreFrozenBundleExactly
+            ? restoredCompletedSteps
+            : restoredCompletedSteps.filter((item) => item !== "evaluate" && item !== "ship")));
+        }
       }
     } catch {
       window.sessionStorage.removeItem(SESSION_STORAGE_KEY);
@@ -5513,6 +5626,8 @@ export default function Home() {
     if (!sessionHydrated) return;
     try {
       window.sessionStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({
+        sessionSchemaVersion: SESSION_SCHEMA_VERSION,
+        pipelineContractVersion: PIPELINE_CONTRACT_VERSION,
         step, idea, sourceNames, sourceWarnings, sourceInsights, sourceReceipt, contextNotes,
         interviewRounds, interviewRoundOrigins, interviewRoundIndex, highestRoundReached, intentInterpretation,
         discoveryPreview, previewFeedback, previewFeedbackCustom, interviewReadiness,
@@ -5564,44 +5679,58 @@ export default function Home() {
   const requirementCoverage = summarizeRequirementCoverage(interviewEvidence);
   const coveredDimensions = requirementCoverage.covered;
   const uncertainDimensions = requirementCoverage.uncertain;
-  const coveredDimensionCount = requirementCoverage.coveredCount;
-  const uncertainDimensionCount = requirementCoverage.uncertainCount;
   const ideaReady = idea.trim().length >= 2;
   const interviewReady = questions.length > 0 && currentAnsweredCount === questions.length;
   const isFinalInterviewRound = interviewRoundIndex === INTERVIEW_ROUND_META.length - 1;
   const interviewCompletion = interviewCompletionGate({ rounds: interviewRounds, origins: interviewRoundOrigins, answers,
     currentRoundIndex: interviewRoundIndex, highestRoundReached, expectedQuestionCounts: INTERVIEW_ROUND_META.map((round) => round.dimensions.length) });
-  const completeness = Math.min(100, Math.round(
-    (ideaReady ? 15 : 0)
-    + ((coveredDimensionCount - uncertainDimensionCount * 0.55) / REQUIREMENT_DIMENSIONS.length) * 85
-    + Math.min(10, (sourceNames.length + contextFilledCount) * 2.5),
-  ));
   const hasApiKey = apiKey.trim().length > 8 || credentialStored;
   const hasRealModel = hasApiKey;
   const researchReady = researchProvider === "firecrawl"
     ? researchApiKey.trim().length > 7 || researchCredentialStored
     : researchProvider === "searxng"
       ? /^https?:\/\//i.test(researchBaseUrl.trim())
+      : researchProvider === "deepseek"
+        ? provider === "deepseek" && hasApiKey
       : false;
+  const managedResearchChoices = Array.from(new Set<ResearchProviderId>([
+    ...(researchCredentialManaged && configuredResearchProvider !== "disabled" ? [configuredResearchProvider] : []),
+    ...(provider === "deepseek" ? ["deepseek" as const] : []),
+  ]));
   const busy = busyTask !== null;
   const optimizationActive = optimizationStatus === "analyzing" || optimizationStatus === "optimizing" || optimizationStatus === "reevaluating";
   const optimizationTarget = optimizationTargetIndex === null ? null : evals[optimizationTargetIndex] || null;
   const optimizationTargetHistory = optimizationTarget ? optimizationHistory[optimizationTarget.label] : null;
   const optimizationPhaseIndex = optimizationStatus === "analyzing" ? 0 : optimizationStatus === "ready" ? 1 : optimizationStatus === "optimizing" ? 1 : optimizationStatus === "reevaluating" ? 2 : optimizationStatus === "complete" ? 3 : 0;
   const observedEvals = evals.filter((item) => item.coverage !== "not-covered");
-  const strongEvals = observedEvals.filter((item) => item.score >= DEMO_SCORING_POLICY.observedGoodFloor);
-  const needsWorkEvals = observedEvals.filter((item) => item.score < DEMO_SCORING_POLICY.observedGoodFloor);
-  const averageEvalScore = evalRan && observedEvals.length ? Math.round(observedEvals.reduce((total, item) => total + item.score, 0) / observedEvals.length) : 0;
-  const evaluationHeadline = needsWorkEvals.length
-    ? `这次试跑发现 ${needsWorkEvals.length} 个还能再提升的地方`
-    : observedEvals.length
-      ? "这次表现符合要求"
-      : "本轮结果待评估";
-  const evaluationSummary = needsWorkEvals.length
-    ? `优先处理“${needsWorkEvals[0].label}”。其他结论会保留，不需要一次读完所有评语。`
-    : observedEvals.length
-      ? `已经确认 ${strongEvals.length} 项表现，可以继续发布检查，也可以选择其中一项继续提高。`
-      : "继续对话并更新评分，查看本轮结果。";
+  const formalComparisonIsCurrent = generationLoop.benchmarkRuns > 0
+    && generationLoop.comparisonRevision === currentBundleRevision
+    && generationLoop.comparisonVerdict !== "not-run"
+    && generationLoop.comparisonEvidence.length > 0;
+  const formalComparisonRows = formalComparisonIsCurrent
+    ? generationLoop.comparisonEvidence.map((item) => {
+        const benchmarkCase = generationLoop.benchmarkSuiteCases.find((candidate) => candidate.id === item.caseId);
+        const verdict = item.blindVerdict || (item.delta >= 3 ? "candidate" : item.delta < 0 ? "baseline" : "tie");
+        return {
+          ...item,
+          verdict,
+          title: comparisonTaskTitle(item.taskPrompt || benchmarkCase?.prompt || "", "代表性任务对照"),
+          explanation: item.comparisonEvidence || "这条历史对照只保留了判定结果。重新运行正式对照后，会补齐裸模型与 Skill 的逐条差异证据。",
+        };
+      })
+    : [];
+  const formalImprovementRows = formalComparisonRows.filter((item) => item.verdict === "candidate");
+  const formalGapRows = formalComparisonRows.filter((item) => item.verdict !== "candidate");
+  const evaluationHeadline = !formalComparisonIsCurrent
+    ? "还没有与当前版本匹配的裸模型对照"
+    : generationLoop.comparisonVerdict === "improved"
+      ? `在 ${formalImprovementRows.length} 个真实任务中，Skill 的回答更好`
+      : generationLoop.comparisonVerdict === "equivalent"
+        ? "Skill 与裸模型表现接近，暂不宣称提升"
+        : "这版 Skill 还没有稳定超过裸模型";
+  const evaluationSummary = !formalComparisonIsCurrent
+    ? "需要让同一批任务分别交给裸模型和当前 Skill，再匿名比较两边结果。"
+    : "下面每条结论都来自同一任务、同一模型的匿名 A/B 对照；不再用固定维度或自评分代替真实差异。";
   const busyStageIndex = busyTask
     ? Math.min(BUSY_STAGES[busyTask].stages.length - 1, busyPhaseIndex)
     : 0;
@@ -5609,6 +5738,11 @@ export default function Home() {
   const busyElapsedLabel = busyElapsed < 60
     ? `${busyElapsed} 秒`
     : `${Math.floor(busyElapsed / 60)} 分 ${busyElapsed % 60} 秒`;
+  const busyBuildProgress = busyTask === "build"
+    ? busyClosing
+      ? 100
+      : Math.min(99, Math.max(1, Math.ceil((busyElapsed / BUILD_ESTIMATED_SECONDS) * 100)))
+    : null;
   const busyExecutionLabel = busyExecutionKind === "local"
     ? "本地确定性检查"
     : busyExecutionKind === "loop"
@@ -5621,16 +5755,6 @@ export default function Home() {
       : busyElapsed < 25
         ? `${activeAiMode ? AI_MODE_LABELS[activeAiMode] || activeAiMode : "模型任务"}正在返回真实结果；当前回答会一直保留。`
         : "流程仍在处理，已完成的步骤会保留；上方显示本次流程累计耗时，不代表当前请求超时或正在重试。";
-  const busyTokenUsageStatus = busyTokenUsage.pendingPromptTokens > 0
-    ? `输入约 ${formatAiTokens(busyTokenUsage.promptTokens)} · 输出生成中`
-    : busyTokenUsage.requests > 0
-      ? `${formatAiTokens(busyTokenUsage.promptTokens)} 输入 · ${formatAiTokens(busyTokenUsage.completionTokens)} 输出`
-      : "本地检查，不调用模型";
-  const busyTokenUsageHint = busyTokenUsage.pendingPromptTokens > 0
-    ? "当前为输入预估，模型返回后会自动校准"
-    : busyTokenUsage.estimated
-      ? "部分请求未返回 usage，已按文本长度估算"
-      : "已按模型返回的 usage 统计";
   const modelChoices = Array.from(new Set([
     ...PROVIDERS[provider].models.map((item) => item.id),
     ...availableModels,
@@ -5677,10 +5801,26 @@ export default function Home() {
       && generationLoop.bestScore === 100
       && generationLoop.passRate === 100
       && generationLoop.closureScore === 100);
-  const optimizationCompletedWithRollback = generationLoop.status === "attention"
-    && generationLoop.minimalityChecked
-    && generationLoop.benchmarkRuns > 0
-    && !optimizationStableAtCeiling;
+  const visibleGenerationOutcome: GenerationLoopOutcome = optimizationBlockedByBuild
+    ? "build-blocked"
+    : generationLoop.status === "running"
+      ? "running"
+      : generationLoop.status === "passed"
+        ? "accepted"
+        : optimizationStableAtCeiling
+          ? "stable"
+          : generationLoop.outcome !== "not-run"
+            ? generationLoop.outcome
+            : generationLoop.status === "attention"
+              ? generationLoop.benchmarkRuns > 0 && generationLoop.rejectedPatches > 0
+                ? "no-safe-change"
+                : "evaluation-incomplete"
+              : "not-run";
+  const generationCopy = generationResultCopy({
+    outcome: visibleGenerationOutcome,
+    issueCount: generationLoop.issues.length,
+    lift: generationLoop.lift,
+  });
   const buildUnresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
   const buildProductCapabilities = capabilityPlan.items
     .filter((item) => capabilityIsActive(item) && item.kind !== "eval")
@@ -5709,23 +5849,48 @@ export default function Home() {
     : createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0);
   const optionalToolCapabilities = capabilityPlan.items.filter((item) => item.optional && (item.kind === "builtin-tool" || item.kind === "mcp"));
   const adoptedRuntimeCapabilities = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind !== "eval" && item.layer === "runtime");
+  const coreRuntimeCapabilities = adoptedRuntimeCapabilities.filter((item) => !item.optional);
+  const adoptedOptionalCapabilityCount = optionalToolCapabilities.filter(capabilityIsActive).length;
   const unresolvedMcpCount = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind === "mcp" && item.status === "requires-setup").length;
   const selectedCatalogCapabilityCount = CAPABILITY_LIBRARY.filter((libraryItem) => capabilityPlan.items.some((item) => item.id === libraryItem.id && capabilityIsActive(item))).length;
-  const thinkingWords = busyTask ? createContextualThinkingWords({
-    task: busyTask,
-    idea,
-    stage: busyStage,
-    questions,
-    answers,
-    blueprint,
-    capabilities: capabilityPlan.items,
-    loopPlan,
-    issues: buildLoop.issues,
-    feedback: [...feedbackReasons, feedbackCustom, ...(personalizationHistory.at(-1)?.feedback || [])].filter(Boolean),
-    demo: skillDemo,
-  }) : [];
   const activeSkillName = stripYamlQuotes(files["SKILL.md"]?.match(/^name:\s*([^\n]+)$/m)?.[1] || "") || "generated-skill";
   const workspaceName = completedSteps.has("build") ? activeSkillName : ideaReady ? "新 Skill 草稿" : "未命名 Skill";
+
+  useEffect(() => {
+    const viewport = busyOutputViewportRef.current;
+    if (!viewport || !busyOutputText) return;
+    viewport.scrollTop = 0;
+    if (window.matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+    let animationFrame = 0;
+    let interrupted = false;
+    const stopAutoScroll = () => {
+      interrupted = true;
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+    };
+    viewport.addEventListener("wheel", stopAutoScroll, { passive: true });
+    viewport.addEventListener("touchstart", stopAutoScroll, { passive: true });
+    const startDelay = window.setTimeout(() => {
+      const bottomPadding = Number.parseFloat(window.getComputedStyle(viewport).paddingBottom) || 0;
+      const maxScroll = Math.max(0, viewport.scrollHeight - viewport.clientHeight - bottomPadding);
+      if (!maxScroll) return;
+      const startedAt = performance.now();
+      const duration = Math.min(2_750, Math.max(1_300, maxScroll * 3.125));
+      const advance = (now: number) => {
+        if (interrupted) return;
+        const progress = Math.min(1, (now - startedAt) / duration);
+        const easedProgress = 1 - Math.pow(1 - progress, 3);
+        viewport.scrollTop = Math.min(maxScroll, maxScroll * easedProgress);
+        if (progress < 1) animationFrame = window.requestAnimationFrame(advance);
+      };
+      animationFrame = window.requestAnimationFrame(advance);
+    }, 90);
+    return () => {
+      window.clearTimeout(startDelay);
+      if (animationFrame) window.cancelAnimationFrame(animationFrame);
+      viewport.removeEventListener("wheel", stopAutoScroll);
+      viewport.removeEventListener("touchstart", stopAutoScroll);
+    };
+  }, [busyOutputText]);
 
   useEffect(() => {
     if (!toast) return;
@@ -5743,7 +5908,7 @@ export default function Home() {
     const compilerFixable = bundleAudit.blockers.some((blocker) => (
       blocker === "总目标为空、过短或仍是占位内容"
       || blocker === "没有保留用户确认的内容改动范围"
-      || blocker === "内容限制与用户确认的润色或扩写权限冲突"
+      || blocker.startsWith("内容限制与用户确认的事实补写权限冲突")
       || blocker.includes("[USER_PERMISSION_IR_CONFLICT]")
       || blocker.includes("[USER_PERMISSION_RUNTIME_CONFLICT]")
       || blocker.includes("[USER_PERMISSION_EVAL_CONFLICT]")
@@ -5986,17 +6151,12 @@ export default function Home() {
 
   function notifyGenerationLoopResult(state: GenerationLoopState) {
     const elapsedSeconds = loopStartedAt.current ? Math.max(1, Math.round((Date.now() - loopStartedAt.current) / 1_000)) : 0;
-    const title = state.status === "passed" ? "Skill 优化已完成" : state.status === "stable" ? "Skill 已保留当前最佳版本" : "Skill 优化需要查看";
-    const result = state.status === "passed"
-      ? `当前最佳版本已通过回归门控${state.lift ? `，Skill Lift ${state.lift > 0 ? "+" : ""}${state.lift}` : ""}。`
-      : state.status === "stable"
-        ? "冻结评测全部通过，但没有候选证明额外提升；已安全保留当前最佳版本。"
-      : `${state.stopReason || "Loop 已停止并保留当前最佳版本。"}`;
-    const body = `${result}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220);
-    setCompletionNotice({ title, body });
-    document.title = `● ${title} · SkillCanvas`;
+    const copy = generationResultCopy({ outcome: state.outcome, issueCount: state.issues.length, lift: state.lift });
+    const body = `${copy.body}${elapsedSeconds ? ` 用时约 ${elapsedSeconds} 秒。` : ""}`.slice(0, 220);
+    setCompletionNotice({ title: copy.title, body });
+    document.title = `● ${copy.title} · SkillCanvas`;
     if (!("Notification" in window) || window.Notification.permission !== "granted") return;
-    void deliverBrowserNotification(title, {
+    void deliverBrowserNotification(copy.title, {
       body,
       tag: "skillcanvas-generation-loop",
     });
@@ -6020,7 +6180,13 @@ export default function Home() {
   }
 
   function updateResearchProvider(next: ResearchProviderId) {
-    if (next !== researchProvider) setResearchCredentialStored(next === "searxng" && Boolean(RESEARCH_PROVIDERS[next].baseUrl));
+    if (next !== researchProvider) setResearchCredentialStored(
+      next === "deepseek"
+        ? provider === "deepseek" && hasApiKey
+        : next === configuredResearchProvider
+          ? true
+          : next === "searxng" && Boolean(RESEARCH_PROVIDERS[next].baseUrl),
+    );
     setResearchProvider(next);
     setResearchApiKey("");
     setResearchBaseUrl(RESEARCH_PROVIDERS[next].baseUrl);
@@ -6193,24 +6359,34 @@ export default function Home() {
     setBusyElapsed(0);
     setBusyExecutionKind("local");
     setBusyExecutionNote("正在准备当前步骤");
+    setBusyOutputText("");
+    busyOutputArrivedAt.current = 0;
     setActiveAiMode("");
     setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
     setRetryAction(retry);
   }
 
   function finishBusy() {
-    setBusyClosing(true);
     if (busyCloseTimer.current !== null) window.clearTimeout(busyCloseTimer.current);
-    busyCloseTimer.current = window.setTimeout(() => {
-      setBusyTask(null);
-      setBusyClosing(false);
-      setBusyPhaseIndex(0);
-      setBusyElapsed(0);
-      setBusyExecutionKind("local");
-      setBusyExecutionNote("正在准备当前步骤");
-      setActiveAiMode("");
-      busyCloseTimer.current = null;
-    }, 220);
+    const close = () => {
+      setBusyClosing(true);
+      busyCloseTimer.current = window.setTimeout(() => {
+        setBusyTask(null);
+        setBusyClosing(false);
+        setBusyPhaseIndex(0);
+        setBusyElapsed(0);
+        setBusyExecutionKind("local");
+        setBusyExecutionNote("正在准备当前步骤");
+        setBusyOutputText("");
+        busyOutputArrivedAt.current = 0;
+        setActiveAiMode("");
+        busyCloseTimer.current = null;
+      }, 220);
+    };
+    const visibleFor = busyOutputArrivedAt.current ? Date.now() - busyOutputArrivedAt.current : Number.POSITIVE_INFINITY;
+    const remaining = Math.max(0, 1_100 - visibleFor);
+    if (remaining) busyCloseTimer.current = window.setTimeout(close, remaining);
+    else close();
   }
 
   function showLocalBusy(note: string) {
@@ -6331,6 +6507,9 @@ export default function Home() {
           throw responseError;
         }
         settleActualUsage(data.usage || {}, data.content);
+        setBusyOutputText(data.content.slice(0, 16_000));
+        setBusyOutputRevision((revision) => revision + 1);
+        busyOutputArrivedAt.current = Date.now();
         return jsonFromText<T>(data.content);
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
@@ -6626,6 +6805,36 @@ export default function Home() {
       revealedScores,
       caseResults: comparison.caseResults.map((item) => ({ ...item, revealedWinner: revealWinner(item.winner) })),
     };
+  }
+
+  function attachTaskSpecificComparisonEvidence(
+    cases: BenchmarkCaseComparison[],
+    baseline: HarnessReport,
+    skill: HarnessReport,
+    blind: Awaited<ReturnType<typeof runBlindHarnessComparison>>,
+  ): BenchmarkCaseComparison[] {
+    const contractCases = new Map(baseline.contract.cases.map((item) => [item.id, item]));
+    const baselineCases = new Map(baseline.evidence.cases.map((item) => [item.caseId, item]));
+    const skillCases = new Map(skill.evidence.cases.map((item) => [item.caseId, item]));
+    const blindCases = new Map(blind.caseResults.map((item) => [item.caseId, item]));
+    return cases.map((item) => {
+      const contractCase = contractCases.get(item.caseId);
+      const actualTask = typeof contractCase?.context.actual_task === "string" ? contractCase.context.actual_task.trim() : "";
+      const blindCase = blindCases.get(item.caseId);
+      const revealedWinner = blindCase?.revealedWinner === "left"
+        ? "baseline"
+        : blindCase?.revealedWinner === "right"
+          ? "candidate"
+          : "tie";
+      return {
+        ...item,
+        taskPrompt: (actualTask || contractCase?.prompt || item.caseId).slice(0, 700),
+        baselineOutput: (baselineCases.get(item.caseId)?.output || "").slice(0, 1_600),
+        skillOutput: (skillCases.get(item.caseId)?.output || "").slice(0, 1_600),
+        blindVerdict: revealedWinner,
+        comparisonEvidence: (blindCase?.evidence || "").slice(0, 700),
+      };
+    });
   }
 
   function commitSkillMutation(receipt: SkillMutationReceipt, candidateFiles?: Record<string, string>) {
@@ -7348,7 +7557,15 @@ export default function Home() {
       const foundation = result.foundation;
       const normalizedCapabilities = normalizeCapabilityPlan(result.capabilityPlan);
       if (!normalizedCapabilities) throw new Error("模型没有返回完整的能力与资源计划");
-      const plannedCapabilities = await ensureValidGenerationWorkflow(ensureTaskCapabilities(normalizedCapabilities, idea, demoAnswers));
+      const checkpoint = blueprintCheckpointRef.current;
+      const checkpointKey = checkpoint.key;
+      const workflowOwnerKey = checkpoint.workflowOwnerKey;
+      const plannedCapabilities = await ensureValidGenerationWorkflow(ensureTaskCapabilities(normalizedCapabilities, idea, demoAnswers), (steps) => {
+        if (checkpoint === blueprintCheckpointRef.current && checkpoint.key === checkpointKey
+          && checkpoint.workflowOwnerKey === workflowOwnerKey && checkpoint.workflow) {
+          checkpoint.workflow.workflowSteps = structuredClone(steps);
+        }
+      });
       const plannedLoop = normalizeLoopPlan(result.loopPlan, deriveLoopPlan(idea, demoAnswers, plannedCapabilities));
       const confirmedAnswerText = confirmedAnswerEvidenceText(demoAnswers);
       const normalizedBlueprint = foundation.sections.map((item, index) => ({ ...item, content: reconcileDataMutationPolicy(item.content, confirmedAnswerText), index: item.index || String.fromCharCode(65 + index) }));
@@ -7556,7 +7773,39 @@ export default function Home() {
     let projectionRebuildAttempted = false;
     let evalCoverageRepairAttempted = false;
     let capabilityDeltaRepairAttempted = false;
+    let contentPermissionRepairAttempted = false;
     while (validation.executionReady && state.issues.length && rounds < BUILD_REPAIR_MAX_ROUNDS) {
+      // The owner-approved content boundary is compiler-owned. Reconcile its
+      // canonical source and reproject before asking a model to guess which
+      // generated sentence caused a broad permission conflict.
+      const permissionIssue = (issue: PipelineIssue) => /USER_PERMISSION_RUNTIME_CONFLICT|UNCONFIRMED_CONTENT_RESTRICTION|内容限制与用户确认的事实补写权限冲突/.test(issue.evidence);
+      if (!contentPermissionRepairAttempted && state.issues.some(permissionIssue)) {
+        contentPermissionRepairAttempted = true;
+        const sourceIR = parseCanonicalSkillIR(currentFiles);
+        if (sourceIR) {
+          try {
+            const candidateFiles = finalizeSkillFiles(currentFiles, idea, input.answers, input.sourceText, input.generationPlan, loopPlan, sourceIR);
+            const candidateValidation = await validateBundle(candidateFiles);
+            const candidateState = collectP1ContractState(candidateFiles, input.answers, input.generationPlan, candidateValidation);
+            const progress = contractRepairProgress(state.issues, candidateState.issues);
+            const permissionReduced = candidateState.issues.filter(permissionIssue).length < state.issues.filter(permissionIssue).length;
+            const accepted = candidateValidation.executionReady && progress.improved && permissionReduced;
+            reportClientGenerationLoopEvent("generation_loop_candidate", {
+              phase: "contract-repair", round: rounds, accepted,
+              updatedPaths: accepted ? ["evals/skill-ir.json", "SKILL.md", "references/"] : [],
+              reason: accepted ? `已按用户授权范围重建运行规则；${progress.reason}` : `权限规则重建未解决阻塞：${progress.reason}`,
+            });
+            if (accepted) {
+              currentFiles = candidateFiles;
+              validation = candidateValidation;
+              state = candidateState;
+              continue;
+            }
+          } catch (error) {
+            rejectedAttempts.push(`权限规则重建失败：${error instanceof Error ? error.message : "未知原因"}`);
+          }
+        }
+      }
       // A compiler projection cannot be fixed by model-authored file edits.
       // Repair it locally once, even when independent semantic blockers also
       // exist. Never spend the model budget retrying a broken compiler.
@@ -7673,7 +7922,7 @@ export default function Home() {
         if (!validation.executionReady || !state.issues.length) break;
         continue;
       }
-      if (issuesAreCompilerOwnedEvalCoverage(state.issues)) {
+      if (state.issues.some(isCompilerOwnedEvalCoverageIssue)) {
         if (evalCoverageRepairAttempted) {
           rejectedAttempts.push("Canonical Eval Compiler 补齐后仍存在同类覆盖阻塞，已停止重复生成；需要修复评测编译器而不是改写 Skill 语义");
           break;
@@ -7716,9 +7965,23 @@ export default function Home() {
           continue;
         }
       }
+      const unhandledCompilerIssues = compilerOwnedContractIssues(state.issues);
+      if (unhandledCompilerIssues.length) {
+        const reason = `发现 ${unhandledCompilerIssues.length} 项编译器所有的契约问题，已停止模型空转：${unhandledCompilerIssues.map((issue) => issue.evidence).join("；").slice(0, 360)}`;
+        rejectedAttempts.push(reason);
+        reportClientGenerationLoopEvent("generation_loop_candidate", {
+          phase: "compiler-contract-routing",
+          round: rounds,
+          accepted: false,
+          reason,
+        });
+        break;
+      }
       const blockers = state.issues.map((issue) => `${issue.type} · ${issue.files.join("、") || "bundle"} · ${issue.evidence}`);
       const allowedMutationTypes = allowedP1MutationTypes(state.issues);
+      const contentPermissionConflicts = contentPermissionConflictLocations(currentFiles, resolveContentPermission(input.answers), true).slice(0, 8);
       const evidencePaths = [...new Set([
+        ...contentPermissionConflicts.map((item) => item.path),
         "SKILL.md",
         "evals/capability-manifest.json",
         ...state.issues.flatMap((issue) => issue.files),
@@ -7752,6 +8015,7 @@ export default function Home() {
             warnings: state.audit.warnings,
             contractAttempt: rounds + 1,
             allowedMutationTypes,
+            contentPermissionConflicts,
             missingResources: currentIR ? missingBundleResources(currentIR, currentFiles) : [],
           },
           canonicalTargets: { ...canonicalMutationTargetCatalog(currentFiles), allowedMutationTypes },
@@ -7840,7 +8104,7 @@ export default function Home() {
     loopStartedAt.current = Date.now();
     setBusyPhaseIndex(4);
     showLoopBusy("Build 已通过，正在固定能力边界并启动 Optimization Loop");
-    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "static", stopReason: "正在建立能力闭环" });
+    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, outcome: "running", status: "running", phase: "static", stopReason: "正在建立能力闭环" });
     reportClientGenerationLoopEvent("generation_loop_started", { phase: "static", reason: "固定 Goal 并开始能力闭环检查" });
     const restoredCanonicalIR = parseCanonicalSkillIR(initialFiles);
     const restoredPlan = reconcileCapabilityPlanWithCanonicalIR(generationPlan, restoredCanonicalIR);
@@ -7929,6 +8193,7 @@ export default function Home() {
       const p0Evidence = bestBundleValidation.issues.filter((issue) => issue.priority === "P0").map((issue) => issue.message);
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "build-blocked",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -7944,6 +8209,7 @@ export default function Home() {
     if (!initialContractRepair.passed || !bestBundleValidation.contractReady || staticPolicy.priority === "P1") {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "build-blocked",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8003,6 +8269,7 @@ export default function Home() {
     if (heldOutCoverage.missing.length) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "evaluation-incomplete",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8018,6 +8285,7 @@ export default function Home() {
     if (trainCases.length < 1 || selectionCases.length < 2) {
       const state: GenerationLoopState = {
         ...DEFAULT_GENERATION_LOOP,
+        outcome: "evaluation-incomplete",
         status: "attention",
         phase: "complete",
         closureScore: bestClosure.score,
@@ -8093,7 +8361,7 @@ export default function Home() {
       comparisonStage,
       comparisonCaseCount: selectionCases.length,
       comparisonVerdict: initialComparison.verdict,
-      comparisonEvidence: initialComparison.cases,
+      comparisonEvidence: attachTaskSpecificComparisonEvidence(initialComparison.cases, baselineHarness, bestHarness, blindResult),
       benchmarkSuiteCases: selectionCases,
       lift: initialComparison.lift,
       passRate: bestMetrics.passRate,
@@ -8123,6 +8391,8 @@ export default function Home() {
     });
     let acceptedPatches = 0;
     let rejectedPatches = 0;
+    let candidateEvalAttempts = 0;
+    let candidateEvalCompletions = 0;
     const rejectedHistory: Array<{
       round: number;
       reason: string;
@@ -8255,6 +8525,9 @@ export default function Home() {
                     provider: researchProvider,
                     apiKey: researchApiKey,
                     baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
+                    modelProvider: provider,
+                    modelApiKey: apiKey,
+                    model,
                     queries,
                   }),
                   signal: controller.signal,
@@ -8457,11 +8730,13 @@ export default function Home() {
       setGenerationLoop((current) => ({ ...current, phase: "validate", stopReason: `第 ${round} 轮：先运行冻结最终产物门禁；明显回退将不再触发诊断、复跑和匿名比较` }));
       let candidateHarness: HarnessReport;
       try {
+        candidateEvalAttempts += 1;
         candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 1 });
         if (comparisonNeedsStabilityRepeat(bestHarness, candidateHarness)) {
           reportClientGenerationLoopEvent("generation_loop_phase", { phase: "stability-repeat", round, reason: "候选首轮结果接近门槛或可能被接受，正在补充一次独立试跑" });
           candidateHarness = await runIsolatedEvalHarness({ cases: selectionCases, skillFiles: candidateFiles, configuration: "candidate", repeats: 2, resumeFrom: candidateHarness });
         }
+        candidateEvalCompletions += 1;
       } catch {
         rejectedPatches += 1;
         rejectedHistory.push({ round, reason: "候选版本未完成全部诊断任务或独立保留任务", files: candidateChangedPaths });
@@ -8796,6 +9071,17 @@ export default function Home() {
     ].filter(Boolean).slice(0, 8);
     const state: GenerationLoopState = {
       ...DEFAULT_GENERATION_LOOP,
+      outcome: passed
+        ? "accepted"
+        : stableAtCeiling
+          ? "stable"
+          : acceptedPatches > 0
+            ? "accepted-with-issues"
+            : candidateEvalCompletions > 0
+              ? "evaluated-no-improvement"
+              : candidateEvalAttempts > 0
+                ? "evaluation-incomplete"
+                : "no-safe-change",
       status: passed ? "passed" : stableAtCeiling ? "stable" : "attention",
       phase: "complete",
       rounds: Math.min(GENERATION_GOAL_MAX_ROUNDS, acceptedPatches + rejectedPatches),
@@ -8808,13 +9094,15 @@ export default function Home() {
       comparisonStage,
       comparisonCaseCount: selectionCases.length,
       comparisonVerdict: comparisonIsCurrent ? finalComparison.verdict : "not-run",
-      comparisonEvidence: comparisonIsCurrent ? finalComparison.cases : [],
+      comparisonEvidence: comparisonIsCurrent ? attachTaskSpecificComparisonEvidence(finalComparison.cases, baselineHarness, bestHarness, blindResult) : [],
       benchmarkSuiteCases: selectionCases,
       lift: finalComparison.lift,
       passRate: bestMetrics.passRate,
       closureScore: bestClosure.score,
       acceptedPatches,
       rejectedPatches,
+      candidateEvalAttempts,
+      candidateEvalCompletions,
       contractDigest: bestHarness.contract.digest,
       benchmarkCases: selectionCases.length,
       benchmarkRepeatsPerCase: Math.min(baselineHarness.benchmark.repeatsPerCase, bestHarness.benchmark.repeatsPerCase),
@@ -8913,6 +9201,13 @@ export default function Home() {
   }
 
   async function runBuildTimeKnowledgeCompiler(basePlan: CapabilityPlan, capabilityDelta: CapabilityDelta): Promise<KnowledgePack> {
+    const { policy, researchDelta } = prepareKnowledgeRuntime(capabilityDelta);
+    const externalGaps = policy.externalGaps;
+    if (!policy.required) {
+      const skipped = createNotRequiredKnowledgePack(capabilityDelta);
+      setKnowledgePack(skipped);
+      return skipped;
+    }
     setBuildLoop((current) => ({ ...current, status: "checking", phase: "knowledge" }));
     setInternalMcpEvidenceReports((current) => ({ ...current, "knowledge-compile": undefined }));
     showLoopBusy("正在判断哪些领域知识能真正改变 Skill 的专业判断与工作分支");
@@ -8921,28 +9216,47 @@ export default function Home() {
       sourceText: contextBundle,
       answers: interviewEvidence,
       capabilityPlan: basePlan,
-      capabilityDelta,
+      capabilityDelta: researchDelta,
     });
-    const plan = normalizeKnowledgePlan({
+    const normalizedPlan = normalizeKnowledgePlan({
       ...(rawPlan && typeof rawPlan === "object" ? rawPlan as Record<string, unknown> : {}),
-      required: capabilityDelta.skillMustTeach.length > 0,
-      capabilityDeltaGapIds: capabilityDelta.skillMustTeach.map((item) => item.id),
-      excludedGenericKnowledge: capabilityDelta.excludedGenericKnowledge,
+      capabilityDeltaGapIds: externalGaps.map((item) => item.id),
+      excludedGenericKnowledge: researchDelta.excludedGenericKnowledge,
       userPolicies: ["evidence-policy", "boundary", "autonomy", "output-format"].map((key) => (demoAnswers as Record<string, string>)[key] || "").filter(Boolean),
-    });
+    }, idea);
+    const plan = alignKnowledgePlanToCapabilityDelta(normalizedPlan, externalGaps, idea);
+    let knowledgeVerificationIncomplete = false;
     const verifyPack = async (candidate: KnowledgePack, prior?: KnowledgePack) => {
       const knowledgeClaims = knowledgeVerificationCandidates(candidate);
       if (!knowledgeClaims.length) return candidate;
       setBusyExecutionNote("正在核对每条规则的来源原文与对应能力差值，不把用户偏好当作外部知识");
-      const verdicts = await callAI<unknown>("knowledge-verify", { capabilityDelta, knowledgeClaims, acceptedKnowledge: knowledgeVerificationContext(prior), knowledgePlan: plan, answers: interviewEvidence });
-      return applyKnowledgeVerification(candidate, verdicts, prior);
+      const verification = await verifyKnowledgeClaimsInBatches({
+        claims: knowledgeClaims,
+        batchSize: 4,
+        call: (claimBatch) => callAI<unknown>("knowledge-verify", {
+          capabilityDelta: researchDelta,
+          knowledgeClaims: claimBatch,
+          acceptedKnowledge: knowledgeVerificationContext(prior),
+          knowledgePlan: plan,
+          answers: interviewEvidence,
+        }),
+      });
+      if (verification.failures.length) {
+        knowledgeVerificationIncomplete = true;
+        reportClientGenerationLoopEvent("generation_loop_failed", {
+          phase: "knowledge-verify-batch",
+          afterCount: verification.verdicts.length,
+          reason: `部分知识核验未完成：${verification.failures.slice(0, 2).join("；")}`,
+        });
+      }
+      return applyKnowledgeVerification(candidate, { verdicts: verification.verdicts }, prior);
     };
     const workflowMcpEnabled = mcpConnections.length > 0;
-    if (capabilityDelta.skillMustTeach.length > 0 && !plan.required) {
+    if (!plan.required) {
       const insufficient: KnowledgePack = {
         ...EMPTY_KNOWLEDGE_PACK,
         status: "unavailable",
-        summary: "Capability Delta 已发现专属能力差值，但四类知识检索计划不完整；本 Skill 已标记为知识不足，不会用泛化内容补齐。",
+        summary: "Capability Delta 已发现 external 专业知识差值，但四类知识检索计划不完整；本 Skill 已标记为知识不足，不会用泛化内容补齐。",
         sufficiency: "insufficient",
         plan,
         categoryCoverage: { covered: [], missing: plan.requiredCategories, score: 0 },
@@ -8950,17 +9264,6 @@ export default function Home() {
       };
       setKnowledgePack(insufficient);
       return insufficient;
-    }
-    if (!plan.required) {
-      const skipped: KnowledgePack = {
-        ...EMPTY_KNOWLEDGE_PACK,
-        status: "not-needed",
-        summary: plan.reason || "现有用户资料和模型能力已经足够，不额外制造领域知识文件",
-        plan,
-        generatedAt: new Date().toISOString(),
-      };
-      setKnowledgePack(skipped);
-      return skipped;
     }
     const researching: KnowledgePack = {
       ...EMPTY_KNOWLEDGE_PACK,
@@ -9013,6 +9316,12 @@ export default function Home() {
         const controller = new AbortController();
         const timeout = window.setTimeout(() => controller.abort(), 58_000);
         try {
+          const selectedQueries = selectKnowledgeQueries(plan.queries, plan.preferredDomains);
+          reportClientGenerationLoopEvent("generation_loop_phase", {
+            phase: "knowledge-query-plan",
+            queries: selectedQueries,
+            reason: `围绕 ${plan.capabilityDeltaGapIds.length} 个外部能力缺口执行 ${selectedQueries.length} 条定向检索`,
+          });
           const response = await fetch("/api/research", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
@@ -9020,7 +9329,11 @@ export default function Home() {
               provider: researchProvider,
               apiKey: researchApiKey,
               baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
-              queries: selectKnowledgeQueries(plan.queries, plan.preferredDomains),
+              modelProvider: provider,
+              modelApiKey: apiKey,
+              model,
+              preferredDomains: plan.preferredDomains,
+              queries: selectedQueries,
             }),
             signal: controller.signal,
           });
@@ -9049,12 +9362,12 @@ export default function Home() {
       const compiling: KnowledgePack = { ...researching, status: "compiling", sources, summary: `已取得 ${sources.length} 个来源${workflowMcpEnabled ? `（MCP ${mcpReport.sources.length}）` : ""}，正在提炼会改变 Skill 行为的专业规则${webResearchIssue ? `；网页补充未完成：${webResearchIssue}` : ""}` };
       setKnowledgePack(compiling);
       setBusyExecutionNote(`已读取 ${sources.length} 个来源，正在核对适用条件、例外和失败处理`);
-      const evidenceFocus = [...plan.decisionDimensions, ...capabilityDelta.skillMustTeach.flatMap((gap) => gap.researchQuestions)];
+      const evidenceFocus = [...plan.decisionDimensions, ...externalGaps.flatMap((gap) => gap.researchQuestions)];
       let evidencePayload = buildKnowledgeEvidencePayload(sources, 42_000, { focus: evidenceFocus });
       let pack = await compileBatches({
         idea,
         answers: interviewEvidence,
-        capabilityDelta,
+        capabilityDelta: researchDelta,
         knowledgePlan: plan,
         researchSources: evidencePayload,
       });
@@ -9063,17 +9376,15 @@ export default function Home() {
         beforeCount: pack.diagnostics.candidateCount,
         afterCount: pack.atoms.length,
         blockers: pack.rejected.slice(-8),
-        reason: pack.diagnostics.validatorRejectedCount
-          ? `首轮 ${pack.diagnostics.candidateCount} 条候选中有 ${pack.diagnostics.validatorRejectedCount} 条未通过本地编译校验`
-          : `首轮形成 ${pack.atoms.length} 条可追溯规则`,
+        reason: `首轮累计提出 ${pack.diagnostics.candidateCount} 条候选（含分批与重复），保留 ${pack.atoms.length} 条；另有 ${pack.diagnostics.validatorRejectedCount} 条未采用或去重记录`,
       });
       const densityGate = knowledgePackNeedsExpansion(pack);
-      if (densityGate.needsExpansion && !compilationIncomplete) {
+      if (densityGate.needsExpansion && !compilationIncomplete && !knowledgeVerificationIncomplete) {
         setBusyExecutionKind("loop");
         setBusyExecutionNote(`${densityGate.reason}，正在针对未覆盖能力补搜来源；引用不支持规则时，不会只改写同一批证据`);
         try {
           const missingGapIds = new Set(pack.evidenceCoverage?.missingGapIds || plan.capabilityDeltaGapIds);
-          const gapQuestions = capabilityDelta.skillMustTeach.filter((gap) => missingGapIds.has(gap.id)).flatMap((gap) => gap.researchQuestions);
+          const gapQuestions = externalGaps.filter((gap) => missingGapIds.has(gap.id)).flatMap((gap) => gap.researchQuestions);
           const followupQueries = buildFollowupResearchQueries(plan, densityGate.missingDimensions, gapQuestions);
           const previousUrls = new Set(sources.map((source) => source.url));
           const usedUrls = pack.atoms.flatMap((atom) => atom.sourceUrls);
@@ -9086,6 +9397,12 @@ export default function Home() {
               const followupController = new AbortController();
               const followupTimeout = window.setTimeout(() => followupController.abort(), 45_000);
               try {
+                const selectedFollowupQueries = selectKnowledgeQueries(followupQueries, plan.preferredDomains);
+                reportClientGenerationLoopEvent("generation_loop_phase", {
+                  phase: "knowledge-query-followup",
+                  queries: selectedFollowupQueries,
+                  reason: `针对 ${densityGate.missingDimensions.length || missingGapIds.size} 个未覆盖知识维度补搜`,
+                });
                 const followupResponse = await fetch("/api/research", {
                   method: "POST",
                   headers: { "Content-Type": "application/json" },
@@ -9093,7 +9410,11 @@ export default function Home() {
                     provider: researchProvider,
                     apiKey: researchApiKey,
                     baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
-                    queries: selectKnowledgeQueries(followupQueries, plan.preferredDomains),
+                    modelProvider: provider,
+                    modelApiKey: apiKey,
+                    model,
+                    preferredDomains: plan.preferredDomains,
+                    queries: selectedFollowupQueries,
                   }),
                   signal: followupController.signal,
                 });
@@ -9112,7 +9433,7 @@ export default function Home() {
           pack = await compileBatches({
             idea,
             answers: interviewEvidence,
-            capabilityDelta,
+            capabilityDelta: researchDelta,
             knowledgePlan: { ...plan, knowledgeGaps: densityGate.missingDimensions.length ? densityGate.missingDimensions : plan.knowledgeGaps },
             researchSources: evidencePayload,
             priorKnowledgePack: serializeKnowledgePackForRefinement(pack, evidencePayload),
@@ -9148,20 +9469,21 @@ export default function Home() {
     }
   }
 
-  async function ensureValidGenerationWorkflow(plan: CapabilityPlan): Promise<CapabilityPlan> {
+  async function ensureValidGenerationWorkflow(plan: CapabilityPlan, saveCheckpoint?: (steps: CapabilityPlan["workflowSteps"]) => void): Promise<CapabilityPlan> {
     const result = await repairWorkflowPlan({
       workflowSteps: plan.workflowSteps,
       capabilities: plan.items.filter((item) => item.kind !== "eval" && capabilityIsActive(item)),
       inputs: deriveTaskInputContract({ idea, answers: demoAnswers, capabilityInputs: plan.items.filter((item) => item.kind === "llm").map((item) => item.input) }),
+      stateFields: plan.stateModel.needed ? plan.stateModel.fields.map((field) => field.name) : [],
     }, (workflowRepair) => callAI("workflow-repair", {
       idea, answers: interviewEvidence, outputContract: plan.outputContract, workflowRepair,
-    }), ({ attempt, status, issues }) => {
+    }), ({ attempt, status, issues, bindingChanges }) => {
       if (status === "repairing") showLoopBusy(`正在修复工作流连线（第 ${attempt} 轮），保留已有任务、知识和用户要求`);
       reportClientGenerationLoopEvent(status === "failed" ? "generation_loop_failed" : "generation_loop_phase", {
-        phase: "workflow-dag-preflight", round: attempt, blockers: issues,
+        phase: "workflow-dag-preflight", round: attempt, blockers: issues, bindingChanges,
         reason: status === "passed" ? "输入、实际产物、用户反馈与交付连线检查通过" : status === "failed" ? "工作流连线修复仍未通过；未开始文件生成" : "只修复有问题的工作流连线，不重新生成需求或专业知识",
       });
-    });
+    }, saveCheckpoint);
     return { ...plan, workflowSteps: result.workflowSteps };
   }
 
@@ -9178,12 +9500,12 @@ export default function Home() {
     beginBusy("build", "compile-skill");
     setAiGenerationIssue("");
     setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "checking", phase: "contract" });
-    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, status: "running", phase: "contract", stopReason: "正在固定 Goal 与能力契约" });
+    setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, outcome: "running", status: "running", phase: "contract", stopReason: "正在固定目标与能力边界" });
     try {
       if (!hasRealModel) throw new Error("模型配置已缺失，请重新连接");
       // Old sessions may contain a pre-guard blueprint. Repair it before any
       // paid research/build work, not after knowledge has already completed.
-      generationPlan = await ensureValidGenerationWorkflow(generationPlan);
+      generationPlan = await ensureValidGenerationWorkflow(generationPlan, (steps) => setCapabilityPlan({ ...generationPlan, workflowSteps: steps }));
       setCapabilityPlan(generationPlan);
       durableBuild = await DurableWorkflowJournal.start("build", {
         goal: idea.slice(0, 2_000),
@@ -9217,7 +9539,25 @@ export default function Home() {
         }));
       }
       if (liveCapabilityDelta.status === "insufficient") {
-        throw new Error("CAPABILITY_DELTA_INSUFFICIENT: 两轮分析仍未识别出裸模型之外的可证明能力；已停止生成，避免产出只有普通 Prompt 的伪 Skill");
+        reportClientGenerationLoopEvent("generation_loop_phase", {
+          phase: "capability-delta", reason: "未识别出需要额外教授的专业能力；继续按已确认的要求生成基础 Skill，不虚构能力增益或来源知识",
+        });
+      }
+      if (!externalCapabilityDeltaGaps(liveCapabilityDelta).length && capabilityPlanNeedsExternalDecisionAudit(generationPlan)) {
+        showLoopBusy("正在复核任务里的分类、判断与验证规则是否需要外部专业依据");
+        const qualityAudit = normalizeCapabilityDelta(await callAI<unknown>("capability-delta", {
+          idea,
+          sourceText: contextBundle,
+          answers: interviewEvidence,
+          blueprint,
+          capabilityPlan: generationPlan,
+          validationFeedback: `上一轮只识别了用户已经确定的执行契约，没有识别任何 external gap。请只复核任务中的语义判断质量层：分类、诊断、比较、优先级、风险表达、专业受众表达或结果验证所需的任务特定规则。用户选择的标签、顺序、格式、确认点和权限仍是 contract-only，绝不能拿去搜索；但“如何把模糊输入正确映射到这些标签”“如何识别领域失败或验证输出没有越界”是不同的外部知识问题。如果确实不存在会改变正确性的外部规则，返回空 skillMustTeach；不要用泛化最佳实践凑数。\n\n上一轮 Capability Delta：\n${JSON.stringify(liveCapabilityDelta)}`,
+        }));
+        const externalAuditOnly = {
+          ...qualityAudit,
+          skillMustTeach: qualityAudit.skillMustTeach.filter((gap) => gap.knowledgeNeed === "external"),
+        };
+        liveCapabilityDelta = mergeCapabilityDeltas(liveCapabilityDelta, externalAuditOnly);
       }
       await durableBuild?.complete("capability-delta", {
         status: liveCapabilityDelta.status,
@@ -9249,7 +9589,7 @@ export default function Home() {
       );
       // Research can introduce another runtime resource. Validate its consumer
       // while retaining the completed knowledge pack and all original work.
-      generationPlan = await ensureValidGenerationWorkflow(generationPlan);
+      generationPlan = await ensureValidGenerationWorkflow(generationPlan, (steps) => setCapabilityPlan({ ...generationPlan, workflowSteps: steps }));
       setCapabilityPlan(generationPlan);
       const liveKnowledgeText = serializeKnowledgePack(liveKnowledgePack);
       const liveKnowledgeProjection = applyKnowledgePackToFiles({ "SKILL.md": "" }, liveKnowledgePack);
@@ -9265,12 +9605,7 @@ export default function Home() {
         sourceEvidence: `${sourceInsightText}\n${liveKnowledgeText}`,
         files: liveKnowledgeProjection,
         capabilityDelta: liveCapabilityDelta,
-        knowledgeAssessment: {
-          status: liveKnowledgePack.sufficiency,
-          requiredCategories: liveKnowledgePack.plan.requiredCategories,
-          coveredCategories: liveKnowledgePack.categoryCoverage.covered,
-          missingCategories: liveKnowledgePack.categoryCoverage.missing,
-        },
+        knowledgeAssessment: knowledgeAssessmentFromPack(liveCapabilityDelta, liveKnowledgePack),
       });
       await durableBuild?.complete("knowledge-compile", {
         status: liveKnowledgePack.status,
@@ -9336,7 +9671,7 @@ export default function Home() {
           const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
           goalLoopError = message;
           reportClientGenerationLoopEvent("generation_loop_failed", { phase: "runtime", reason: message });
-          const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
+          const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
           setGenerationLoop(failedState);
           notifyGenerationLoopResult(failedState);
         }
@@ -9344,6 +9679,7 @@ export default function Home() {
         await durableBuild?.fail(new Error(contractRepair.failureReason));
         const blockedState: GenerationLoopState = {
           ...DEFAULT_GENERATION_LOOP,
+          outcome: "build-blocked",
           status: "attention",
           phase: "complete",
           closureScore: contractRepair.closure.score,
@@ -9383,20 +9719,20 @@ export default function Home() {
       setSelectedFile("SKILL.md");
       setRetryAction(goalLoopError ? "rerun-optimization-loop" : null);
       setToast(goalLoopError
-        ? `Skill 文件已生成，但自动优化停在：${goalLoopError}`
+        ? "Skill 文件已生成并保存，但自动测试没有完成。你可以查看记录后重新测试。"
         : unresolvedBuildIssues.length
-        ? "内部编译没有收敛，已保留当前候选并自动记录失败节点"
+        ? "Skill 文件已生成并保存，但还有结构问题需要修复。"
         : repairRounds
-          ? `已完成生成、质检和 ${repairRounds} 轮定向修复`
-          : "已完成目标拆解、循环设计和生成质检");
+          ? `Skill 已生成并通过检查，系统自动修复了 ${repairRounds} 轮问题。`
+          : "Skill 已生成并通过文件检查。");
     } catch (error) {
       await durableBuild?.fail(error);
       const message = error instanceof Error ? error.message : "AI Skill 生成失败";
       reportClientGenerationLoopEvent("generation_loop_failed", { phase: message.includes("WORKFLOW_DAG") ? "workflow-dag-preflight" : "build", reason: message });
       setAiGenerationIssue(message);
       setBuildLoop((current) => ({ ...current, status: "attention", issues: [message] }));
-      notifyGenerationLoopResult({ ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: message });
-      setToast(`${message}；没有生成模板 Skill`);
+      notifyGenerationLoopResult({ ...DEFAULT_GENERATION_LOOP, outcome: "failed", status: "attention", phase: "complete", issues: [message], stopReason: message });
+      setToast("这次没有生成完成。你填写的内容已经保留，可以直接重试。");
     } finally {
       finishBusy();
     }
@@ -9433,16 +9769,17 @@ export default function Home() {
         frozen: !buildIssues.length,
       });
       setRetryAction(result.state.status === "passed" ? null : "rerun-optimization-loop");
-      setToast(result.state.status === "passed" ? "Optimization Loop 已完成并通过回归门控" : result.state.stopReason);
+      const resultCopy = generationResultCopy({ outcome: result.state.outcome, issueCount: result.state.issues.length, lift: result.state.lift });
+      setToast(resultCopy.body);
     } catch (error) {
       const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
       reportClientGenerationLoopEvent("generation_loop_failed", { phase: "runtime", reason: message });
-      const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
+      const failedState: GenerationLoopState = { ...DEFAULT_GENERATION_LOOP, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `自动优化停在：${message}` };
       setGenerationLoop(failedState);
       notifyGenerationLoopResult(failedState);
       setAiGenerationIssue(message);
       setRetryAction("rerun-optimization-loop");
-      setToast(`${message}；当前 Skill 文件没有被覆盖`);
+      setToast("测试没有完成，当前 Skill 文件仍然保留。请查看记录后重试。");
     } finally {
       optimizationRunInFlight.current = false;
       finishBusy();
@@ -9530,7 +9867,7 @@ export default function Home() {
         comparisonStage: current.comparisonStage === "initial" ? "initial" : "optimized",
         comparisonCaseCount: selectionCases.length,
         comparisonVerdict: comparison.verdict,
-        comparisonEvidence: comparison.cases,
+        comparisonEvidence: attachTaskSpecificComparisonEvidence(comparison.cases, baselineHarness, currentHarness, blindResult),
         benchmarkSuiteCases: selectionCases,
         lift: comparison.lift,
         passRate: currentMetrics.passRate,
@@ -9764,9 +10101,10 @@ export default function Home() {
     return conversation;
   }
 
-  async function sendDemoChatMessage() {
-    const message = demoChatInput.trim();
-    const attachments = demoChatAttachments;
+  async function sendDemoChatMessage(options: { message?: string; source?: "owner" | "inspiration" } = {}) {
+    const source = options.source || "owner";
+    const message = (options.message ?? demoChatInput).trim();
+    const attachments = source === "owner" ? demoChatAttachments : [];
     if ((!message && !attachments.length) || !skillDemo || demoChatBusy || demoChatFilesLoading) return;
     if (!hasRealModel) {
       setToast("继续对话前需要先连接模型");
@@ -9776,9 +10114,9 @@ export default function Home() {
     const sequence = demoChatSequence + 1;
     const visibleMessage = message || `请结合我刚上传的${attachments.length === 1 ? "文件" : `${attachments.length} 个文件`}继续。`;
     const userMessage: DemoChatMessage = {
-      id: `user-${demoRunCount}-${sequence}`,
+      id: `${source === "inspiration" ? "inspiration-user" : "user"}-${demoRunCount}-${sequence}`,
       role: "user",
-      source: "owner",
+      source,
       content: visibleMessage.slice(0, 3_000),
       attachments: attachments.length ? attachments : undefined,
     };
@@ -9808,10 +10146,41 @@ export default function Home() {
     } catch (error) {
       setDemoConversation((current) => current.filter((item) => item.id !== userMessage.id));
       setDemoChatInput(message);
-      setDemoChatAttachments(attachments);
+      if (source === "owner") setDemoChatAttachments(attachments);
       setDemoChatError(error instanceof Error ? error.message : "继续对话失败，请重试");
     } finally {
       setDemoChatBusy(false);
+    }
+  }
+
+  async function continueDemoWithInspiration() {
+    if (!skillDemo || demoChatBusy || demoInspirationBusy || demoChatFilesLoading || demoChatInput.trim() || demoChatAttachments.length) return;
+    if (!hasRealModel) {
+      setToast("让 AI 帮你继续前需要先连接模型");
+      setSettingsOpen(true);
+      return;
+    }
+    setDemoChatError("");
+    setBusyTokenUsage(EMPTY_AI_TOKEN_USAGE);
+    setDemoInspirationBusy(true);
+    try {
+      const result = await callAI<{ message?: unknown }>("demo-inspiration", {
+        idea,
+        sourceText: contextBundle,
+        answers: interviewEvidence,
+        capabilityPlan,
+        loopPlan,
+        skill: files,
+        demo: skillDemo,
+        conversation: demoConversation,
+      });
+      const generatedMessage = typeof result.message === "string" ? result.message.trim().slice(0, 3_000) : "";
+      if (!generatedMessage) throw new Error("AI 没有生成可发送的下一句");
+      await sendDemoChatMessage({ message: generatedMessage, source: "inspiration" });
+    } catch (error) {
+      setDemoChatError(error instanceof Error ? error.message : "AI 暂时没想出合适的下一句，你仍可手动输入");
+    } finally {
+      setDemoInspirationBusy(false);
     }
   }
 
@@ -9821,15 +10190,15 @@ export default function Home() {
     const completedTurns = completedReplies.length;
     const latestReplyId = completedReplies.at(-1)?.id || "";
     if (!latestReplyId) {
-      setToast("先继续对话一轮，AI 回复后即可更新评分");
+      setToast("先继续对话一轮，AI 回复后即可更新对比结论");
       return;
     }
     if (latestReplyId === demoConversationScoredReplyId) {
-      setToast("当前对话已经评分；继续对话后可再次更新");
+      setToast("当前对话已经完成对比；继续对话后可再次更新");
       return;
     }
     if (!hasRealModel) {
-      setToast("重新评分前需要先连接模型");
+      setToast("更新对比结论前需要先连接模型");
       setSettingsOpen(true);
       return;
     }
@@ -9857,9 +10226,9 @@ export default function Home() {
       setEvalRan(true);
       setDemoConversationScoredTurns(completedTurns);
       setDemoConversationScoredReplyId(latestReplyId);
-      setToast(`已更新本次场景评分（${completedTurns} 轮对话）；顶部多场景对照需单独重新运行`);
+      setToast(`已更新本次场景对比结论（${completedTurns} 轮对话）；顶部多场景对照需单独重新运行`);
     } catch (error) {
-      setDemoChatError(error instanceof Error ? error.message : "对话证据重新评分失败");
+      setDemoChatError(error instanceof Error ? error.message : "对话证据重新对比失败");
     } finally {
       setDemoConversationScoreBusy(false);
     }
@@ -9867,7 +10236,25 @@ export default function Home() {
 
   function enterEvaluation() {
     setStep("evaluate");
-    if (!evalRan && !busy) void runEvaluation();
+    if (evalRan || busy || evaluationLaunchPendingRef.current) return;
+    evaluationLaunchPendingRef.current = true;
+    // Let React commit and paint the validation workspace before starting a
+    // potentially long model request. This keeps navigation responsive even
+    // when the evaluation provider or browser connection is slow.
+    window.requestAnimationFrame(() => {
+      evaluationLaunchPendingRef.current = false;
+      void runEvaluation();
+    });
+  }
+
+  function handleBuildPrimaryAction() {
+    if (busy) return;
+    if (bundleAudit.blockers.length) {
+      setToast("正在根据发现的问题重新整理生成文件；当前版本会保留到新版本通过检查。");
+      void compileSkill();
+      return;
+    }
+    enterEvaluation();
   }
 
   function openWorkspaceStep(nextStep: StepId) {
@@ -9968,7 +10355,7 @@ export default function Home() {
 
   async function runEvaluation() {
     if (!hasRealModel) {
-      setToast("真实 Demo 需要先连接模型；不会用静态分数冒充试跑结果");
+      setToast("真实 Demo 需要先连接模型；不会用文件检查冒充实际提升");
       setSettingsOpen(true);
       return;
     }
@@ -10053,7 +10440,7 @@ export default function Home() {
         } catch (error) {
           const message = error instanceof Error ? error.message : "Optimization Loop 没有完成";
           reportClientGenerationLoopEvent("generation_loop_failed", { phase: "repair-handoff", reason: message });
-          setGenerationLoop((current) => ({ ...current, status: "attention", phase: "complete", issues: [message], stopReason: `文件契约已修复，但自动优化停在：${message}` }));
+          setGenerationLoop((current) => ({ ...current, outcome: "evaluation-incomplete", status: "attention", phase: "complete", issues: [message], stopReason: `文件契约已修复，但自动优化停在：${message}` }));
           setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: "passed", phase: "frozen", frozen: true });
           setRetryAction("rerun-optimization-loop");
           setToast(`文件交付契约已自动补齐；Optimization Loop 可从当前文件继续：${message}`);
@@ -10471,11 +10858,24 @@ export default function Home() {
     try {
       const response = await fetch("/api/research", {
         method: "POST", headers: { "Content-Type": "application/json" }, signal: controller.signal,
-        body: JSON.stringify({ action: "test", provider: researchProvider, apiKey: researchApiKey, baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl }),
+        body: JSON.stringify({
+          action: "test",
+          provider: researchProvider,
+          apiKey: researchApiKey,
+          baseUrl: researchBaseUrl || RESEARCH_PROVIDERS[researchProvider].baseUrl,
+          modelProvider: provider,
+          modelApiKey: apiKey,
+          model,
+        }),
       });
       const result = await response.json() as { ok?: boolean; sourceCount?: number; error?: string };
       if (!response.ok || !result.ok) throw new Error(result.error || "检索服务未返回正文证据");
-      if (!controller.signal.aborted) setResearchProbe({ status: "ok", message: `检索成功：已读取 ${result.sourceCount} 份网页证据；未调用大模型` });
+      if (!controller.signal.aborted) setResearchProbe({
+        status: "ok",
+        message: researchProvider === "deepseek"
+          ? `检索成功：DeepSeek 已发现来源，SkillCanvas 已读取 ${result.sourceCount} 份网页正文；会产生额外模型 Token`
+          : `检索成功：已读取 ${result.sourceCount} 份网页证据；未调用大模型`,
+      });
     } catch (error) {
       if (researchProbeController.current === controller) setResearchProbe({ status: "error", message: controller.signal.aborted ? "检索测试已取消或超时，请重新测试" : error instanceof Error ? error.message : "检索测试失败" });
     } finally {
@@ -10496,6 +10896,10 @@ export default function Home() {
       setToast("SearXNG 地址需要以 http:// 或 https:// 开头");
       return;
     }
+    if (researchProvider === "deepseek" && provider !== "deepseek") {
+      setToast("DeepSeek 联网搜索需要先选择 DeepSeek 模型服务");
+      return;
+    }
     try {
       const response = await fetch("/api/credentials", {
         method: "POST",
@@ -10514,6 +10918,7 @@ export default function Home() {
       if (!response.ok) throw new Error(result.error || "凭据保存失败");
       setCredentialStored(Boolean(result.configured));
       setResearchCredentialStored(Boolean(result.researchConfigured));
+      setConfiguredResearchProvider(result.researchConfigured ? researchProvider : "disabled");
       setApiKey("");
       setResearchApiKey("");
     } catch (error) {
@@ -10541,6 +10946,7 @@ export default function Home() {
     setCredentialStored(false);
     setResearchApiKey("");
     setResearchCredentialStored(false);
+    setConfiguredResearchProvider("disabled");
     setConnectionState("idle");
     setToast("已清除服务端安全存储中的模型与检索凭据");
   }
@@ -10598,26 +11004,98 @@ export default function Home() {
     setToast("SKILL.md 已复制");
   }
 
+  function commitWorkflowSteps(nextSteps: WorkflowDagStep[], message: string) {
+    const nextPlan = { ...capabilityPlan, workflowSteps: nextSteps };
+    setCapabilityPlan(nextPlan);
+    if (!completedSteps.has("build")) {
+      setToast(`${message}；生成 Skill 时会同步写入全部文件`);
+      return;
+    }
+    const currentIR = parseCanonicalSkillIR(files);
+    if (!currentIR) {
+      setToast("工作流已保存在蓝图，但现有 SkillIR 无法解析；重新生成时会完整同步");
+      return;
+    }
+    try {
+      const mutated = applySkillIRMutations(currentIR, [{ type: "workflow.replace", steps: nextSteps }]).ir;
+      const nextFiles = finalizeSkillFiles(files, idea, demoAnswers, sourceInsightText, nextPlan, loopPlan, mutated);
+      const nextAudit = auditSkillFiles(nextFiles, demoAnswers);
+      setFiles(nextFiles);
+      setBuildLoop({ status: nextAudit.blockers.length ? "attention" : "passed", phase: nextAudit.blockers.length ? "bundle" : "frozen", rounds: 0, issues: nextAudit.blockers, frozen: !nextAudit.blockers.length });
+      setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, stopReason: "Workflow 已更新并重新编译；需要重新运行真实任务评测" });
+      setEvals([]);
+      setEvalRan(false);
+      setSkillDemo(null);
+      setDemoReviewPending(false);
+      setRejectedOptimizations([]);
+      setOptimizationSession(null);
+      setCompletedSteps((current) => new Set([...current].filter((item) => item !== "evaluate" && item !== "ship")));
+      setToast(`${message}；SkillIR 与相关文件已同步，旧评测已失效`);
+    } catch (error) {
+      setToast(error instanceof Error ? `工作流已保存在蓝图；同步现有 Skill 时发现：${error.message}` : "工作流已保存在蓝图；现有 Skill 需要重新生成");
+    }
+  }
+
+  function beginWorkflowStepEdit(step: WorkflowDagStep) {
+    setWorkflowStepEditor({ stepId: step.id, draft: workflowStepDraft(step) });
+  }
+
+  function addWorkflowStep(index: number) {
+    const inserted = insertWorkflowStep(capabilityPlan.workflowSteps, index);
+    commitWorkflowSteps(inserted.steps, "已新增工作步骤");
+    const step = inserted.steps.find((item) => item.id === inserted.stepId);
+    if (step) setWorkflowStepEditor({ stepId: step.id, draft: workflowStepDraft(step) });
+  }
+
+  function saveWorkflowStep() {
+    if (!workflowStepEditor) return;
+    try {
+      const nextSteps = updateWorkflowStep(capabilityPlan.workflowSteps, workflowStepEditor.stepId, workflowStepEditor.draft);
+      commitWorkflowSteps(nextSteps, "工作步骤已更新");
+      setWorkflowStepEditor(null);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "工作步骤没有保存");
+    }
+  }
+
+  function deleteWorkflowStep(stepId: string) {
+    try {
+      commitWorkflowSteps(removeWorkflowStep(capabilityPlan.workflowSteps, stepId), "工作步骤已移除");
+      if (workflowStepEditor?.stepId === stepId) setWorkflowStepEditor(null);
+    } catch (error) {
+      setToast(error instanceof Error ? error.message : "工作步骤没有移除");
+    }
+  }
+
   function renderSkillDemoCard(pendingReview: boolean) {
     if (!skillDemo) return null;
-    const completedConversationTurns = demoConversation.filter((message) => message.role === "assistant").length;
     const latestCompletedReplyId = [...demoConversation].reverse().find((message) => message.role === "assistant")?.id || "";
     const conversationScoreIsFresh = Boolean(latestCompletedReplyId) && demoConversationScoredReplyId === latestCompletedReplyId;
     const hasNewConversationEvidence = Boolean(latestCompletedReplyId) && !conversationScoreIsFresh;
     const automaticTurns = demoConversation.filter((message) => message.role === "assistant" && message.source === "mock").length;
+    const visibleComparisonRows = formalComparisonRows.slice(0, 3);
     return (
       <section className={`skill-demo-card ${pendingReview ? "review-pending" : ""}`}>
         <div className="skill-demo-head">
           <div className="skill-demo-title"><span>第 {Math.max(1, demoRunCount)} 次试跑</span><h3>{skillDemo.title}</h3><p>{skillDemo.scenario}</p></div>
           <div className="skill-demo-aside">
-            {pendingReview
-              ? <div className="demo-score pending"><small>已保存</small><strong>✓</strong><span>等待评估</span></div>
-              : observedEvals.length
-                ? <div className="demo-score"><small>{demoConversationScoredTurns > 0 ? `当前单场景 · ${demoConversationScoredTurns} 轮对话` : `当前单场景 · ${observedEvals.length} 项证据`}</small><strong>{averageEvalScore}</strong><span>/ 100</span><em>不与多场景总分直接比较</em></div>
-                : <div className="demo-score pending"><small>本轮证据</small><strong>0</strong><span>项可评分</span></div>}
+            <section className={`demo-improvement-summary ${pendingReview || !formalComparisonIsCurrent ? "pending" : ""}`} aria-label="相比裸模型的实际变化">
+              <div className="demo-improvement-heading">
+                <span>同题匿名 A/B</span>
+                <strong>{pendingReview || !formalComparisonIsCurrent ? "等待正式对照" : formalImprovementRows.length ? `${formalImprovementRows.length} 个任务中 Skill 更好` : "尚未证明有提升"}</strong>
+              </div>
+              {visibleComparisonRows.length > 0
+                ? <ul>{visibleComparisonRows.map((result) => (
+                    <li className={result.verdict === "candidate" ? "improved" : "gap"} key={result.caseId}>
+                      <span>{result.verdict === "candidate" ? "更好" : result.verdict === "tie" ? "接近" : "待加强"}</span>
+                      <div><strong>{result.title}</strong><p>{result.explanation}</p></div>
+                    </li>
+                  ))}</ul>
+                : <p>{pendingReview ? "完成本轮试跑后，会用生成阶段的裸模型对照给出具体差异。" : "当前版本还没有正式 A/B 证据，重新运行对照后才能判断它是否真的优于裸模型。"}</p>}
+            </section>
             {!pendingReview && <div className="demo-head-actions">
-              <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
-              <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "评分中…" : conversationScoreIsFresh ? "本次评分已更新" : "更新本次评分"}</span></button>
+              <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="/icons/tabler/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
+              <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="/icons/tabler/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "对比中…" : conversationScoreIsFresh ? "对比结论已更新" : "更新对比结论"}</span></button>
             </div>}
           </div>
         </div>
@@ -10645,10 +11123,10 @@ export default function Home() {
           </div>
         </details>
         <div className="demo-conversation">
-          <div className="demo-conversation-heading"><div><strong>{automaticTurns ? `已自动续跑 ${automaticTurns} 轮` : "继续对话"}</strong><small>{automaticTurns ? "系统模拟了必要的材料补充；你仍可在下面接着追问或纠正。" : "补充材料或修改意见，AI 会基于当前结果继续处理。"}</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，评分生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
+          <div className="demo-conversation-heading"><div><strong>{automaticTurns ? `已自动续跑 ${automaticTurns} 轮` : "继续对话"}</strong><small>{automaticTurns ? "系统模拟了必要的材料补充；你可以自己继续输入，也可以让 AI 再生成一条测试输入。" : "补充材料或修改意见；不想自己写时，可以让 AI 帮你继续测试。"}</small>{demoConversationScoreBusy && <small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，对比分析中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small>}</div></div>
           {demoConversation.length > 0 && (
             <div className="demo-message-list" aria-live="polite">
-              {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? message.source === "mock" ? "模拟" : "你" : "AI"}</span><div className="demo-message-body">{message.role === "user" && message.source === "mock" && <small>自动补充的测试输入</small>}<p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
+              {demoConversation.map((message) => <div className={`demo-message ${message.role}`} key={message.id}><span>{message.role === "user" ? message.source === "mock" ? "模拟" : message.source === "inspiration" ? "AI 代写" : "你" : "AI"}</span><div className="demo-message-body">{message.role === "user" && message.source === "mock" && <small>自动补充的测试输入</small>}{message.role === "user" && message.source === "inspiration" && <small>AI 生成并自动发送的测试输入</small>}<p>{message.content}</p>{message.attachments?.length ? <div className="demo-message-files">{message.attachments.map((attachment) => <span key={attachment.id}>{attachment.name}</span>)}</div> : null}</div></div>)}
               {demoChatBusy && <div className="demo-message assistant pending"><span>AI</span><div className="demo-message-body"><p><i /><i /><i /></p><small className="demo-token-usage" aria-live="polite">Token 约 {formatAiTokens(busyTokenUsage.totalTokens)} · {busyTokenUsage.pendingPromptTokens > 0 ? "输入预估，回复生成中" : "已校准"} · 会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)}</small></div></div>}
             </div>
           )}
@@ -10663,7 +11141,8 @@ export default function Home() {
               onChange={handleDemoChatFiles}
               tabIndex={-1}
             />
-            <button className="demo-chat-attach" type="button" onClick={() => demoChatFileInputRef.current?.click()} disabled={demoChatBusy || demoChatFilesLoading || demoChatAttachments.length >= 3} aria-label={demoChatFilesLoading ? "正在读取文件" : "添加文件"}>{demoChatFilesLoading ? <span>读取中</span> : <img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/paperclip.svg" alt="" aria-hidden="true" />}</button>
+            <button className="demo-chat-inspiration" type="button" onClick={() => void continueDemoWithInspiration()} disabled={demoChatBusy || demoInspirationBusy || demoChatFilesLoading || Boolean(demoChatInput.trim()) || Boolean(demoChatAttachments.length)} title={demoChatInput.trim() || demoChatAttachments.length ? "清空待发送内容后，可让 AI 生成下一句" : "根据当前对话生成一条测试输入并自动发送"}><img src="/icons/tabler/sparkles.svg" alt="" aria-hidden="true" /><span>{demoInspirationBusy ? "AI 正在想…" : "让 AI 帮我继续"}</span></button>
+            <button className="demo-chat-attach" type="button" onClick={() => demoChatFileInputRef.current?.click()} disabled={demoChatBusy || demoChatFilesLoading || demoChatAttachments.length >= 3} aria-label={demoChatFilesLoading ? "正在读取文件" : "添加文件"}>{demoChatFilesLoading ? <span>读取中</span> : <img src="/icons/tabler/paperclip.svg" alt="" aria-hidden="true" />}</button>
             <textarea
               value={demoChatInput}
               onChange={(event) => { setDemoChatInput(event.target.value); setDemoChatError(""); }}
@@ -10672,7 +11151,7 @@ export default function Home() {
               aria-label="继续与 Demo 对话"
               rows={1}
             />
-            <button className="demo-chat-send" type="button" onClick={() => void sendDemoChatMessage()} disabled={(!demoChatInput.trim() && !demoChatAttachments.length) || demoChatBusy || demoChatFilesLoading}><span>{demoChatBusy ? "回复中…" : "发送"}</span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/send.svg" alt="" aria-hidden="true" /></button>
+            <button className="demo-chat-send" type="button" onClick={() => void sendDemoChatMessage()} disabled={(!demoChatInput.trim() && !demoChatAttachments.length) || demoChatBusy || demoChatFilesLoading}><span>{demoChatBusy ? "回复中…" : "发送"}</span><img src="/icons/tabler/send.svg" alt="" aria-hidden="true" /></button>
           </div>
           {demoChatError && <div className="demo-chat-error" role="alert"><span>{demoChatError}</span><button type="button" onClick={() => void sendDemoChatMessage()} disabled={demoChatBusy || (!demoChatInput.trim() && !demoChatAttachments.length)}>重试</button></div>}
         </div>
@@ -10731,7 +11210,7 @@ export default function Home() {
         {step === "brief" && <button type="button" className={`sidebar-edge-toggle ${briefSidebarOpen ? "open" : ""}`} onClick={() => setBriefSidebarOpen((current) => !current)} aria-label={briefSidebarOpen ? "收起创建流程" : "展开创建流程"} aria-expanded={briefSidebarOpen}><span>{briefSidebarOpen ? "‹" : "›"}</span></button>}
         <aside className="step-rail" aria-hidden={step === "brief" && !briefSidebarOpen}>
           <div className="rail-heading">
-            <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chart-line.svg" alt="" aria-hidden="true" /></span>
+            <span><img src="/icons/tabler/chart-line.svg" alt="" aria-hidden="true" /></span>
             <strong>创建进度</strong>
           </div>
           <nav aria-label="Skill 创建步骤">
@@ -10741,11 +11220,12 @@ export default function Home() {
               const canOpen = canNavigateToWorkflowStep(item.id, step, completedSteps);
               return (
                 <button
+                  type="button"
                   key={item.id}
                   className={`step-item ${active ? "active" : ""} ${done ? "done" : ""}`}
                   onClick={() => (canOpen ? openWorkspaceStep(item.id) : setToast("请先完成前面的步骤"))}
                 >
-                  <span className="step-index">{done ? "✓" : item.eyebrow}</span>
+                  <span className="step-index">{done ? <i className="ui-check-icon" aria-hidden="true" /> : item.eyebrow}</span>
                   <span>{item.label}</span>
                 </button>
               );
@@ -10760,7 +11240,13 @@ export default function Home() {
           )}
           {step === "brief" && (
             <div className="stage-content brief-stage">
-              <h1><span className="headline-line">AI 不懂你</span><br /><span className="brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</span> 来帮你</h1>
+              <div className="brief-hero">
+                <h1><span className="headline-line">AI 不懂你</span><br /><span className="brand-script"><span className="brand-letter-accent">S</span>kill<span className="brand-letter-accent">C</span>anvas</span> 来帮你</h1>
+                <picture className="brief-hero-illustration-frame">
+                  <source srcSet="/skillcanvas-hero-helper-emoji-512.avif" type="image/avif" />
+                  <img className="brief-hero-illustration" src="/skillcanvas-hero-helper-emoji-512.png" width="512" height="512" alt="" aria-hidden="true" decoding="async" fetchPriority="high" />
+                </picture>
+              </div>
 
               <div className="idea-composer">
                 <textarea
@@ -10770,10 +11256,9 @@ export default function Home() {
                   aria-label="Skill 想法"
                 />
                 <div className="composer-footer">
-                  <FileUploadButton onChange={handleSources} loading={sourcesLoading} disabled={busy} label="添加你的资料" />
-                  <button className="primary-button" onClick={startInterview} disabled={busy || materialsLoading}>
+                  <StartButton onClick={startInterview} disabled={busy || materialsLoading}>
                     {materialsLoading ? "等待资料解析" : busy ? "AI 正在先做一次…" : hasRealModel ? "Let‘s Start！" : "连接模型后开始 AI 理解"}<span>→</span>
-                  </button>
+                  </StartButton>
                 </div>
                 {(sourcesLoading || sourceReceipt) && (
                   <div className={`source-upload-receipt ${sourcesLoading ? "reading" : sourceReceipt?.tone || "ready"}`} role="status" aria-live="polite">
@@ -10785,14 +11270,14 @@ export default function Home() {
 
               <div className="starter-row">
                 <button onClick={() => setIdea("根据 JD 定制我的简历")}>根据 JD 定制我的简历</button>
-                <button onClick={() => setIdea("把我的写作习惯做成小红书 Skill")}>把我的写作习惯做成小红书 Skill</button>
+                <button onClick={() => setIdea("根据我的英语水平定制每日学习计划")}>根据我的英语水平定制每日学习计划</button>
                 <button onClick={() => setIdea("根据固定模板帮我做竞品分析")}>根据固定模板帮我做竞品分析</button>
                 <button onClick={() => setIdea("把我的旅行偏好变成长期规划助手")}>把我的旅行偏好变成长期规划助手</button>
               </div>
 
               <div className={`context-builder ${contextPanelOpen ? "open" : ""}`}>
                 <button className={`context-builder-toggle ${contextPanelOpen ? "expanded" : ""} ${contextFilledCount + sourceNames.length ? "" : "without-status"}`} type="button" aria-expanded={contextPanelOpen} onClick={() => setContextPanelOpen((current) => !current)}>
-                  {!contextPanelOpen && <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/books.svg" alt="" aria-hidden="true" /></span>}
+                  {!contextPanelOpen && <span><img src="/icons/tabler/books.svg" alt="" aria-hidden="true" /></span>}
                   <div><strong>补充参考 <b>（可选）</b></strong><small>有现成方法、样例或偏好，可以让 Skill 更懂你</small></div>
                   {!contextPanelOpen && contextFilledCount + sourceNames.length > 0 && <em>已补充 {contextFilledCount + sourceNames.length} 项</em>}
                   <i>{contextPanelOpen ? "⌃" : "⌄"}</i>
@@ -10845,12 +11330,17 @@ export default function Home() {
           {step === "interview" && (
             <div className="stage-content interview-stage">
               <div className="stage-heading-row">
-                <div>
+                <div className="interview-heading-copy">
                   <div className="stage-kicker">让 AI 更了解你</div>
                   <h2>确认你的目标、偏好与工作方式</h2>
                   <p>按实际需求选择，或直接写下你的想法。AI 会围绕影响结果的关键选择继续细化，最多四轮。</p>
                 </div>
-                <div className="completeness-badge"><strong>{completeness}%</strong><span>需求完整度</span></div>
+                <div className="interview-heading-aside">
+                  <picture className="interview-heading-pen">
+                    <source srcSet="/skillcanvas-note-pen-192.avif" type="image/avif" />
+                    <img src="/skillcanvas-note-pen-192.png" width="192" height="192" alt="" aria-hidden="true" loading="lazy" decoding="async" />
+                  </picture>
+                </div>
               </div>
 
               {sourceInsights.map((insight, index) => (
@@ -10864,28 +11354,6 @@ export default function Home() {
                 </article>
               ))}
 
-              {isFinalInterviewRound && <div className={`understanding-evidence ${interviewEvidenceOpen ? "open" : ""}`}>
-                <button className="understanding-evidence-toggle" type="button" aria-expanded={interviewEvidenceOpen} onClick={() => setInterviewEvidenceOpen((current) => !current)}>
-                  <span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/file-star.svg" alt="" aria-hidden="true" /></span>
-                  <div><strong>再给AI一点材料 <b className="optional-tag">可选</b></strong><small>补充理想结果、反例或参考文件，让 AI 更了解你的标准。</small></div>
-                  <em>{contextFilledCount + sourceNames.length ? `正在参考 ${contextFilledCount + sourceNames.length} 项上下文` : "还没有示例"}</em>
-                  <i><img className={interviewEvidenceOpen ? "expanded" : ""} src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" /></i>
-                </button>
-                {interviewEvidenceOpen && (
-                  <div className="understanding-example-fields">
-                    <MaterialInput id="understanding-ideal-output" className="understanding-example-field" title="你理想的产出" tag="AI 提取结构与标准" placeholder="粘贴一份你觉得很好的方案、文章、报告、代码或其他结果……"
-                      value={contextNotes.idealOutput} onChange={(value) => setContextNotes((current) => ({ ...current, idealOutput: value }))}
-                      onUpload={(event) => void handleContextSources(event, "idealOutput")} upload={contextUploads.idealOutput} disabled={busy} />
-                    <MaterialInput id="understanding-negative-output" className="understanding-example-field" title="你不喜欢的结果" tag="AI 识别跑偏模式" placeholder="粘贴反例，或直接写下哪里让你觉得不对……"
-                      value={contextNotes.negativeOutput} onChange={(value) => setContextNotes((current) => ({ ...current, negativeOutput: value }))}
-                      onUpload={(event) => void handleContextSources(event, "negativeOutput")} upload={contextUploads.negativeOutput} disabled={busy} />
-                    <div className="understanding-evidence-action">
-                      <button type="button" onClick={regenerateCurrentInterviewRound} disabled={busy || materialsLoading}>{materialsLoading ? "等待材料解析…" : "让 AI 参考材料，重做本轮理解"}</button>
-                    </div>
-                  </div>
-                )}
-              </div>}
-
               <div className="round-navigator" aria-label="需求澄清轮次">
                 {INTERVIEW_ROUND_META.map((round, index) => (
                   <button
@@ -10895,7 +11363,7 @@ export default function Home() {
                     onClick={() => setInterviewRoundIndex(index)}
                     key={round.title}
                   >
-                    <span>{index < highestRoundReached ? "✓" : index + 1}</span>
+                    <span>{index < highestRoundReached ? <i className="ui-check-icon" aria-hidden="true" /> : index + 1}</span>
                     <div><strong>{round.label}</strong></div>
                   </button>
                 ))}
@@ -10904,7 +11372,7 @@ export default function Home() {
               <div className="round-transition" key={`interview-round-${interviewRoundIndex}`}>
                 <div className="round-heading">
                   <div><h3>{INTERVIEW_ROUND_META[interviewRoundIndex].title}</h3></div>
-                  <strong>{currentAnsweredCount}/{questions.length}<small>本轮已回答</small></strong>
+                  <strong>{currentAnsweredCount}/{questions.length}<small>AI 已帮你选择</small></strong>
                 </div>
                 <div className="question-list">
                 {questions.map((question, index) => {
@@ -10917,9 +11385,12 @@ export default function Home() {
                     || Boolean(currentAnswer && selectedOptions.length === 0);
                   return (
                     <div className={`question-card selection-${question.selectionMode}`} key={question.id}>
-                      <span className="question-number">{String(index + 1).padStart(2, "0")}</span>
+                      <span className="question-index">
+                        <span className="question-number">{String(index + 1).padStart(2, "0")}</span>
+                        <b className="question-dimension">{question.dimension}</b>
+                      </span>
                       <span className="question-copy">
-                        <span className="question-meta"><b>{question.dimension}</b><i>{question.selectionMode === "multiple" ? "可多选" : "单选"}</i>
+                        <span className="question-meta"><i>{question.selectionMode === "multiple" ? "可多选" : "单选"}</i>
                           {question.selectionMode === "single" && <button type="button" className="question-multiple-toggle" disabled={busy} onClick={() => allowMultipleAnswers(question.id)} aria-label={`将“${question.label}”改为多选`}>我想多选</button>}
                         </span>
                         <span className="question-title-row">
@@ -10950,7 +11421,7 @@ export default function Home() {
                                 key={option}
                                 onClick={() => toggleQuestionOption(question, option)}
                               >
-                                <i className="choice-indicator" aria-hidden="true" />
+                                <i className="choice-indicator" aria-hidden="true"><img src="/icons/tabler/check.svg" alt="" /></i>
                                 <span className="choice-label">{option}</span>
                                 {option === question.recommendedOption && <em>{autoSelectedQuestionIds.has(question.id) && selected ? "AI 自动选择" : selected ? "AI 推荐 · 已预选" : "AI 推荐"}</em>}
                               </button>
@@ -10963,7 +11434,7 @@ export default function Home() {
                             aria-checked={isCustomAnswer}
                             onClick={() => showCustomQuestionInput(question)}
                           >
-                            <i className="choice-indicator" aria-hidden="true" />
+                            <i className="choice-indicator" aria-hidden="true"><img src="/icons/tabler/check.svg" alt="" /></i>
                             <span className="choice-label">都不符合，我自己说</span>
                           </button>
                         </div>
@@ -10982,6 +11453,44 @@ export default function Home() {
                 </div>
 
               </div>
+              {isFinalInterviewRound && (
+                <section className="final-note-card" aria-labelledby="final-note-title">
+                  <span className="final-note-tape" aria-hidden="true" />
+                  <div className="final-note-copy">
+                    <span className="final-note-kicker">可选</span>
+                    <h3 id="final-note-title">还有什么想说的吗</h3>
+                    <p>可以补充你的背景，你不喜欢的，或者选项里面不完整的内容，或者任何你想写的</p>
+                  </div>
+                  <textarea
+                    id="final-note-input"
+                    value={contextNotes.background}
+                    maxLength={20_000}
+                    disabled={contextUploads.background?.loading}
+                    onChange={(event) => setContextNotes((current) => ({ ...current, background: event.target.value }))}
+                    placeholder="写在这里，AI 会把它和上面的选择一起理解……"
+                    aria-label="还有什么想说的吗"
+                    aria-describedby="final-note-description"
+                  />
+                  <div className="final-note-footer" id="final-note-description">
+                    <div>
+                      <FileUploadButton
+                        onChange={(event) => void handleContextSources(event, "background")}
+                        loading={contextUploads.background?.loading}
+                        disabled={busy}
+                        label="上传文件"
+                        ariaLabel="为补充内容上传文件"
+                      />
+                      <small>PDF / MD / 文本</small>
+                    </div>
+                    <small>{contextNotes.background.length.toLocaleString("en-US")} / 20,000</small>
+                  </div>
+                  {contextUploads.background?.message && (
+                    <p className={`final-note-status ${contextUploads.background.warning ? "warning" : ""}`} role="status" aria-live="polite">
+                      {contextUploads.background.message}
+                    </p>
+                  )}
+                </section>
+              )}
               <div className="stage-footer">
                 <button className="secondary-button" onClick={() => interviewRoundIndex > 0 ? setInterviewRoundIndex(interviewRoundIndex - 1) : setStep("brief")}>{interviewRoundIndex > 0 ? "返回上一轮" : "返回修改一句话"}</button>
                 <div className="adaptive-footer-actions">
@@ -11035,16 +11544,46 @@ export default function Home() {
               <section className={`loop-plan-card ${loopPlan.mode}`}>
                 <div className="loop-plan-heading">
                   <div>
-                    <span className="stage-kicker">AI 已推荐并采用一条可执行流程</span>
-                    <h3>推荐工作流：目标、子目标与循环</h3>
-                    <p>{loopPlan.reason}</p>
+                    <h3>工作流</h3>
                   </div>
-                  <span className="status-pill">✓ 已采用 · {loopPlan.label} · 最多 {loopPlan.maxRounds} 回合</span>
                 </div>
                 <div className="loop-goal">
                   <span>总目标</span>
                   <strong>{loopPlan.goal}</strong>
                 </div>
+                <section className="workflow-editor" aria-labelledby="workflow-editor-title">
+                  <div className="workflow-editor-heading">
+                    <div><span>可执行 Workflow</span><strong id="workflow-editor-title">Skill 实际会按这些步骤运行</strong></div>
+                    <small>{completedSteps.has("build") ? "修改后自动重编译 · 需重新 Eval" : "确认后写入 SkillIR 与生成文件"}</small>
+                  </div>
+                  <div className="workflow-editor-flow" aria-label="可编辑工作流">
+                    {capabilityPlan.workflowSteps.map((workflowStep, index) => (
+                      <Fragment key={workflowStep.id}>
+                        <button className="workflow-step-insert" type="button" onClick={() => addWorkflowStep(index)} aria-label={`在步骤 ${index + 1} 前新增步骤`}><span>＋</span></button>
+                        <article className={`workflow-step-card ${workflowStepEditor?.stepId === workflowStep.id ? "editing" : ""}`}>
+                          <div className="workflow-step-meta"><span>{String(index + 1).padStart(2, "0")}</span><em>{workflowStep.role === "deliver" ? "交付" : workflowStep.role === "validate" ? "验证" : workflowStep.role === "persist" ? "保存" : workflowStep.role?.startsWith("await") ? "等待确认" : "执行"}</em></div>
+                          <strong>{workflowStep.action}</strong>
+                          <p>{workflowStep.when}</p>
+                          <small>产出 · {workflowStep.output}</small>
+                          <div className="workflow-step-actions">
+                            <button type="button" onClick={() => beginWorkflowStepEdit(workflowStep)}>修改</button>
+                            <button type="button" onClick={() => deleteWorkflowStep(workflowStep.id)} disabled={capabilityPlan.workflowSteps.length <= 1}>移除</button>
+                          </div>
+                        </article>
+                      </Fragment>
+                    ))}
+                    <button className="workflow-step-insert trailing" type="button" onClick={() => addWorkflowStep(capabilityPlan.workflowSteps.length)} aria-label="在工作流末尾新增步骤"><span>＋</span></button>
+                  </div>
+                  {workflowStepEditor && (
+                    <div className="workflow-step-form" role="group" aria-label="修改工作步骤">
+                      <label><span>什么时候执行</span><input value={workflowStepEditor.draft.when} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, when: event.target.value } } : current)} /></label>
+                      <label className="wide"><span>这一步做什么</span><textarea rows={2} value={workflowStepEditor.draft.action} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, action: event.target.value } } : current)} /></label>
+                      <label><span>产生什么结果</span><input value={workflowStepEditor.draft.output} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, output: event.target.value } } : current)} /></label>
+                      <label><span>失败时怎么办</span><input value={workflowStepEditor.draft.fallback} onChange={(event) => setWorkflowStepEditor((current) => current ? { ...current, draft: { ...current.draft, fallback: event.target.value } } : current)} /></label>
+                      <div className="workflow-step-form-actions"><button type="button" onClick={() => setWorkflowStepEditor(null)}>取消</button><button type="button" onClick={saveWorkflowStep}>保存并同步</button></div>
+                    </div>
+                  )}
+                </section>
                 <div className="loop-columns">
                   <div className="loop-subgoals">
                     <div className="loop-section-title"><span>01</span><div><strong>必要子目标</strong><small>只保留完成总目标必须经过的中间状态</small></div></div>
@@ -11066,48 +11605,51 @@ export default function Home() {
                   </div>
                 </div>
               </section>
-              <section className="capability-plan-card">
-                <section className="tool-ability-picker">
+              <section className="tool-ability-picker">
                   <div className="tool-ability-heading">
                     <div><span>能力选型结果</span><h4>完成这个任务实际会用到什么</h4><p>只采用会改变输入读取、任务判断或真实交付的能力；每项都必须有触发条件、可观察产出和不可用时的降级方式。</p></div>
                     <small>{adoptedRuntimeCapabilities.length} 项运行能力已采用</small>
                   </div>
+                  <div className="capability-group-heading"><strong>核心能力</strong><span>直接决定任务结果</span></div>
                   <div className="adopted-capability-grid" aria-label="已采用的运行能力">
-                    {adoptedRuntimeCapabilities.map((item) => (
-                      <article key={item.id}>
+                    {coreRuntimeCapabilities.map((item) => (
+                      <article className={`kind-${item.kind}`} key={item.id}>
                         <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
                         <div><strong>{item.name}</strong><p>{item.reason}</p><small>何时用：{item.activationCondition || item.routingCondition}</small></div>
-                        <em>{item.recommended ? "AI 自动添加" : item.kind === "builtin-tool" || item.kind === "mcp" ? "你已添加" : "核心任务"}</em>
+                        <em>{item.kind === "llm" ? "核心推理" : CAPABILITY_KIND_META[item.kind].label}</em>
                       </article>
                     ))}
                   </div>
                   {optionalToolCapabilities.length ? (
-                    <div className="tool-ability-grid">
-                      {optionalToolCapabilities.map((item) => {
-                        const active = capabilityIsActive(item);
-                        return (
-                          <article className={`tool-ability-card ${active ? "selected" : ""}`} key={item.id}>
-                            <button type="button" className="tool-ability-toggle" aria-pressed={active} onClick={() => toggleOptionalCapability(item)}>
-                              <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
-                              <span className="tool-ability-copy"><small>{CAPABILITY_KIND_META[item.kind].label}{item.recommended ? " · AI 推荐" : " · 可选"}</small><strong>{item.name}</strong><em>{item.reason}</em></span>
-                              <span className="tool-toggle-state">{active ? "✓ 已添加" : "+ 添加能力"}</span>
-                            </button>
-                            {active && <div className="capability-contract"><span>何时用：{item.routingCondition}</span><span>输入：{item.input || "由当前任务提供"}</span><span>产出：{item.output || "可验证结果"}</span></div>}
-                            {active && item.kind === "mcp" && item.status === "requires-setup" && (
-                              <div className="mcp-setup-panel">
-                                <div><strong>确认目标 Agent 中的连接</strong><p>只有安装并授权后才会写成可调用；否则取消添加即可，不会留下发布待办。</p></div>
-                                <label><span>MCP Server 名称</span><input value={mcpDrafts[item.id] || ""} onChange={(event) => setMcpDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder={item.connection?.server || "例如：Notion MCP、GitHub MCP"} /></label>
-                                {!!item.connection?.tools.length && <small>预计使用：{item.connection.tools.join("、")}</small>}
-                                <div className="mcp-setup-actions"><button onClick={() => confirmMcpCapability(item)}>我已安装并授权</button><button onClick={() => chooseMcpFallback(item)}>取消添加</button></div>
-                              </div>
-                            )}
-                            {active && item.kind === "mcp" && item.status === "use-provided" && item.connection?.verified && (
-                              <div className="mcp-confirmed"><span>✓</span><div><strong>已确认 {item.connection.server}</strong><small>会生成调用契约、运行前检查和不可用时的替代路径。</small></div><button onClick={() => editMcpCapability(item)}>修改</button></div>
-                            )}
-                          </article>
-                        );
-                      })}
-                    </div>
+                    <section className="capability-option-section">
+                      <div className="capability-group-heading"><strong>工具与外部连接</strong><span>{adoptedOptionalCapabilityCount ? `已启用 ${adoptedOptionalCapabilityCount} 项` : "按需启用"}</span></div>
+                      <div className="tool-ability-grid">
+                        {optionalToolCapabilities.map((item) => {
+                          const active = capabilityIsActive(item);
+                          return (
+                            <article className={`tool-ability-card kind-${item.kind} ${active ? "selected" : ""}`} key={item.id}>
+                              <button type="button" className="tool-ability-toggle" aria-pressed={active} onClick={() => toggleOptionalCapability(item)}>
+                                <span className="capability-icon"><img src={capabilityIconPath(item.id, item.kind)} alt="" aria-hidden="true" /></span>
+                                <span className="tool-ability-copy"><small>{CAPABILITY_KIND_META[item.kind].label}{item.recommended ? " · AI 推荐" : " · 可选"}</small><strong>{item.name}</strong><em>{item.reason}</em></span>
+                                <span className="tool-toggle-state">{active ? "✓ 已添加" : "+ 添加能力"}</span>
+                              </button>
+                              {active && <div className="capability-contract"><span>何时用：{item.routingCondition}</span><span>输入：{item.input || "由当前任务提供"}</span><span>产出：{item.output || "可验证结果"}</span></div>}
+                              {active && item.kind === "mcp" && item.status === "requires-setup" && (
+                                <div className="mcp-setup-panel">
+                                  <div><strong>确认目标 Agent 中的连接</strong><p>只有安装并授权后才会写成可调用；否则取消添加即可，不会留下发布待办。</p></div>
+                                  <label><span>MCP Server 名称</span><input value={mcpDrafts[item.id] || ""} onChange={(event) => setMcpDrafts((current) => ({ ...current, [item.id]: event.target.value }))} placeholder={item.connection?.server || "例如：Notion MCP、GitHub MCP"} /></label>
+                                  {!!item.connection?.tools.length && <small>预计使用：{item.connection.tools.join("、")}</small>}
+                                  <div className="mcp-setup-actions"><button onClick={() => confirmMcpCapability(item)}>我已安装并授权</button><button onClick={() => chooseMcpFallback(item)}>取消添加</button></div>
+                                </div>
+                              )}
+                              {active && item.kind === "mcp" && item.status === "use-provided" && item.connection?.verified && (
+                                <div className="mcp-confirmed"><span>✓</span><div><strong>已确认 {item.connection.server}</strong><small>会生成调用契约、运行前检查和不可用时的替代路径。</small></div><button onClick={() => editMcpCapability(item)}>修改</button></div>
+                              )}
+                            </article>
+                          );
+                        })}
+                      </div>
+                    </section>
                   ) : <div className="tool-ability-empty"><strong>本次无需额外安装</strong><span>AI 已把完成任务必需的能力放进核心流程，没有为了显得“专业”而机械添加 MCP。你仍可从下面的能力库自行扩展。</span></div>}
                   <div className="capability-library-control">
                     <div><span>完整能力库</span><strong className="capability-library-title"><img src="/icons/tabler/plug.svg" alt="" aria-hidden="true" />添加能力</strong><p>宿主能力来自 Codex、Claude Code 等 Agent；MCP 是另行安装和授权的外部连接。Skill 只声明何时调用，不能凭空安装能力。</p></div>
@@ -11146,7 +11688,6 @@ export default function Home() {
                       </details>
                     </div>
                   )}
-                </section>
               </section>
               <div className="stage-footer">
                 <button className="secondary-button" onClick={() => setStep("interview")}>继续让 AI 了解我</button>
@@ -11159,25 +11700,25 @@ export default function Home() {
             <div className="build-stage">
               <div className="build-toolbar">
                 <div><span className="stage-kicker">专属 Skill 已生成</span><h2>真正属于你的 Skill</h2></div>
-                <div className="toolbar-actions"><button onClick={copySkill}>复制主文件</button><button className="primary-button compact" onClick={enterEvaluation} disabled={bundleAudit.blockers.length > 0 || busy}>{bundleAudit.blockers.length ? "修复后再评估" : busyTask === "evaluate" ? "正在开始评估…" : "进入评估"} <span>→</span></button></div>
+                <div className="toolbar-actions"><button type="button" onClick={copySkill}>复制主文件</button><button type="button" className="primary-button compact" onClick={handleBuildPrimaryAction} disabled={busy}>{bundleAudit.blockers.length ? "自动修复并重新生成" : busyTask === "evaluate" ? "正在开始评估…" : "进入评估"} <span>→</span></button></div>
               </div>
               <section className="build-product-overview" aria-label="Skill 生成结果摘要">
                 <div className="build-product-status">
-                  <span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/circle-check.svg" alt="" aria-hidden="true" /></span>
+                  <span className="build-product-icon"><img src="/icons/tabler/circle-check.svg" alt="" aria-hidden="true" /></span>
                   <div><span>已生成</span><strong>{bundleAudit.blockers.length ? "这份 Skill 已生成，修复发布问题后即可评估" : "这份 Skill 已经可以进入真实任务评估"}</strong><p>{buildProductSummary}</p></div>
                   <em>{bundleAudit.blockers.length ? `${bundleAudit.blockers.length} 项发布问题` : "结构检查已通过"}</em>
                 </div>
                 <div className="build-product-section build-product-capabilities">
-                  <div className="build-product-section-title"><span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/sparkles.svg" alt="" aria-hidden="true" /></span><div><strong>加入了哪些关键能力</strong><p>这里只展示相对普通 AI 新增、并且会改变实际工作方式的能力。</p></div></div>
+                  <div className="build-product-section-title"><span className="build-product-icon"><img src="/icons/tabler/sparkles.svg" alt="" aria-hidden="true" /></span><div><strong>加入了哪些关键能力</strong><p>这里只展示相对普通 AI 新增、并且会改变实际工作方式的能力。</p></div></div>
                   {buildProductCapabilities.length ? <div className="build-product-capability-list">{buildProductCapabilities.map((item) => <article key={item.id}><strong>{item.name}</strong><p>{item.purpose || item.requirement}</p><small>{item.routingCondition}</small></article>)}</div> : <p className="build-product-empty">本次任务不需要额外能力，Skill 主要负责稳定执行你确认的工作方式。</p>}
                 </div>
                 <div className="build-product-section build-product-risks">
-                  <div className="build-product-section-title"><span className="build-product-icon"><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/shield-exclamation.svg" alt="" aria-hidden="true" /></span><div><strong>还有哪些风险</strong><p>只保留会影响下一步决策的限制、缺口和待验证事项。</p></div></div>
+                  <div className="build-product-section-title"><span className="build-product-icon"><img src="/icons/tabler/shield-exclamation.svg" alt="" aria-hidden="true" /></span><div><strong>还有哪些风险</strong><p>只保留会影响下一步决策的限制、缺口和待验证事项。</p></div></div>
                   {buildProductRisks.length ? <ul>{buildProductRisks.map((risk) => <li key={risk}>{risk}</li>)}</ul> : <p className="build-product-empty success">当前没有阻止评估的风险，仍建议用一条真实任务确认最终效果。</p>}
                 </div>
               </section>
               <details className="build-explanation">
-                <summary><span><strong>为什么这样生成</strong><small>查看采用的专业知识、工作流和关键规则</small></span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" /></summary>
+                <summary><span><strong>为什么这样生成</strong><small>查看采用的专业知识、工作流和关键规则</small></span><img src="/icons/tabler/chevron-down.svg" alt="" aria-hidden="true" /></summary>
                 <div className="build-explanation-body">
                   <section>
                     <div><span>专业知识</span><strong>{knowledgePack.atoms.length ? `${knowledgePack.evidenceCoverage?.verifiedRuleCount || 0} 条可执行规则 · ${knowledgePack.evidenceCoverage?.advisoryRuleCount || 0} 条参考洞察` : knowledgePack.status === "not-needed" ? "本次不需要额外专业知识" : "专业知识尚未补齐"}</strong></div>
@@ -11194,7 +11735,7 @@ export default function Home() {
                 </div>
               </details>
               <details className="build-developer-details">
-                <summary><span><strong>开发者详情</strong><small>Compiler、Manifest、Eval、运行指标与全部文件</small></span><img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/code-dots.svg" alt="" aria-hidden="true" /></summary>
+                <summary><span><strong>开发者详情</strong><small>Compiler、Manifest、Eval、运行指标与全部文件</small></span><img src="/icons/tabler/code-dots.svg" alt="" aria-hidden="true" /></summary>
                 <div className="build-developer-content">
               {knowledgePack.status !== "idle" && (
                 <section className={`knowledge-pack-panel ${knowledgePack.status}`} aria-label="生成阶段专业知识增强结果">
@@ -11203,6 +11744,10 @@ export default function Home() {
                     <div className="knowledge-pack-metrics"><span><b>{knowledgePack.sources.length}</b> 个来源</span><span><b>{knowledgePack.atoms.length}</b> 条采用</span><span><b>{knowledgePack.coverage.score}%</b> 维度覆盖</span><span><b>{knowledgePack.valueDensity}</b> 价值密度</span></div>
                   </div>
                   {knowledgePack.plan.knowledgeGaps.length > 0 && <div className="knowledge-gap-row"><span>本次重点寻找</span>{knowledgePack.plan.knowledgeGaps.map((gap) => <em key={gap}>{gap}</em>)}</div>}
+                  {knowledgePack.plan.queries.length > 0 && <details className="knowledge-query-details">
+                    <summary>查看实际发送的检索问题</summary>
+                    <ol>{selectKnowledgeQueries(knowledgePack.plan.queries, knowledgePack.plan.preferredDomains).map((query) => <li key={query}>{query}</li>)}</ol>
+                  </details>}
                   {mcpConnections.length > 0 && knowledgeMcpReport && <div className={`knowledge-mcp-receipt ${knowledgeMcpReceiptState}`}>
                     <div className="knowledge-mcp-receipt-copy">
                       <span>INTERNAL MCP · 生成器取证回执</span>
@@ -11251,16 +11796,16 @@ export default function Home() {
                       </div>
                     </details>
                   )}
-                  {knowledgePack.rejected.length > 0 && <details className="knowledge-rejected"><summary>为什么这 {knowledgePack.rejected.length} 条候选没有写入</summary><ul>{knowledgePack.rejected.map((item) => <li key={item}>{item}</li>)}</ul></details>}
+                  {knowledgePack.rejected.length > 0 && <details className="knowledge-rejected"><summary>查看 {knowledgePack.rejected.length} 条未采用原因</summary><ul>{knowledgePack.rejected.map((item) => <li key={item}>{item}</li>)}</ul></details>}
                 </section>
               )}
               <section className={`build-loop-result ${buildLoop.status}`} aria-label="Build Loop 结果">
                 <div className="build-loop-copy">
-                  <span>BUILD LOOP · 负责生成并冻结初始架构</span>
-                  <strong>{gateOutcomes.build.verdict === "satisfied" ? "确定性结构验证完成，初始架构已冻结" : buildLoop.status === "attention" ? "Build Loop 仍有结构问题" : "正在从需求生成初始 Bundle"}</strong>
-                  <p>{gateOutcomes.build.verdict === "satisfied" ? "这只证明语法、路径与跨文件契约可复现地成立，不代表实际任务效果已经验证。" : buildLoop.issues[0] || "需求 → Capability → Bundle"}</p>
+                  <span>生成文件检查</span>
+                  <strong>{gateOutcomes.build.verdict === "satisfied" ? "文件结构检查通过" : buildLoop.status === "attention" ? "生成文件需要修复" : "正在生成并检查文件"}</strong>
+                  <p>{gateOutcomes.build.verdict === "satisfied" ? "文件结构、引用路径和步骤衔接都已检查，可以开始真实任务测试。这里只说明文件可以运行，不代表效果一定更好。" : buildLoop.issues[0] ? friendlyReleaseBlocker(buildLoop.issues[0]) : "系统正在把你的需求整理成可以运行的 Skill 文件。"}</p>
                 </div>
-                <div className="gate-evidence-strip"><span>证据类型</span><strong>本地确定性检查</strong><em>{gateOutcomes.build.sampleSize} 项 · 可复现</em></div>
+                <div className="gate-evidence-strip"><span>检查方式</span><strong>自动结构检查</strong><em>{gateOutcomes.build.sampleSize} 项 · 可重复检查</em></div>
                 <div className="build-loop-flow">
                   {BUILD_LOOP_STEPS.map((label, index) => {
                     const reachedIndex = buildLoop.frozen ? BUILD_LOOP_STEPS.length - 1 : BUILD_LOOP_PHASE_INDEX[buildLoop.phase];
@@ -11269,17 +11814,17 @@ export default function Home() {
                   })}
                 </div>
               </section>
-              <section className={`generation-loop-result ${optimizationStableAtCeiling || optimizationCompletedWithRollback ? "completed" : generationLoop.status}`} aria-label="Optimization Loop 结果">
+              <section className={`generation-loop-result ${generationCopy.tone}`} aria-label="自动测试与优化结果">
                 <div className="generation-loop-head">
-                  <div><span>{optimizationBlockedByBuild ? "BUILD CONTRACT REPAIR · 先修复再评测" : "OPTIMIZATION LOOP · 只做有证据的局部优化"}</span><strong>{gateOutcomes.optimization.verdict === "satisfied" ? "当前候选已被保留集与回归证据接受" : optimizationStableAtCeiling ? "评测已完成，当前版本处于稳定上限" : optimizationCompletedWithRollback ? "评测已完成，已保留当前最佳版本" : optimizationBlockedByBuild ? "初始 Bundle 尚未通过契约检查" : generationLoop.status === "attention" ? "Optimization Loop 需要处理" : generationLoop.status === "running" ? "正在运行 Optimization Loop" : "尚未运行 Optimization Loop"}</strong><p>{optimizationStableAtCeiling ? "无 Skill 与当前版本都达到评测上限，保留任务全部通过。候选没有证明额外提升，系统已自动回滚并保留当前最佳版本。" : optimizationCompletedWithRollback ? "候选已完成真实试跑，但没有稳定优于当前版本，因此系统自动回滚候选。当前最佳版本没有被失败修改覆盖。" : generationLoop.stopReason}</p></div>
+                  <div><span>{optimizationBlockedByBuild ? "生成前检查" : "自动测试与优化"}</span><strong>{generationCopy.panelTitle}</strong><p>{generationCopy.panelBody}</p></div>
                   <div className="generation-loop-actions">
-                    <em>{gateOutcomes.optimization.verdict === "satisfied" ? "✓ 已接受" : optimizationStableAtCeiling ? "✓ 已保留最佳版" : optimizationCompletedWithRollback ? "✓ 已安全回滚" : optimizationBlockedByBuild ? "未启动" : generationLoop.status === "attention" ? "需处理" : generationLoop.status === "running" ? "执行中" : "未运行"}</em>
-                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在处理…" : optimizationBlockedByBuild ? "继续修复 Bundle" : optimizationCompletedWithRollback ? "再次尝试优化" : "重跑 Optimization Loop"}</button>}
+                    <em>{generationCopy.badge}</em>
+                    {generationLoop.status === "attention" && !optimizationStableAtCeiling && files["SKILL.md"] && <button type="button" onClick={() => void rerunOptimizationLoop()} disabled={busy}>{busy ? "正在处理…" : generationCopy.action}</button>}
                   </div>
                 </div>
                 {optimizationBlockedByBuild
-                  ? <div className="optimization-waiting-note">真实试跑尚未开始；当前只显示 Build Loop 的待修复原因，不提前展示评分、Lift 或 held-out 证据。</div>
-                  : generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>证据类型</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "重复 held-out 比较" : "单次 held-out 观察"}</strong><em>{generationLoop.benchmarkCases} 个冻结场景 · 每个版本每场景 {generationLoop.benchmarkRepeatsPerCase} 次</em></div>}
+                  ? <div className="optimization-waiting-note">真实任务测试还没有开始。先修复上面的生成文件问题，修好后系统会继续测试。</div>
+                  : generationLoop.status !== "idle" && <div className="gate-evidence-strip"><span>测试依据</span><strong>{gateOutcomes.optimization.evidenceStrength === "repeated-held-out" ? "多次独立测试" : "单次独立测试"}</strong><em>{generationLoop.benchmarkCases} 个固定场景 · 每个版本每场景 {generationLoop.benchmarkRepeatsPerCase} 次</em></div>}
                 {!optimizationBlockedByBuild && <div className="generation-loop-flow optimization-loop-flow">
                   {OPTIMIZATION_LOOP_STEPS.map((label, index) => {
                     const reachedIndex = generationLoop.status === "passed" || generationLoop.minimalityChecked
@@ -11296,16 +11841,13 @@ export default function Home() {
                   })}
                 </div>}
                 {generationLoop.status !== "idle" && !optimizationBlockedByBuild && <div className="generation-loop-metrics">
-                  <div><span>独立评分 · 普通 AI</span><strong>{generationLoop.benchmarkRuns ? generationLoop.baselineScore : "—"}</strong></div>
-                  <div><span>独立评分 · 当前 Skill</span><strong>{generationLoop.benchmarkRuns ? generationLoop.bestScore : "—"}</strong></div>
-                  <div className={generationLoop.lift > 0 ? "positive" : ""}><span>独立评分 Lift</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.lift >= 0 ? "+" : ""}${generationLoop.lift}` : "—"}</strong></div>
-                  <div><span>冻结断言通过率</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.passRate}%` : "—"}</strong></div>
-                  <div><span>冻结场景正式总分</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.baselineQualityScore} / ${generationLoop.bestQualityScore}` : "—"}</strong></div>
-                  <div><span>匿名 A/B 结果</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 胜" : generationLoop.blindWinner === "baseline" ? "普通 AI 胜" : generationLoop.blindWinner === "tie" ? "两者持平" : "—"}</strong></div>
-                  <div><span>试跑设计</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkCases} 场景 × 每版 ${generationLoop.benchmarkRepeatsPerCase} 次` : "—"}</strong></div>
-                  <div><span>重复运行稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? `Skill σ ${generationLoop.bestStddev} · 基线 σ ${generationLoop.baselineStddev ?? "—"}` : "未测（每场景仅 1 次）"}</strong></div>
+                  <div className={generationLoop.lift > 0 ? "positive" : ""}><span>相比通用 AI</span><strong>{generationLoop.blindWinner === "candidate" ? "当前 Skill 更好" : generationLoop.blindWinner === "baseline" ? "通用 AI 更好" : generationLoop.blindWinner === "tie" ? "暂未看到明显差异" : "等待对比"}</strong></div>
+                  <div><span>整体提升</span><strong>{generationLoop.benchmarkRuns ? generationLoop.lift >= 8 ? "提升明显" : generationLoop.lift > 0 ? "有所提升" : generationLoop.lift === 0 ? "表现接近" : "出现退步" : "等待测试"}</strong></div>
+                  <div><span>关键要求</span><strong>{generationLoop.benchmarkRuns ? generationLoop.passRate >= 90 ? "大部分稳定做到" : generationLoop.passRate >= 70 ? "基本做到，仍有缺口" : "多项仍未做到" : "等待测试"}</strong></div>
+                  <div><span>测试规模</span><strong>{generationLoop.benchmarkRuns ? `${generationLoop.benchmarkCases} 个场景 × 每版 ${generationLoop.benchmarkRepeatsPerCase} 次` : "—"}</strong></div>
+                  <div><span>结果稳定性</span><strong>{generationLoop.benchmarkRepeatsPerCase > 1 && generationLoop.bestStddev !== null ? generationLoop.bestStddev <= 5 ? "多次结果较稳定" : "不同轮次仍有波动" : "每个场景只测了 1 次"}</strong></div>
                 </div>}
-                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{optimizationStableAtCeiling ? `查看 ${generationLoop.issues.length} 条比较说明` : optimizationCompletedWithRollback ? `查看 ${generationLoop.issues.length} 条未采纳证据` : `查看仍需观察的 ${generationLoop.issues.length} 项`}</summary><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
+                {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{generationCopy.issueLabel}</summary><p>这些是测试记录，不一定代表不同问题；同一问题可能有多条证据。</p><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
               </section>
               <div className="editor-shell">
                 <div className="file-tree">
@@ -11375,7 +11917,7 @@ export default function Home() {
                     <h3>先让它完成一次代表性任务</h3>
                     <p>AI 会根据你的目标和资料设计一条真实输入，再严格按当前 Skill 生成完整结果。之后才会指出不足，不再用文件是否齐全代替效果。</p>
                     <button className="primary-button" onClick={runEvaluation} disabled={busy}>{busy ? "正在生成 Demo…" : "生成第一版 Demo"}<span>↗</span></button>
-                    <small>{hasRealModel ? `由 ${model} 试跑 · Key 通过服务端安全代理使用` : "需要先连接模型；不会用静态分数冒充真实试跑"}</small>
+                    <small>{hasRealModel ? `由 ${model} 试跑 · Key 通过服务端安全代理使用` : "需要先连接模型；不会用文件检查冒充实际提升"}</small>
                   </div>
                 )
               ) : (
@@ -11389,56 +11931,47 @@ export default function Home() {
                       </section>
                     )}
                     {renderSkillDemoCard(false)}
-                    <section className={`eval-report-panel ${evalDetailsOpen ? "expanded" : "collapsed"}`} aria-label="本轮效果报告">
-                    <div className={`eval-report-summary ${needsWorkEvals.length ? "needs-work" : observedEvals.length ? "ready" : "partial"}`}>
+                    <section className="eval-report-panel expanded" aria-label="本轮效果报告">
+                    <div className={`eval-report-summary ${!formalComparisonIsCurrent || formalGapRows.length ? "needs-work" : "ready"}`}>
                       <div className="eval-report-verdict">
-                        <span>本轮结论</span>
+                        <span>裸模型 vs 当前 Skill · 同题匿名对照</span>
                         <strong>{evaluationHeadline}</strong>
                         <p>{evaluationSummary}</p>
                       </div>
                       <div className="eval-report-counts" aria-label="本轮证据状态">
-                        <div><strong>{strongEvals.length}</strong><span>表现符合要求</span></div>
-                        <div><strong>{needsWorkEvals.length}</strong><span>还能再提升</span></div>
+                        <div><strong>{formalImprovementRows.length}</strong><span>任务中 Skill 更好</span></div>
+                        <div><strong>{formalGapRows.length}</strong><span>任务中尚未胜出</span></div>
                       </div>
-                      <button type="button" className="eval-report-toggle" onClick={() => setEvalDetailsOpen((current) => !current)} aria-expanded={evalDetailsOpen} aria-controls="eval-report-details" disabled={!observedEvals.length}>
-                        {evalDetailsOpen ? "收起" : "展开"}<img src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-down.svg" alt="" aria-hidden="true" />
-                      </button>
                     </div>
-                    <div id="eval-report-details" className="eval-report-details" hidden={!evalDetailsOpen}>
-                      <div className="eval-list" aria-label="本轮效果验证">
-                    {evals.map((result, index) => {
-                      // Hide unobserved rows without shifting optimization indices.
-                      if (result.coverage === "not-covered") return null;
-                      const history = optimizationHistory[result.label];
-                      const delta = history ? result.score - history.before.score : 0;
-                      const analyzingThis = optimizationOpen && optimizationTargetIndex === index && optimizationActive;
-                      const statusLabel = result.score >= DEMO_SCORING_POLICY.observedGoodFloor
-                          ? "这次表现符合要求"
-                          : result.score >= DEMO_SCORING_POLICY.observedWarningFloor
-                            ? "有一个明显差距"
-                            : "优先提升";
-                      return (
-                        <article className={`eval-row ${history ? "optimized" : ""} ${result.tone}`} key={result.label}>
-                          <div className="eval-row-head">
-                            <span className="eval-title-line"><strong>{result.label}</strong>{history && <em>复评 {delta >= 0 ? "+" : ""}{delta}</em>}</span>
-                            <span className={`eval-status ${result.tone}`}>{statusLabel}</span>
+                    <div id="eval-report-details" className="eval-report-details">
+                      <div className="ab-comparison-list" aria-label="裸模型与 Skill 的逐任务对照">
+                        {formalComparisonRows.length > 0 ? formalComparisonRows.map((result) => (
+                          <article className={`ab-comparison-row ${result.verdict}`} key={result.caseId}>
+                            <div className="ab-comparison-head">
+                              <div><span>实际测试任务</span><strong>{result.title}</strong></div>
+                              <em>{result.verdict === "candidate" ? "Skill 更好" : result.verdict === "tie" ? "表现接近" : "裸模型更好"}</em>
+                            </div>
+                            <div className="ab-comparison-finding">
+                              <span>{result.verdict === "candidate" ? "这份 Skill 带来的具体提升" : "这次对照发现的问题"}</span>
+                              <p>{result.explanation}</p>
+                            </div>
+                            {(result.baselineOutput || result.skillOutput) && <details className="ab-output-details">
+                              <summary>查看两份实际回答 <span>⌄</span></summary>
+                              <div><section><span>不带 Skill</span><pre>{result.baselineOutput || "没有保存这份历史回答"}</pre></section><section><span>带当前 Skill</span><pre>{result.skillOutput || "没有保存这份历史回答"}</pre></section></div>
+                            </details>}
+                          </article>
+                        )) : (
+                          <div className="ab-comparison-empty">
+                            <strong>当前版本还没有可展示的正式对照</strong>
+                            <p>运行后会把同一任务分别交给裸模型和当前 Skill，并直接显示哪一份更好、具体好在哪里。</p>
+                            <button type="button" onClick={() => void rerunMultiSceneComparison()} disabled={busy}>{busy ? "正在运行对照…" : "运行裸模型对照"}<span>→</span></button>
                           </div>
-                          <div className={`eval-row-body ${result.score < DEMO_SCORING_POLICY.observedGoodFloor ? "has-gap" : "good"}`}>
-                            <div className="eval-observation"><span>本轮看到的表现</span><p>{result.strength || result.detail}</p></div>
-                            {result.score < DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-next-gap"><span>还能再提升的地方</span><p>{result.issue || "本轮暂未发现明确差距。"}</p></div>}
-                            {result.score >= DEMO_SCORING_POLICY.observedGoodFloor && <div className="eval-good-note"><span>结论</span><p>{result.detail}</p></div>}
-                          </div>
-                          <div className="eval-row-actions">
-                            <details className="eval-evidence-details">
-                              <summary>查看判断依据 <span>⌄</span></summary>
-                              <div><p><strong>观察依据</strong>{result.evidence || "请结合上面的 Demo 判断。"}</p><p><strong>对实际使用的影响</strong>{result.impact || "这会影响结果是否真正可用。"}</p><p><strong>内部观察分</strong>{history && <del>{history.before.score}</del>} {result.score}/100</p></div>
-                            </details>
-                            {(result.score < DEMO_SCORING_POLICY.observedGoodFloor || history) && <button className="eval-optimize-button" onClick={() => void openOptimization(index)} disabled={optimizationActive || busy}>{analyzingThis ? "正在分析…" : history ? "继续优化" : "优化这一项"}<span>→</span></button>}
-                          </div>
-                        </article>
-                      );
-                    })}
+                        )}
                       </div>
+                      {observedEvals.length > 0 && <details className="eval-internal-diagnostics">
+                        <summary><span><strong>查看单次 Demo 的内部诊断</strong><small>用于定位问题，不作为“优于裸模型”的证明</small></span><i>⌄</i></summary>
+                        <div>{observedEvals.map((result) => <article key={result.label}><strong>{result.label}</strong><p>{result.strength || result.detail}</p>{result.issue && <small>{result.issue}</small>}</article>)}</div>
+                      </details>}
                     </div>
                     </section>
                     {bundleAudit.blockers.length > 0 && <div className="finding-card">
@@ -11524,7 +12057,7 @@ export default function Home() {
           <section className="generation-notice-modal" aria-modal="true" role="dialog" aria-labelledby="generation-notice-title">
             <button className="close-button" aria-label="关闭生成提醒" onClick={() => setGenerationNoticeOpen(false)}>×</button>
             <span className="generation-notice-kicker">开始生成前</span>
-            <h2 id="generation-notice-title">生成可能需要几分钟</h2>
+            <h2 id="generation-notice-title">生成大概需要 5–7 分钟</h2>
             <p>SkillCanvas 会继续完成专业知识检索、Skill 生成、结构检查和自动优化。你不必一直停留在当前页面。</p>
             <div className={`generation-notice-permission ${notificationPermission}`}>
               <span aria-hidden="true">{notificationPermission === "granted" ? "✓" : "●"}</span>
@@ -11547,14 +12080,23 @@ export default function Home() {
             <div className="modal-head"><div><span className="stage-kicker">{credentialManaged ? "MANAGED SERVICE" : "BYOK · Bring your own key"}</span><h2 id="model-settings-title">{credentialManaged ? "平台服务已就绪" : "连接你的 AI 模型"}</h2></div><button className="close-button" aria-label="关闭模型设置" onClick={closeSettings}>×</button></div>
             {credentialManaged ? (
               <div className="managed-service-panel">
-                <div className="privacy-banner"><span>✓</span><p><strong>无需填写任何 API Key</strong><small>{researchCredentialManaged ? "DeepSeek 与 Firecrawl 均由平台在服务器端提供。" : "DeepSeek 由平台在服务器端提供。"}密钥不会发送到浏览器，也不会写入生成的 Skill 或日志。</small></p></div>
+                <div className="privacy-banner"><span>✓</span><p><strong>无需填写任何 API Key</strong><small>AI 与已启用的检索服务均由平台在服务器端提供。密钥不会发送到浏览器，也不会写入生成的 Skill 或日志。</small></p></div>
                 <div className="managed-service-status">
                   <div><span>AI 模型</span><strong>{PROVIDERS[provider].name} · {model}</strong><em>可用</em></div>
-                  <div><span>公开网页检索</span><strong>{researchCredentialManaged ? RESEARCH_PROVIDERS[researchProvider].name : "未启用"}</strong><em className={researchCredentialManaged ? "" : "muted"}>{researchCredentialManaged ? "可用" : "未启用"}</em></div>
+                  <div><span>公开网页检索</span><strong>{researchReady ? RESEARCH_PROVIDERS[researchProvider].name : "未启用"}</strong><em className={researchReady ? "" : "muted"}>{researchReady ? "可用" : "未启用"}</em></div>
                 </div>
+                {managedResearchChoices.length > 0 && (
+                  <div className="provider-options research-provider-options">
+                    {managedResearchChoices.map((id) => (
+                      <button type="button" key={id} aria-pressed={researchProvider === id} className={researchProvider === id ? "selected" : ""} onClick={() => updateResearchProvider(id)}>
+                        <span>{RESEARCH_PROVIDERS[id].mark}</span><strong>{RESEARCH_PROVIDERS[id].name}</strong><i>{researchProvider === id ? "●" : ""}</i><small>{RESEARCH_PROVIDERS[id].detail}</small>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 <div className="modal-footer">
                   <button className="secondary-button" onClick={testConnection} disabled={connectionState === "testing"}>{connectionState === "testing" ? "正在测试 AI…" : "测试 AI 服务"}</button>
-                  {researchCredentialManaged && <button className="secondary-button" onClick={() => void testResearchConnection()} disabled={researchProbe.status === "testing"}>{researchProbe.status === "testing" ? "正在测试检索…" : "测试网页检索"}</button>}
+                  {researchReady && <button className="secondary-button" onClick={() => void testResearchConnection()} disabled={researchProbe.status === "testing"}>{researchProbe.status === "testing" ? "正在测试检索…" : "测试网页检索"}</button>}
                   <span className={`connection-result ${connectionState}`}>{connectionState === "ok" ? "✓ AI 服务连接成功" : connectionState === "error" ? "AI 服务暂时不可用" : "访客可直接使用，无需自行配置"}</span>
                   <button className="primary-button" onClick={closeSettings}>完成</button>
                 </div>
@@ -11593,7 +12135,7 @@ export default function Home() {
               <p>它用于寻找专业流程、判断规则、例外和失败模式，并写入 Skill 的领域手册与评测；不是给生成后的 Skill 机械添加联网工具。</p>
               <div className="provider-options research-provider-options">
                 {(Object.keys(RESEARCH_PROVIDERS) as ResearchProviderId[]).map((id) => (
-                  <button type="button" key={id} aria-pressed={researchProvider === id} className={researchProvider === id ? "selected" : ""} onClick={() => updateResearchProvider(id)}>
+                  <button type="button" key={id} aria-pressed={researchProvider === id} className={researchProvider === id ? "selected" : ""} disabled={id === "deepseek" && provider !== "deepseek"} onClick={() => updateResearchProvider(id)}>
                     <span>{RESEARCH_PROVIDERS[id].mark}</span><strong>{RESEARCH_PROVIDERS[id].name}</strong><i>{researchProvider === id ? "●" : ""}</i><small>{RESEARCH_PROVIDERS[id].detail}</small>
                   </button>
                 ))}
@@ -11604,7 +12146,7 @@ export default function Home() {
                 <button className="secondary-button" onClick={() => void testResearchConnection()} disabled={!researchReady || researchProbe.status === "testing"}>{researchProbe.status === "testing" ? "正在测试检索…" : "测试检索连接"}</button>
                 <span role="status" className={`connection-result ${researchProbe.status}`}>{researchProbe.message}</span>
               </div>}
-              <small className="research-privacy-note">检索服务只收到 AI 生成的专业问题和它自身的授权凭据；不会收到大模型 API Key、上传文件全文、原始业务材料或个人联系方式。网页证据会经过来源过滤后再交给模型编译。</small>
+              <small className="research-privacy-note">Firecrawl 与 SearXNG 只收到检索问题及其自身配置；DeepSeek 联网搜索会在服务端复用已保存的 DeepSeek Key，但不会把 Key 交给结果网站。任何方式都不会发送上传文件全文、原始业务材料或个人联系方式；网页证据会经过来源过滤后再交给模型编译。</small>
               <details className="internal-mcp-settings">
                 <summary>
                   <span><strong>Workflow MCP 证据源</strong><small>供 Knowledge Compiler 与 Optimization Research 调用</small></span>
@@ -11647,13 +12189,13 @@ export default function Home() {
             <div className="optimization-baseline">
               <span className={`eval-dot ${optimizationTarget.tone}`} />
               <div><strong>当前评估</strong><p>{optimizationTarget.detail}</p></div>
-              <b>{optimizationTarget.score}</b>
+              <b>{optimizationTarget.score >= DEMO_SCORING_POLICY.observedGoodFloor ? "已见提升" : optimizationTarget.score >= DEMO_SCORING_POLICY.observedWarningFloor ? "仍需加强" : "尚未提升"}</b>
             </div>
 
             {optimizationStatus === "analyzing" && (
               <div className="optimization-loading" role="status" aria-live="polite">
                 <div className="optimization-loading-copy"><span className="coach-avatar">AI</span><div><strong>正在用多项任务寻找共性问题</strong><small>训练任务用于找问题，独立验证任务不会提供给修改 Agent</small></div><b>{optimizationElapsed}s</b></div>
-                <div className="optimization-scan"><span /></div>
+                <DotMatrixProgress tone="dark" label="正在分析评测证据" />
                 <p>系统会分别试跑训练组和验证组，只根据训练证据提出优化；验证组负责决定候选版本是否能够替换原版。</p>
                 <div className="optimization-token-usage" aria-live="polite">
                   <strong>Token 用量</strong>
@@ -11691,7 +12233,7 @@ export default function Home() {
             {optimizationActive && optimizationStatus !== "analyzing" && (
               <div className="optimization-run-state" role="status" aria-live="polite">
                 <div><span className="coach-avatar">AI</span><p><strong>{optimizationStatus === "optimizing" ? "正在生成有限修改的候选版本" : "正在进行独立验证"}</strong><small>{optimizationStatus === "optimizing" ? `本轮最多 ${OPTIMIZATION_EDIT_BUDGET} 处局部修改，不直接覆盖当前 Skill` : "使用修改 Agent 没看过的保留任务；没有严格提升就自动回滚"}</small></p><b>{optimizationElapsed}s</b></div>
-                <div className="optimization-scan"><span /></div>
+                <DotMatrixProgress tone="dark" label={optimizationStatus === "optimizing" ? "正在生成候选版本" : "正在进行独立验证"} />
                 <div className="optimization-token-usage" aria-live="polite">
                   <strong>Token 用量</strong>
                   <b>{formatAiTokens(busyTokenUsage.totalTokens)}</b>
@@ -11718,10 +12260,10 @@ export default function Home() {
                   <div><strong>{optimizationTargetHistory.accepted ? "候选版本已通过，成为当前最佳版本" : "候选版本未通过，已自动回滚"}</strong><small>使用 {optimizationTargetHistory.testedCases} 项独立任务验证 · 目标维度必须严格提升且其他关键能力不能明显退步</small></div>
                 </div>
                 <div className="optimization-score-change">
-                  <div><span>原版验证分</span><strong>{optimizationTargetHistory.before.score}</strong></div>
+                  <div><span>原版表现</span><strong>{optimizationTargetHistory.before.score >= DEMO_SCORING_POLICY.observedGoodFloor ? "已见提升" : optimizationTargetHistory.before.score >= DEMO_SCORING_POLICY.observedWarningFloor ? "仍需加强" : "尚未提升"}</strong></div>
                   <i>→</i>
-                  <div className="after"><span>候选验证分</span><strong>{optimizationTargetHistory.after.score}</strong></div>
-                  <b>{optimizationTargetHistory.after.score - optimizationTargetHistory.before.score >= 0 ? "+" : ""}{optimizationTargetHistory.after.score - optimizationTargetHistory.before.score} pts</b>
+                  <div className="after"><span>候选表现</span><strong>{optimizationTargetHistory.after.score >= DEMO_SCORING_POLICY.observedGoodFloor ? "已见提升" : optimizationTargetHistory.after.score >= DEMO_SCORING_POLICY.observedWarningFloor ? "仍需加强" : "尚未提升"}</strong></div>
+                  <b>{optimizationTargetHistory.accepted ? "提升已通过" : "没有证明更好"}</b>
                 </div>
                 <div className="optimization-result-copy"><strong>{optimizationTargetHistory.accepted ? "这次具体改变了什么" : "为什么没有采用"}</strong><p>{optimizationTargetHistory.summary}</p></div>
                 <div className="optimization-applied"><span>{optimizationTargetHistory.accepted ? "已采用" : "候选修改"}</span>{optimizationTargetHistory.appliedTitles.map((title) => <b key={title}>{optimizationTargetHistory.accepted ? "✓" : "○"} {title}</b>)}</div>
@@ -11745,38 +12287,26 @@ export default function Home() {
             <div className="ai-progress-top">
               <span className="coach-avatar">AI</span>
               <div><strong>{BUSY_STAGES[busyTask].title}</strong><small>当前阶段：{busyStage}</small></div>
-              <b>已等待 {busyElapsedLabel}</b>
+              {busyBuildProgress !== null
+                ? <b className="ai-progress-percent" role="progressbar" aria-label="预计生成进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={busyBuildProgress}>{busyBuildProgress}%</b>
+                : <b>已等待 {busyElapsedLabel}</b>}
             </div>
             <div className={`busy-execution-status ${busyExecutionKind}`} key={`${busyStage}-${busyExecutionKind}-${busyExecutionNote}`}>
               <span>{busyExecutionLabel}</span>
               <p>{busyExecutionNote}</p>
             </div>
-            <div className="ai-progress-token-usage" aria-live="polite">
-              <div>
-                <span>本次加载 Token</span>
-                <strong>{formatAiTokens(busyTokenUsage.totalTokens)}</strong>
-                <small>{busyTokenUsageStatus}</small>
-              </div>
-              <div>
-                <span>请求次数</span>
-                <strong>{busyTokenUsage.requests}</strong>
-                <small>{busyTokenUsageHint}</small>
-              </div>
-              <em>会话累计 {formatAiTokens(sessionTokenUsage.totalTokens)} tokens</em>
+            <div className={`ai-output-stage ${busyOutputText ? "has-output" : "waiting"}`} aria-label={busyOutputText ? "模型本轮输出" : "模型正在处理"}>
+              {busyOutputText
+                ? <div className="ai-output-scroll" ref={busyOutputViewportRef} key={busyOutputRevision} tabIndex={0}><pre>{busyOutputText}</pre></div>
+                : <WaitingDotField />}
             </div>
-            <div className={`thinking-warp ${busyTask} ${busyExecutionKind}`} aria-hidden="true">
-              <span className="warp-core">AI</span>
-              {thinkingWords.map((word, index) => (
-                <i key={`${word}-${index}`} style={{ "--word-index": index, animationDelay: `${index * 170}ms` } as CSSProperties}>{word}</i>
-              ))}
-            </div>
-            <div className="ai-progress-track"><span /></div>
+            <DotMatrixProgress progress={(busyStageIndex + 0.42) / BUSY_STAGES[busyTask].stages.length} label={`总进度：${busyStage}`} />
             <div className="ai-progress-steps">
               {BUSY_STAGES[busyTask].stages.map((stageName, index) => (
-                <div className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName}>
+                <div className={index < busyStageIndex ? "done" : index === busyStageIndex ? "active" : ""} key={stageName} style={{ "--stage-index": index } as CSSProperties}>
                   <i aria-hidden="true">{index < busyStageIndex ? "✓" : index === busyStageIndex ? "●" : ""}</i>
                   <span><strong>{stageName}</strong><small>{index < busyStageIndex ? "已完成" : index === busyStageIndex ? "进行中" : "待进行"}</small></span>
-                  {index < BUSY_STAGES[busyTask].stages.length - 1 && <img className="progress-step-arrow" src="https://unpkg.com/@tabler/icons@3.46.0/icons/outline/chevron-right.svg" alt="" aria-hidden="true" />}
+                  {index < BUSY_STAGES[busyTask].stages.length - 1 && <img className="progress-step-arrow" src="/icons/tabler/chevron-right.svg" alt="" aria-hidden="true" />}
                 </div>
               ))}
             </div>

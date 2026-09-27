@@ -19,6 +19,32 @@ test("missing foundation review status stays unconfirmed without changing origin
   assert.throws(() => assertBlueprintStage("blueprint-foundation", normalizeBlueprintStage("blueprint-foundation", raw)), /content/);
 });
 
+test("fixed foundation slots survive duplicate IDs and extra sections without losing evidence", () => {
+  const raw = structuredClone(foundation);
+  raw.sections[3].id = raw.sections[2].id;
+  raw.sections.splice(4, 0, { ...raw.sections[3], content: "Additional confirmed boundary detail" });
+  const normalized = normalizeBlueprintStage("blueprint-foundation", raw);
+  assertBlueprintStage("blueprint-foundation", normalized);
+  assert.deepEqual(normalized.sections.map((section) => section.id), ["goal", "understanding", "working-style", "boundary", "output", "eval"]);
+  assert.deepEqual(normalized.sections.map((section) => section.index), ["A", "B", "C", "D", "E", "F"]);
+  assert.match(normalized.sections[3].content, /Additional confirmed boundary detail/);
+  assert.equal(normalized.sections[3].status, "attention", "merged evidence must be reviewed");
+});
+
+test("a missing foundation section requests only its content, not a model-authored array shape", () => {
+  const raw = structuredClone(foundation);
+  raw.sections.splice(3, 1);
+  const candidate = normalizeBlueprintStage("blueprint-foundation", raw);
+  const issues = blueprintStageIssues("blueprint-foundation", candidate);
+  assert.deepEqual(issues, [{ path: "/sections/3/content", code: "missing", expected: "non-empty string" }]);
+  const repaired = applyBlueprintFieldRepairs("blueprint-foundation", { candidate, issues }, { repairs: [
+    { path: "/sections/3/content", value: foundation.sections[3].content },
+  ] });
+  assertBlueprintStage("blueprint-foundation", repaired);
+  assert.deepEqual(repaired.sections.map((section) => section.id), foundation.sections.map((section) => section.id));
+  assert.equal(repaired.sections[3].status, "attention");
+});
+
 test("capability kind-specific nulls normalize without a model retry or invented routing", () => {
   const raw = structuredClone(capabilities);
   raw.capabilityPlan.items[0].scope = "conditional";

@@ -12,7 +12,14 @@ export const HOST_WEB_SEARCH_CAPABILITY = {
   category: "联网与界面" as const, hosts: ["Codex", "Claude（需 Web Search 或 MCP）", "通用 Agent"],
 };
 
-type HostCapability = { id: string; kind: string; name?: string; path?: string };
+type HostCapability = {
+  id: string;
+  kind: string;
+  name?: string;
+  path?: string;
+  optional?: boolean;
+  affects?: string[];
+};
 
 /** Infer host adapters from observable task I/O, never from a domain-specific
  * Skill name. The result is a recommendation: the target Agent still checks
@@ -60,9 +67,27 @@ export function reconcileHostCapabilityAliases<T extends HostCapability>(
     groups.set(id, [...(groups.get(id) || []), item]);
   }
   return {
-    // Exact catalog entry wins, including an explicit disabled selection.
-    // Keep distinct task actions on their original workflow nodes.
-    items: [...groups].map(([id, entries]) => ({ ...(entries.find((item) => item.id === id) || entries[0]), id })),
+    // Selection state and task wording come from the plan, but host identity
+    // and routing semantics come from the catalog. A planner must not turn an
+    // optional host adapter into a required writer merely by hallucinating
+    // optional=false or artifact-output. A later explicit artifact compiler
+    // may still promote the canonical adapter when the user really requested
+    // a file delivery.
+    items: [...groups].map(([id, entries]) => {
+      const selected = entries.find((item) => item.id === id) || entries[0];
+      const canonical = catalog.find((item) => item.id === id && item.kind === "builtin-tool");
+      return {
+        ...selected,
+        id,
+        ...(canonical ? {
+          kind: canonical.kind,
+          ...(canonical.name ? { name: canonical.name } : {}),
+          ...(canonical.path ? { path: canonical.path } : {}),
+          optional: canonical.optional,
+          affects: canonical.affects ? [...canonical.affects] : undefined,
+        } : {}),
+      } as T;
+    }),
     workflowSteps: workflowSteps.map((step) => ({ ...step,
       capabilityIds: [...new Set(step.capabilityIds.map((id) => aliases.get(id) || id))],
       ...(step.availableCapabilityIds ? { availableCapabilityIds: [...new Set(step.availableCapabilityIds.map((id) => aliases.get(id) || id))] } : {}),

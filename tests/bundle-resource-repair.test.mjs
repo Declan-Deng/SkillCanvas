@@ -3,17 +3,19 @@ import test from "node:test";
 import { readFile } from "node:fs/promises";
 import ts from "typescript";
 import * as canonical from "../app/canonical-mutations.ts";
-import { compileSkillIR, auditSkillIRFiles, projectEvalBank, projectSkillIRFiles, bindSkillIREvals, ensureSkillIREvalCoverage, skillIRDigest } from "../app/skill-ir.ts";
+import { compileSkillIR, auditSkillIRFiles, projectEvalBank, projectSkillIRFiles, bindSkillIREvals, ensureSkillIREvalCoverage, reconcileSkillIRContentPermission, skillIRDigest } from "../app/skill-ir.ts";
 import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract, contractRepairFailureReason } from "../app/skill-projection-repair.ts";
 import { validateBundleContentCoherence } from "../app/bundle-validator.ts";
 import { compileWorkflowDag } from "../app/workflow-dag.ts";
 import { validateImplementationFiles, applySkillIRMutations, validateCanonicalSkillIR } from "../app/canonical-mutations.ts";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "../app/bundle-resource-repair.ts";
 import { auditCapabilityClosure } from "../app/generation-loop-core.ts";
+import { contentPermissionConflictLocations, resolveContentPermission } from "../app/evidence-gates.ts";
 import { auditCrossArtifactConsistency } from "../app/skill-pipeline-core.ts";
 import { capabilities, workflow } from "./fixtures/blueprint.mjs";
 import { providerRepairNeedsUserAction } from "../app/eval-prompt.ts";
-import { issuesAreCompilerOwnedEvalCoverage } from "../app/eval-repair-routing.ts";
+import { isCompilerOwnedEvalCoverageIssue } from "../app/eval-repair-routing.ts";
+import { compilerOwnedContractIssues } from "../app/contract-repair-routing.ts";
 
 function fixture(inputName = "合同 PDF", path = "references/contract.pdf") {
   const plan = structuredClone(capabilities.capabilityPlan);
@@ -217,6 +219,19 @@ async function runRepairScenario(responses, options = {}) {
     initial = projectSkillIRFiles(badIR);
   }
   if (options.referencePresent) initial["references/check-rules.md"] = "# 检查规则\n保留原始证据。";
+  if (options.permissionConflict) {
+    const staleIR = canonical.parseCanonicalSkillIR(initial);
+    staleIR.requirements.push({
+      ...staleIR.requirements[0], id: "owner-content-permission", provenance: "user_explicit",
+      source: "interview.evidence-policy", statement: options.answers["evidence-policy"],
+      originalQuote: options.answers["evidence-policy"], evidenceKind: "explicit_authorization",
+    });
+    staleIR.requirements.push({
+      ...staleIR.requirements[0], id: "research-generic-restriction", provenance: "source_grounded",
+      source: "research", statement: "不得新增经历", originalQuote: undefined, evidenceKind: undefined,
+    });
+    initial = { ...initial, ...projectSkillIRFiles(staleIR) };
+  }
   if (options.drift) {
     const manifest = JSON.parse(initial["evals/capability-manifest.json"]);
     manifest.skill_ir.digest = "old-in-memory-digest";
@@ -251,12 +266,16 @@ async function runRepairScenario(responses, options = {}) {
       ...missingBundleResources(canonical.parseCanonicalSkillIR(files), files)
         .map((item) => issue("MISSING_IMPLEMENTATION", `能力 ${item.capabilityId} 的实现文件不存在：${item.path}`, [item.path], item.capabilityId)),
       ...auditSkillIRFiles(files).map((evidence) => issue("SKILL_IR_CLOSURE", evidence, ["evals/skill-ir.json"])).filter(isSkillIRProjectionIssue),
+      ...(options.permissionConflict ? auditSkillIRFiles(files)
+        .filter((evidence) => evidence.includes("USER_PERMISSION_RUNTIME_CONFLICT"))
+        .map((evidence) => issue("SKILL_IR_CLOSURE", evidence, ["evals/skill-ir.json"])) : []),
       ...coverageIssues,
     ] };
   };
   const validate = (files) => ({ executionReady: !(options.rebuildIntroducesP0 && files !== initial), contractReady: collect(files).issues.length === 0 });
   const deps = {
     ...canonical, reconcileRuntimeInputResources, missingBundleResources, contractRepairProgress, providerRepairNeedsUserAction,
+    contentPermissionConflictLocations, resolveContentPermission,
     bindSkillIREvals, ensureSkillIREvalCoverage, projectEvalBank,
     isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, contractRepairFailureReason,
     repairCapabilityDeltaContract,
@@ -264,12 +283,13 @@ async function runRepairScenario(responses, options = {}) {
     idea: "检查文档", loopPlan: workflow.loopPlan, BUILD_REPAIR_MAX_ROUNDS: 2,
     ensureCanonicalBundledResources: (value) => value,
     finalizeSkillFiles: (files, _idea, _answers, _source, _plan, _loop, value) => {
+      if (options.permissionConflict) value = reconcileSkillIRContentPermission(value, _answers);
       const bank = ensureSkillIREvalCoverage(value, files["evals/evals.json"] || projectEvalBank(value));
       const bound = bindSkillIREvals(value, bank);
       return { ...files, ...projectSkillIRFiles(bound) };
     },
     validateBundle: async (files) => validate(files), collectP1ContractState: collect,
-    issuesAreCompilerOwnedEvalCoverage,
+    isCompilerOwnedEvalCoverageIssue, compilerOwnedContractIssues,
     isSafeSkillFilePath: (path) => !path.includes(".."),
     allowedP1MutationTypes: () => ["identity.update", "capability.update"], canonicalMutationTargetCatalog: () => ({}),
     setBuildLoop: () => {}, setGenerationLoop: () => {}, setFiles: (files) => events.push({ event: "preserved-files", files }),
@@ -283,7 +303,7 @@ async function runRepairScenario(responses, options = {}) {
     },
   };
   const run = new Function(...Object.keys(deps), `${code}\nreturn runP1ContractRepairLoop;`)(...Object.values(deps));
-  const result = await run({ files: initial, validation: validate(initial), generationPlan: capabilities.capabilityPlan, answers: {}, sourceText: "", skillIR: ir });
+  const result = await run({ files: initial, validation: validate(initial), generationPlan: capabilities.capabilityPlan, answers: options.answers || {}, sourceText: "", skillIR: ir });
   return { result, initial, events, calls };
 }
 
@@ -295,6 +315,18 @@ test("production P1 repairs projection drift without a model call or consuming s
   assert.equal(run.result.files["evals/skill-ir.json"], run.initial["evals/skill-ir.json"]);
   assert.equal(run.result.files["references/check-rules.md"], run.initial["references/check-rules.md"]);
   assert.ok(run.events.some((event) => event.phase === "projection-repair" && event.accepted));
+});
+
+test("production P1 deterministically removes a lower-priority content restriction before model repair", async () => {
+  const run = await runRepairScenario([], {
+    referencePresent: true,
+    permissionConflict: true,
+    answers: { "evidence-policy": "可以自由补写经历和量化数据" },
+  });
+  assert.equal(run.result.passed, true);
+  assert.equal(run.result.rounds, 0);
+  assert.equal(run.calls.length, 0);
+  assert.doesNotMatch(run.result.files["SKILL.md"], /不得新增经历/);
 });
 
 test("production P1 closes missing failure coverage and a focused capability edge without a model call", async () => {

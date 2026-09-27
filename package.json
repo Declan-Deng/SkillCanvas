@@ -2,6 +2,7 @@
   "name": "site-creator-vinext-starter",
   "version": "0.1.0",
   "private": true,
+  "packageManager": "pnpm@11.19.0",
   "engines": {
     "node": ">=22.13.0"
   },
@@ -14,6 +15,7 @@
     "test": "pnpm run build && node --test tests/*.test.mjs",
     "test:mcp-runtime": "node scripts/mcp-runtime-check.mjs",
     "test:workflow-runtime": "node --test tests/workflow-runtime.test.mjs",
+    "probe:deepseek-search": "node scripts/deepseek-web-search-probe.mjs",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "db:generate": "drizzle-kit generate"
   },

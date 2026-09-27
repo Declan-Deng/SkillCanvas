@@ -9,6 +9,10 @@ export type WorkflowPlanContext = {
   workflowSteps: WorkflowDagStep[];
   capabilities: WorkflowPlanCapability[];
   inputs: Array<{ id: string; name: string; required: boolean; concept?: string; representations?: string[] }>;
+  /** Runtime state declared by the capability plan. These values exist as
+   * internal session roots even before their first update; they are not user
+   * inputs and must never be invented by the graph repair model. */
+  stateFields?: string[];
 };
 
 const normalizedLabel = (value: string) => value.replace(/^(?:\$|input:|input-|custom-)+/g, "").replace(/[\s_.:\-/]+/g, "").toLowerCase();
@@ -61,12 +65,43 @@ function scopeCheckpointReplies(steps: WorkflowDagStep[]) {
   }
   const businessProducts = new Set(steps.flatMap((step) => step.produces).filter((token) => !Object.values(WORKFLOW_TERMINALS).some((value) => value === token)));
   const occupied = new Set(steps.flatMap((step) => [...step.requires, ...step.produces, ...(step.resumeProduces || [])]));
+  const businessProducer = new Map<string, WorkflowDagStep | null>();
+  for (const step of steps) for (const token of step.produces.filter((value) => businessProducts.has(value))) {
+    businessProducer.set(token, businessProducer.has(token) ? null : step);
+  }
+  const ancestorsOf = (token: string, seen = new Set<string>()): Set<string> => {
+    if (seen.has(token)) return seen;
+    seen.add(token);
+    const producer = businessProducer.get(token);
+    if (producer) for (const dependency of producer.requires.filter((value) => businessProducts.has(value))) ancestorsOf(dependency, seen);
+    return seen;
+  };
+  const distanceToAncestor = (token: string, target: string, seen = new Set<string>()): number => {
+    if (token === target) return 0;
+    if (seen.has(token)) return Number.POSITIVE_INFINITY;
+    seen.add(token);
+    const producer = businessProducer.get(token);
+    if (!producer) return Number.POSITIVE_INFINITY;
+    const distances = producer.requires.filter((value) => businessProducts.has(value))
+      .map((value) => distanceToAncestor(value, target, new Set(seen)));
+    const nearest = distances.length ? Math.min(...distances) : Number.POSITIVE_INFINITY;
+    return Number.isFinite(nearest) ? nearest + 1 : nearest;
+  };
   const producedNames = new Map<string, Map<string, string>>();
   const consumedNames = new Map<string, Map<string, string>>();
   for (const [token, owners] of replies) {
     if (owners.length < 2 || token.startsWith("input:") || businessProducts.has(token)) continue;
     const consumers = steps.filter((step) => step.requires.includes(token));
-    const bindings = consumers.map((consumer) => ({ consumer, candidates: owners.filter((owner) => owner.id !== consumer.id && owner.requires.some((artifact) => businessProducts.has(artifact) && consumer.requires.includes(artifact))) }));
+    const bindings = consumers.map((consumer) => {
+      const dependencies = consumer.requires.filter((value) => value !== token && businessProducts.has(value));
+      const consumerContext = new Set(dependencies.flatMap((value) => [...ancestorsOf(value)]));
+      const ranked = owners.filter((owner) => owner.id !== consumer.id).map((owner) => ({ owner, distance: Math.min(...owner.requires
+        .filter((artifact) => businessProducts.has(artifact) && consumerContext.has(artifact))
+        .flatMap((artifact) => dependencies.map((dependency) => distanceToAncestor(dependency, artifact)))) }))
+        .filter((entry) => Number.isFinite(entry.distance));
+      const nearest = ranked.length ? Math.min(...ranked.map((entry) => entry.distance)) : Number.POSITIVE_INFINITY;
+      return { consumer, candidates: ranked.filter((entry) => entry.distance === nearest).map((entry) => entry.owner) };
+    });
     if (!consumers.length || bindings.some(({ candidates }) => candidates.length !== 1)) continue;
     const names = new Map(owners.map((owner) => [owner.id, `${token}:${owner.id}`]));
     if ([...names.values()].some((name) => occupied.has(name))) continue;
@@ -83,6 +118,513 @@ function scopeCheckpointReplies(steps: WorkflowDagStep[]) {
       when: step.when.replace(/\$?[a-zA-Z_][a-zA-Z0-9_.:-]*/g, (token) => incoming?.get(token) || token) };
   });
 }
+
+/** A delivery contract names the artifact being handed over. When exactly one
+ * real producer exists, bind that artifact as a dependency instead of asking
+ * a model to rediscover an already explicit edge. Ambiguous or missing
+ * products remain compiler errors and go through targeted repair. */
+function bindUnambiguousDeliveries(steps: WorkflowDagStep[]) {
+  const producers = new Map<string, WorkflowDagStep[]>();
+  for (const step of steps) for (const token of step.produces) producers.set(token, [...(producers.get(token) || []), step]);
+  return steps.map((step) => {
+    if (!["deliver", "persist"].includes(step.role || "") || !step.delivers?.length) return step;
+    const requires = [...step.requires];
+    for (const token of step.delivers) {
+      if (step.produces.includes(token) || requires.includes(token) || Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)) continue;
+      const owners = (producers.get(token) || []).filter((owner) => owner.id !== step.id);
+      if (owners.length === 1) requires.push(token);
+    }
+    return requires.length === step.requires.length ? step : { ...step, requires };
+  });
+}
+
+/** `$output` is a control terminal, never the content being handed over. If a
+ * delivery has exactly one validated (or otherwise sole) business dependency,
+ * bind that real artifact. Multiple candidates stay invalid for model repair. */
+function bindTerminalOnlyDeliveries(steps: WorkflowDagStep[]) {
+  const producers = new Map<string, WorkflowDagStep | null>();
+  for (const step of steps) for (const token of step.produces) producers.set(token, producers.has(token) ? null : step);
+  const consumed = new Set(steps.flatMap((step) => [...step.requires, ...step.mutates, ...(step.delivers || [])]));
+  return steps.map((step) => {
+    if (step.role !== "deliver" || !step.delivers?.length || step.delivers.some((token) => !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token))) return step;
+    const candidates = step.requires.filter((token) => !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)
+      && !isUserReplyToken(token) && !["$request", "$source"].includes(token) && !token.startsWith("input:") && !token.startsWith("state:"));
+    const validated = candidates.filter((token) => producers.get(token)?.role === "validate");
+    let selected = validated.length === 1 ? validated : candidates.length === 1 ? candidates : [];
+    if (!selected.length) {
+      const leaves = steps.filter((entry) => entry.id !== step.id && !["await-input", "await-approval", "deliver", "persist"].includes(entry.role || ""))
+        .flatMap((entry) => entry.produces)
+        .filter((token) => !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token) && !isUserReplyToken(token) && !token.startsWith("state:")
+          && !token.startsWith("capability:") && !consumed.has(token));
+      if (leaves.length === 1) selected = leaves;
+    }
+    if (selected.length !== 1) return step;
+    return { ...step, requires: step.requires.includes(selected[0]) ? step.requires : [...step.requires, selected[0]], delivers: selected };
+  });
+}
+
+const isWorkflowTerminal = (token: string) => Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token);
+const isControlToken = (token: string) => isWorkflowTerminal(token) || isUserReplyToken(token) || token.startsWith("state:");
+const isRawInputToken = (token: string) => ["$request", "$source"].includes(token) || token.startsWith("input:");
+
+function capabilityLooksLikeGate(capability: WorkflowPlanCapability | undefined) {
+  return Boolean(capability && (capability.kind === "eval"
+    || /(?:test|check|validate|verify|lint|quality|format|schema|测试|检查|校验|验证|质检|格式)/i
+      .test(`${capability.id} ${capability.requirement || ""} ${capability.purpose || ""} ${capability.output}`)));
+}
+
+function stepLooksLikeGate(step: WorkflowDagStep, capabilities: Map<string, WorkflowPlanCapability>) {
+  return step.role === "validate" || step.capabilityIds.some((id) => capabilityLooksLikeGate(capabilities.get(id)))
+    || /(?:test|check|validate|verify|lint|quality|format|schema|测试|检查|校验|验证|质检|格式)/i
+      .test(`${step.id} ${step.action} ${step.output}`);
+}
+
+function stepUsesDeterministicGate(step: WorkflowDagStep, capabilities: Map<string, WorkflowPlanCapability>) {
+  return step.capabilityIds.some((id) => {
+      const capability = capabilities.get(id);
+      return capability?.kind === "script" || capability?.kind === "eval"
+        || (step.id.startsWith("step-capability-") && capabilityLooksLikeGate(capability));
+    });
+}
+
+/**
+ * A planner may split one task result into a primary artifact plus companion
+ * facts (warnings, estimates, conflicts, provenance, and similar metadata),
+ * then wire only the primary artifact into the final hand-off. When there is
+ * exactly one delivery path, those otherwise-orphaned companion facts have one
+ * lossless destination: the same hand-off. This is data wiring, not a new task
+ * operation. Ambiguous multi-delivery graphs stay strict and go through the
+ * targeted repair loop.
+ */
+function bindUniqueDeliveryCompanions(steps: WorkflowDagStep[], capabilities: WorkflowPlanCapability[]) {
+  const next = steps.map((step) => ({
+    ...step,
+    requires: [...step.requires],
+    delivers: [...(step.delivers || [])],
+  }));
+  const deliveries = next.filter((step) => ["deliver", "persist"].includes(step.role || ""));
+  if (deliveries.length !== 1) return next;
+
+  const [delivery] = deliveries;
+  const capabilityById = new Map(capabilities.map((item) => [item.id, item]));
+  const consumed = new Set(next.flatMap((step) => [
+    ...step.requires,
+    ...step.mutates,
+    ...(step.delivers || []),
+  ]));
+  const companions = next.flatMap((step) => {
+    // Auto-created capability helpers are routed/folded by
+    // bindWorkflowCapabilities. Treating their disconnected output as a final
+    // user deliverable would hide a genuinely missing tool route.
+    if (step.id === delivery.id || step.id.startsWith("step-capability-") || stepLooksLikeGate(step, capabilityById)) return [];
+    return step.produces.filter((token) => !consumed.has(token)
+      && !isControlToken(token)
+      && !isRawInputToken(token)
+      && !token.startsWith("capability:"));
+  });
+
+  for (const token of new Set(companions)) {
+    if (!delivery.requires.includes(token)) delivery.requires.push(token);
+    if (!delivery.delivers?.includes(token)) delivery.delivers?.push(token);
+  }
+  return next;
+}
+
+/** A token listed in resumeProduces belongs to the real user checkpoint. Some
+ * planners also put that future reply on the preceding preview/delivery node,
+ * which falsely claims that showing a draft manufactured the user's answer.
+ * The explicit checkpoint is authoritative, so remove only that duplicate
+ * ownership from ordinary producers. The reviewed artifact and all other
+ * outputs remain intact. */
+function bindCheckpointReplyOwnership(steps: WorkflowDagStep[]) {
+  const checkpointReplies = new Set(steps
+    .filter((step) => ["await-input", "await-approval"].includes(step.role || ""))
+    .flatMap((step) => step.resumeProduces || []));
+  if (!checkpointReplies.size) return steps;
+  return steps.map((step) => {
+    if (["await-input", "await-approval"].includes(step.role || "")) return step;
+    const duplicated = step.produces.filter((token) => checkpointReplies.has(token));
+    if (!duplicated.length) return step;
+    const owned = new Set(duplicated);
+    return {
+      ...step,
+      produces: step.produces.filter((token) => !owned.has(token)),
+      delivers: step.delivers?.filter((token) => !owned.has(token)),
+    };
+  });
+}
+
+/** Declared session/persistent fields are internal runtime state, not missing
+ * business artifacts. Every mutation reads the current value before writing
+ * it, so expose that dependency explicitly. Ordering still has to come from
+ * real workflow edges; the DAG compiler continues to reject unordered writes. */
+function bindDeclaredStateReads(steps: WorkflowDagStep[], stateFields: string[]) {
+  const declared = new Set(stateFields.map(String).map((value) => value.trim()).filter(Boolean));
+  if (!declared.size) return steps;
+  return steps.map((step) => {
+    const required = step.mutates.filter((token) => declared.has(token) && !step.requires.includes(token));
+    return required.length ? { ...step, requires: [...step.requires, ...required] } : step;
+  });
+}
+
+/** Pause markers and completion markers are runtime control signals, not
+ * business payloads. Models sometimes serialize a checkpoint as reading its
+ * own `$input_required`/`$approval_required`, or make it depend on `$output`
+ * to mean "after the draft was shown". Remove the self-read and, when the
+ * upstream hand-off is unambiguous, replace `$output` with the actual artifact
+ * that was handed off. A delivery that depends on this checkpoint's future
+ * reply is downstream and can never be that upstream hand-off. */
+function bindCheckpointControlEdges(steps: WorkflowDagStep[]) {
+  const owners = new Map<string, WorkflowDagStep[]>();
+  for (const step of steps) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    owners.set(token, [...(owners.get(token) || []), step]);
+  }
+  const dependsOnReply = (step: WorkflowDagStep, replies: Set<string>, seen = new Set<string>()): boolean => {
+    if (seen.has(step.id)) return false;
+    seen.add(step.id);
+    if (step.requires.some((token) => replies.has(token))) return true;
+    return step.requires.some((token) => (owners.get(token) || []).some((owner) => owner.id !== step.id
+      && dependsOnReply(owner, replies, new Set(seen))));
+  };
+  return steps.map((step) => {
+    if (!["await-input", "await-approval"].includes(step.role || "")) return step;
+    const pause = step.role === "await-approval" ? WORKFLOW_TERMINALS.approvalRequired : WORKFLOW_TERMINALS.inputRequired;
+    let requires = step.requires.filter((token) => token !== pause);
+    let input = step.input;
+    let when = step.when;
+    const mentionsCompletion = (text: string) => (text.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || []).includes(WORKFLOW_TERMINALS.completed);
+    if (requires.includes(WORKFLOW_TERMINALS.completed) || mentionsCompletion(input) || mentionsCompletion(when)) {
+      const replies = new Set(step.resumeProduces || []);
+      const upstreamArtifacts = steps.filter((candidate) => candidate.id !== step.id
+        && ["deliver", "persist"].includes(candidate.role || "")
+        && candidate.produces.includes(WORKFLOW_TERMINALS.completed)
+        && !dependsOnReply(candidate, replies))
+        .flatMap((candidate) => candidate.delivers || [])
+        .filter((token) => !isControlToken(token) && !isRawInputToken(token));
+      const uniqueArtifacts = [...new Set(upstreamArtifacts)];
+      if (uniqueArtifacts.length === 1) {
+        const artifact = uniqueArtifacts[0];
+        requires = [...new Set([...requires.filter((token) => token !== WORKFLOW_TERMINALS.completed), artifact])];
+        // Update both representations atomically. Exact tokens only: a
+        // business value named $output_metadata is not a completion marker.
+        const replaceCompletion = (text: string) => text.replace(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g,
+          (token) => token === WORKFLOW_TERMINALS.completed ? artifact : token);
+        input = replaceCompletion(input);
+        when = replaceCompletion(when);
+      }
+    }
+    return input === step.input && when === step.when && requires.length === step.requires.length && requires.every((token, index) => token === step.requires[index])
+      ? step : { ...step, requires, input, when };
+  });
+}
+
+/** If prose explicitly references an exact workflow token and that token has
+ * one real producer, the missing requires[] entry is a serialization omission,
+ * not an ambiguous planning decision. Bind the edge without promoting the
+ * value to a raw input or asking a model to rename either side. */
+function bindExplicitTokenReads(steps: WorkflowDagStep[]) {
+  const owners = new Map<string, WorkflowDagStep | null>();
+  for (const step of steps) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    owners.set(token, owners.has(token) ? null : step);
+  }
+  return steps.map((step) => {
+    const mentioned = (`${step.input} ${step.when}`.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || [])
+      .filter((token) => !isWorkflowTerminal(token) && owners.get(token) && owners.get(token)?.id !== step.id && !step.requires.includes(token));
+    return mentioned.length ? { ...step, requires: [...step.requires, ...new Set(mentioned)] } : step;
+  });
+}
+
+/** A reply from an exceptional wait branch is not mandatory on the normal
+ * path. Planners sometimes put it in requires[] while describing it as
+ * "if that branch occurred" in input prose, making the normal path depend on
+ * a reply that never happened. Preserve the conditional instruction without
+ * turning the reply into a hard DAG edge. */
+function normalizeOptionalCheckpointReads(steps: WorkflowDagStep[]) {
+  const optionalReplies = new Set(steps.filter((step) => step.role === "await-input").flatMap((step) => step.resumeProduces || []));
+  return steps.map((step) => {
+    if (["await-input", "await-approval"].includes(step.role || "")) return step;
+    let input = step.input;
+    let requires = [...step.requires];
+    for (const token of requires) {
+      if (!optionalReplies.has(token) || !input.includes(token) || step.when.includes(token)) continue;
+      const nearby = input.slice(Math.max(0, input.indexOf(token) - 28), input.indexOf(token) + token.length + 28);
+      if (!/(?:如|若|如果|仅当|可选|视情况|when|if|optional)/i.test(nearby)) continue;
+      requires = requires.filter((value) => value !== token);
+      input = input.replaceAll(token, "用户在该分支补充的信息（若有）");
+    }
+    return { ...step, input, requires };
+  });
+}
+
+/** A clarification checkpoint is a real pause even when the model forgot its
+ * control output. Only infer the pause for a side-effect-free, output-less
+ * step whose own condition/action explicitly concerns missing user input. */
+function closeOutputlessClarifications(steps: WorkflowDagStep[]) {
+  return steps.map((step) => {
+    if (step.produces.length || step.mutates.length || step.delivers?.length
+      || ["deliver", "persist", "validate", "await-approval"].includes(step.role || "")) return step;
+    const asksUser = /(?:询问|请|要求|请求|等待|澄清|确认).{0,24}(?:用户|本人|本周重点|补充|回复)|(?:ask|request|clarify|confirm).{0,24}(?:user|weekly focus|input|reply)/i.test(`${step.action} ${step.output}`)
+      || /(?:resolve|clarify|ask)-.{0,35}(?:focus|input|missing)/i.test(step.id);
+    const missingValue = /(?:缺少|未提供|不明确|不确定|尚未|未确认|需要补充|missing|unclear|unknown|not provided)/i.test(`${step.when} ${step.action} ${step.fallback}`);
+    if (!asksUser || !missingValue) return step;
+    return { ...step, role: "await-input" as const, produces: [WORKFLOW_TERMINALS.inputRequired] };
+  });
+}
+
+/**
+ * Close deterministic wiring omissions after capability binding. Model plans
+ * commonly describe validators in prose but omit their exact edges, or use a
+ * pause branch as the only apparent ending. This pass never invents a task
+ * operation: it only connects declared checks to an existing business
+ * artifact and creates the missing hand-off for an already produced result.
+ */
+export function stabilizeBoundWorkflowPlan(steps: WorkflowDagStep[], capabilities: WorkflowPlanCapability[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], mutates: [...step.mutates],
+    delivers: [...(step.delivers || [])], resumeProduces: [...(step.resumeProduces || [])] }));
+  const capabilityById = new Map(capabilities.map((item) => [item.id, item]));
+  const occupied = new Set(next.flatMap((step) => [...step.requires, ...step.produces, ...(step.resumeProduces || [])]));
+
+  // Independent checks may use the same generic result name. They are
+  // separate gate receipts, so give only otherwise-unconsumed collisions a
+  // stable private name instead of pretending that two nodes own one value.
+  const owners = new Map<string, WorkflowDagStep[]>();
+  for (const step of next) for (const token of step.produces) owners.set(token, [...(owners.get(token) || []), step]);
+  for (const [token, producers] of owners) {
+    if (producers.length < 2 || isWorkflowTerminal(token) || !producers.every((step) => stepUsesDeterministicGate(step, capabilityById))) continue;
+    const externalConsumers = next.filter((step) => !producers.includes(step) && step.requires.includes(token));
+    if (externalConsumers.length) continue;
+    for (const producer of producers) {
+      const scoped = `${token}:${producer.id}`;
+      if (occupied.has(scoped)) continue;
+      producer.produces = producer.produces.map((value) => value === token ? scoped : value);
+      producer.delivers = producer.delivers?.map((value) => value === token ? scoped : value);
+      occupied.add(scoped);
+    }
+  }
+
+  const rebuild = () => {
+    const producerByToken = new Map<string, WorkflowDagStep | null>();
+    const consumed = new Set(next.flatMap((step) => [...step.requires, ...step.mutates, ...(step.delivers || [])]));
+    for (const step of next) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+      producerByToken.set(token, producerByToken.has(token) ? null : step);
+    }
+    return { producerByToken, consumed };
+  };
+
+  let graph = rebuild();
+  const businessTokens = () => next.flatMap((step) => step.produces.map((token) => ({ step, token })))
+    .filter(({ token }) => !isControlToken(token) && !token.startsWith("capability:") && !isRawInputToken(token));
+  const deliveryArtifacts = () => new Set(next.flatMap((step) => ["deliver", "persist"].includes(step.role || "")
+    ? [...(step.delivers || []), ...step.requires.filter((token) => graph.producerByToken.has(token) && !stepLooksLikeGate(graph.producerByToken.get(token)!, capabilityById))]
+    : []).filter((token) => !isControlToken(token) && !isRawInputToken(token)));
+
+  // Bind validator/test inputs to the unique artifact already headed for
+  // delivery (or, failing that, the unique business leaf). Never promote an
+  // unbound placeholder to a user input.
+  for (const gate of next.filter((step) => stepUsesDeterministicGate(step, capabilityById))) {
+    const unbound = gate.requires.filter((token) => token.startsWith("unbound:"));
+    if (!unbound.length) continue;
+    const exact = businessTokens().filter(({ token, step }) => step.id !== gate.id
+      && new RegExp(`(?:^|[^a-zA-Z0-9_.:-])${token.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:$|[^a-zA-Z0-9_.:-])`).test(`${gate.input} ${gate.action}`));
+    const delivered = businessTokens().filter(({ step, token }) => step.id !== gate.id && deliveryArtifacts().has(token));
+    const leaves = businessTokens().filter(({ step, token }) => step.id !== gate.id && !graph.consumed.has(token) && !stepLooksLikeGate(step, capabilityById));
+    const candidates = exact.length === 1 ? exact : delivered.length === 1 ? delivered : leaves.length === 1 ? leaves : [];
+    if (candidates.length !== 1) continue;
+    gate.requires = [...gate.requires.filter((token) => !token.startsWith("unbound:")), candidates[0].token];
+    graph = rebuild();
+  }
+
+  // A check receipt is control evidence for hand-off, not another user
+  // deliverable. Feed every otherwise-orphaned receipt into the compatible
+  // final delivery so the check is ordered and cannot silently disappear.
+  graph = rebuild();
+  const terminalDeliveries = next.filter((step) => ["deliver", "persist"].includes(step.role || "")
+    && (step.produces.includes(WORKFLOW_TERMINALS.completed) || (step.delivers || []).length > 0));
+  for (const gate of next.filter((step) => stepUsesDeterministicGate(step, capabilityById))) {
+    const receipts = gate.produces.filter((token) => !isControlToken(token) && !graph.consumed.has(token));
+    if (!receipts.length || !terminalDeliveries.length) continue;
+    const gatesArtifact = gate.requires.filter((token) => graph.producerByToken.has(token));
+    const compatible = terminalDeliveries.filter((delivery) => gatesArtifact.some((token) => delivery.requires.includes(token) || delivery.delivers?.includes(token)));
+    const targets = compatible.length ? compatible : terminalDeliveries.length === 1 ? terminalDeliveries : [];
+    for (const delivery of targets) for (const receipt of receipts) if (!delivery.requires.includes(receipt)) delivery.requires.push(receipt);
+    graph = rebuild();
+  }
+
+  // Resolve a terminal-only hand-off from an existing business result. The
+  // local binding runs again here because capability helpers may have changed
+  // which leaf is unique.
+  const rebound = bindTerminalOnlyDeliveries(next);
+  next.splice(0, next.length, ...rebound);
+  graph = rebuild();
+
+  // A pause is a valid branch ending, but it cannot replace normal task
+  // delivery. If no completion path exists, hand off the unique/latest real
+  // artifact that the declared workflow already produced.
+  if (!next.some((step) => step.produces.includes(WORKFLOW_TERMINALS.completed))) {
+    const gateTokens = new Set(next.filter((step) => stepLooksLikeGate(step, capabilityById)).flatMap((step) => step.produces));
+    const preferred = businessTokens().filter(({ token }) => !gateTokens.has(token) && !graph.consumed.has(token));
+    const checkpointArtifacts = next.filter((step) => ["await-input", "await-approval"].includes(step.role || ""))
+      .flatMap((step) => [...(step.delivers || []), ...step.requires]).filter((token) => graph.producerByToken.has(token) && !isControlToken(token));
+    const uniqueCheckpoint = [...new Set(checkpointArtifacts)];
+    const candidates = preferred.length === 1 ? preferred
+      : uniqueCheckpoint.length === 1 ? businessTokens().filter(({ token }) => token === uniqueCheckpoint[0])
+        : businessTokens().filter(({ step, token }) => !gateTokens.has(token) && !stepLooksLikeGate(step, capabilityById));
+    const selected = candidates.at(-1);
+    if (selected) {
+      const baseId = "step-final-delivery";
+      let id = baseId, suffix = 2;
+      while (next.some((step) => step.id === id)) id = `${baseId}-${suffix++}`;
+      const semanticOwners = selected.step.capabilityIds.filter((owner) => capabilityById.get(owner)?.kind === "llm");
+      const fallbackOwners = capabilities.filter((item) => item.kind === "llm").map((item) => item.id);
+      const receipts = next.filter((step) => stepUsesDeterministicGate(step, capabilityById))
+        .flatMap((step) => step.produces).filter((token) => !isControlToken(token) && !graph.consumed.has(token));
+      next.push({ id, capabilityIds: semanticOwners.length ? semanticOwners : fallbackOwners.slice(0, 1), role: "deliver",
+        when: "已完成声明的处理与检查时", input: selected.token, action: "交付已经生成并通过检查的结果",
+        output: "向用户交付现有结果，不重新生成内容", fallback: "如果结果尚未生成或检查未通过，停止交付并说明缺口",
+        requires: [...new Set([selected.token, ...receipts])], produces: [WORKFLOW_TERMINALS.completed], mutates: [], delivers: [selected.token], resumeProduces: [] });
+    }
+  }
+  return next;
+}
+
+/** A single read operation followed by a single root semantic transform has
+ * one lossless wiring: the transform consumes every otherwise-orphaned read
+ * product. This covers planners that describe those inputs in prose but omit
+ * the exact token names. Ambiguous multi-consumer workflows remain invalid. */
+function bindUniqueReadProducts(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires] }));
+  const consumed = new Set(next.flatMap((step) => [...step.requires, ...step.mutates, ...(step.delivers || [])]));
+  for (const reader of next.filter((step) => step.role === "read")) {
+    const products = reader.produces.filter((token) => !consumed.has(token) && !Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token));
+    if (!products.length) continue;
+    const candidates = next.filter((step) => step.id !== reader.id && step.role === "transform"
+      && step.capabilityIds.some((id) => reader.capabilityIds.includes(id))
+      && step.requires.every((token) => ["$request", "$source"].includes(token) || token.startsWith("input:") || isUserReplyToken(token)));
+    if (candidates.length !== 1) continue;
+    candidates[0].requires.push(...products);
+    products.forEach((token) => consumed.add(token));
+  }
+  return next;
+}
+
+/** A mutable field cannot be updated before it exists. Models occasionally
+ * mark the first assignment as mutates[], then keep using mutates[] for later
+ * revisions. Turn only the uniquely earliest writer into the initializer and
+ * wire every later writer to that state. Ambiguous parallel writers remain a
+ * compiler error instead of being ordered by array position. */
+function initializeFirstStateWrites(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], mutates: [...step.mutates] }));
+  const producers = new Map<string, string | null>();
+  for (const step of next) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    producers.set(token, producers.has(token) ? null : step.id);
+  }
+  const outgoing = new Map(next.map((step) => [step.id, new Set<string>()]));
+  for (const step of next) for (const dependency of step.requires) {
+    const producer = producers.get(dependency);
+    if (producer && producer !== step.id) outgoing.get(producer)?.add(step.id);
+  }
+  const precedes = (from: string, to: string, seen = new Set<string>()): boolean => {
+    if (seen.has(from)) return false;
+    seen.add(from);
+    return [...(outgoing.get(from) || [])].some((nextId) => nextId === to || precedes(nextId, to, seen));
+  };
+  const tokens = new Set(next.flatMap((step) => step.mutates));
+  for (const token of tokens) {
+    if (producers.has(token) || isUserReplyToken(token) || Object.values(WORKFLOW_TERMINALS).some((terminal) => terminal === token)) continue;
+    const writers = next.filter((step) => step.mutates.includes(token));
+    const roots = writers.filter((candidate) => !writers.some((other) => other.id !== candidate.id && precedes(other.id, candidate.id)));
+    if (roots.length !== 1 || !["transform", "read", "validate"].includes(roots[0].role || "transform")) continue;
+    const initializer = roots[0];
+    initializer.mutates = initializer.mutates.filter((value) => value !== token);
+    initializer.requires = initializer.requires.filter((value) => value !== token);
+    if (!initializer.produces.includes(token)) initializer.produces.push(token);
+    producers.set(token, initializer.id);
+    for (const writer of writers.filter((step) => step.id !== initializer.id)) {
+      if (!writer.requires.includes(token)) writer.requires.push(token);
+    }
+  }
+  return next;
+}
+
+/** If exactly one step updates a state field and exactly one terminal step
+ * reads it, an otherwise disconnected handoff has only one safe direction:
+ * update, then validate/deliver. Add an explicit completion edge so runtime
+ * ordering matches that contract. Multiple writers/readers remain untouched
+ * because joining conditional branches would be unsafe. */
+function orderUniqueStateHandoffs(steps: WorkflowDagStep[]) {
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces] }));
+  const producers = new Map<string, string | null>();
+  for (const step of next) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    producers.set(token, producers.has(token) ? null : step.id);
+  }
+  const outgoing = new Map(next.map((step) => [step.id, new Set<string>()]));
+  for (const step of next) for (const dependency of step.requires) {
+    const producer = producers.get(dependency);
+    if (producer && producer !== step.id) outgoing.get(producer)?.add(step.id);
+  }
+  const precedes = (from: string, to: string, seen = new Set<string>()): boolean => {
+    if (seen.has(from)) return false;
+    seen.add(from);
+    return [...(outgoing.get(from) || [])].some((nextId) => nextId === to || precedes(nextId, to, seen));
+  };
+  for (const token of new Set(next.flatMap((step) => step.mutates))) {
+    const writers = next.filter((step) => step.mutates.includes(token));
+    const terminalReaders = next.filter((step) => step.requires.includes(token) && !step.mutates.includes(token)
+      && ["validate", "deliver", "persist"].includes(step.role || ""));
+    if (writers.length !== 1 || terminalReaders.length !== 1) continue;
+    const [writer] = writers, [reader] = terminalReaders;
+    if (precedes(writer.id, reader.id) || precedes(reader.id, writer.id)) continue;
+    const completion = `state:${token}:updated-by:${writer.id}`;
+    if (!writer.produces.includes(completion)) writer.produces.push(completion);
+    if (!reader.requires.includes(completion)) reader.requires.push(completion);
+    outgoing.get(writer.id)?.add(reader.id);
+  }
+  return next;
+}
+
+/** Alternative draft versions may each update the same declared final state.
+ * When each pure content producer has its own explicit terminal handoff, the
+ * final state belongs to that handoff, not to a speculative draft that may
+ * never be chosen. Move only this internal commit to the matching delivery;
+ * never order the alternatives or change an externally writing tool step. */
+function commitAlternativeStateAtDelivery(steps: WorkflowDagStep[], capabilities: WorkflowPlanCapability[], stateFields: string[]) {
+  const declared = new Set(stateFields);
+  if (!declared.size) return steps;
+  const next = steps.map((step) => ({ ...step, requires: [...step.requires], mutates: [...step.mutates] }));
+  const kinds = new Map(capabilities.map((item) => [item.id, item.kind]));
+  const terminalDeliveries = next.filter((step) => ["deliver", "persist"].includes(step.role || "")
+    && (step.produces.includes(WORKFLOW_TERMINALS.completed) || Boolean(step.delivers?.length)));
+  for (const state of declared) {
+    const writers = next.filter((step) => step.mutates.includes(state) && !terminalDeliveries.includes(step));
+    if (writers.length < 2 || writers.some((step) => step.role !== "transform"
+      || !step.capabilityIds.some((id) => kinds.get(id) === "llm")
+      || step.capabilityIds.some((id) => !["llm", "reference"].includes(kinds.get(id) || ""))
+      || step.input.includes(state) || step.when.includes(state))) continue;
+    // If another operation reads this state before handoff, moving its write
+    // would change runtime behavior. Leave that graph for explicit repair.
+    if (next.some((step) => !writers.includes(step) && !terminalDeliveries.includes(step)
+      && step.requires.includes(state))) continue;
+    const bindings = writers.map((writer) => {
+      const products = writer.produces.filter((token) => !isControlToken(token) && token !== state);
+      const matches = terminalDeliveries.filter((delivery) => products.some((token) =>
+        delivery.requires.includes(token) || delivery.delivers?.includes(token)));
+      return { writer, delivery: matches.length === 1 ? matches[0] : undefined };
+    });
+    if (bindings.some(({ delivery }) => !delivery)
+      || new Set(bindings.map(({ delivery }) => delivery!.id)).size !== bindings.length) continue;
+    // These are distinct completion branches. Keep the artifact-producing
+    // steps and their real dependencies; only defer the shared final-state
+    // update until the selected artifact is actually handed over.
+    for (const { writer, delivery } of bindings) {
+      writer.mutates = writer.mutates.filter((token) => token !== state);
+      writer.requires = writer.requires.filter((token) => token !== state);
+      if (!delivery!.mutates.includes(state)) delivery!.mutates.push(state);
+      if (!delivery!.requires.includes(state)) delivery!.requires.push(state);
+    }
+  }
+  return next;
+}
+
 
 /** Lossless boundary metadata, not task invention. Bind only a unique declared
  * input or an actual parent capability. Derived data still needs a producer. */
@@ -110,6 +652,26 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
       ? "persist" : owners.length && owners.every((item) => item.kind === "reference" || item.kind === "asset") ? "read" : "transform";
     return { ...step, role: step.role || before?.role || closed.role || capabilityRole as WorkflowDagStep["role"] };
   });
+  steps = closeOutputlessClarifications(steps);
+  steps = bindCheckpointReplyOwnership(steps);
+  steps = bindCheckpointControlEdges(steps);
+  steps = normalizeOptionalCheckpointReads(steps);
+  steps = bindExplicitTokenReads(steps);
+  steps = bindDeclaredStateReads(steps, context.stateFields || []);
+  // Undeclared fields still need a real initializer. Declared fields already
+  // have an internal runtime root and must retain their mutation semantics.
+  const declaredState = new Set(context.stateFields || []);
+  const stateful = steps.map((step) => ({ ...step, mutates: step.mutates.filter((token) => !declaredState.has(token)) }));
+  const initialized = initializeFirstStateWrites(stateful);
+  steps = initialized.map((step, index) => ({ ...step,
+    mutates: [...new Set([...step.mutates, ...steps[index].mutates.filter((token) => declaredState.has(token))])],
+  }));
+  steps = bindUniqueReadProducts(steps);
+  steps = bindTerminalOnlyDeliveries(steps);
+  steps = bindUnambiguousDeliveries(steps);
+  steps = bindUniqueDeliveryCompanions(steps, context.capabilities);
+  steps = commitAlternativeStateAtDelivery(steps, context.capabilities, context.stateFields || []);
+  steps = orderUniqueStateHandoffs(steps);
   steps = scopeCheckpointReplies(steps);
   steps = scopeDeliveredVersions(steps);
   // Reply values written by models without "$" are still runtime events when
@@ -172,15 +734,42 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
 }
 
 export function inspectWorkflowPlan(context: WorkflowPlanContext) {
-  const initialInputs = ["$request", "$source", ...context.inputs.map((input) => `input:${input.id}`)];
-  const steps = closeWorkflowDagTerminals(bindWorkflowCapabilities(normalizeWorkflowPlanBindings(context), context.capabilities), initialInputs);
+  const initialInputs = ["$request", "$source", ...context.inputs.map((input) => `input:${input.id}`), ...(context.stateFields || [])];
+  const bindingChanges: Array<{ stage: string; stepIds: string[] }> = [];
+  const trace = (stage: string, before: WorkflowDagStep[], after: WorkflowDagStep[]) => {
+    const previous = new Map(before.map((step) => [step.id, JSON.stringify(step)]));
+    const current = new Map(after.map((step) => [step.id, JSON.stringify(step)]));
+    const stepIds = [...new Set([...previous.keys(), ...current.keys()])]
+      .filter((id) => previous.get(id) !== current.get(id));
+    if (stepIds.length) bindingChanges.push({ stage, stepIds });
+  };
+  const normalized = normalizeWorkflowPlanBindings(context);
+  trace("normalize-bindings", normalizeWorkflowDagSteps(context.workflowSteps), normalized);
+  const bound = bindWorkflowCapabilities(normalized, context.capabilities);
+  trace("bind-capabilities", normalized, bound);
+  const baseline = closeWorkflowDagTerminals(bound, initialInputs);
+  const baselineCompile = compileWorkflowDag(baseline, initialInputs, { terminalOutputs: Object.values(WORKFLOW_TERMINALS), requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed] });
+  const capabilityById = new Map(context.capabilities.map((item) => [item.id, item]));
+  const byId = new Map(baseline.map((step) => [step.id, step]));
+  const deterministicOnly = baselineCompile.issues.every((issue) => {
+    if (["missing-terminal", "invalid-terminal"].includes(issue.type)) return true;
+    const step = byId.get(issue.stepId);
+    if (!step || !stepUsesDeterministicGate(step, capabilityById)) return false;
+    return ["duplicate-producer", "unmet-dependency", "unconsumed-production", "disconnected-step"].includes(issue.type)
+      && (issue.type !== "unmet-dependency" || Boolean(issue.dependency?.startsWith("unbound:")));
+  });
+  const stabilized = baselineCompile.issues.length && deterministicOnly
+    ? stabilizeBoundWorkflowPlan(bound, context.capabilities)
+    : bound;
+  const steps = closeWorkflowDagTerminals(stabilized, initialInputs);
+  trace("close-deliveries", bound, steps);
   const result = compileWorkflowDag(steps, initialInputs, { terminalOutputs: Object.values(WORKFLOW_TERMINALS), requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed] });
   const ids = new Set(context.capabilities.map((item) => item.id));
   const ownershipIssues = steps.flatMap((step) => !step.capabilityIds.length || step.capabilityIds.some((id) => !ids.has(id))
     ? [`Workflow step ${step.id} 缺少有效的 capability owner；必须使用当前已启用能力的 id`] : []);
   const issues = [...result.issues.map((item) => item.message), ...ownershipIssues, ...workflowCapabilityRouteIssues(steps, context.capabilities)];
   if (!steps.length) issues.push("Workflow 没有可执行步骤");
-  return { valid: !issues.length, steps, ordered: result.ordered, initialInputs, issues };
+  return { valid: !issues.length, steps, ordered: result.ordered, initialInputs, issues, bindingChanges };
 }
 
 export type WorkflowRepairRequest = {
@@ -260,14 +849,16 @@ export function applyWorkflowStepPatch(steps: WorkflowDagStep[], payload: Record
 export async function repairWorkflowPlan(
   context: WorkflowPlanContext,
   propose: (request: WorkflowRepairRequest) => Promise<unknown>,
-  onProgress?: (event: { attempt: number; status: "repairing" | "passed" | "failed"; issues: string[] }) => void,
+  onProgress?: (event: { attempt: number; status: "repairing" | "passed" | "failed"; issues: string[]; bindingChanges?: Array<{ stage: string; stepIds: string[] }> }) => void,
+  saveCheckpoint?: (steps: WorkflowDagStep[]) => void,
 ) {
   let current = inspectWorkflowPlan(context);
+  saveCheckpoint?.(structuredClone(current.steps));
   const originalSteps = current.steps;
   const originalCompile = compileWorkflowDag(originalSteps, current.initialInputs);
   const structuralProductions = new Set(originalCompile.issues.flatMap((issue) => issue.type === "duplicate-producer" && issue.dependency && current.initialInputs.includes(issue.dependency) ? [issue.dependency] : []));
   const originalArtifacts = new Set(originalSteps.flatMap((step) => [...step.produces, ...(step.resumeProduces || [])]
-    .filter((token) => !structuralProductions.has(token) && !(step.role && ["deliver", "persist"].includes(step.role) && /^\$output_(?:final|revised|draft)$/.test(token)
+    .filter((token) => !isUserReplyToken(token) && !current.initialInputs.includes(token) && !structuralProductions.has(token) && !(step.role && ["deliver", "persist"].includes(step.role) && /^\$output_(?:final|revised|draft)$/.test(token)
       && !step.delivers?.includes(token) && !originalSteps.some((consumer) => consumer.requires.includes(token))))));
   const cyclicSteps = new Set(originalCompile.issues.filter((issue) => issue.type === "cycle").map((issue) => issue.stepId));
   let rejectionIssues: string[] = [];
@@ -275,7 +866,7 @@ export async function repairWorkflowPlan(
   while ((!current.valid || rejectionIssues.length) && attempts < 2) {
     attempts += 1;
     const issues = [...current.issues, ...rejectionIssues];
-    onProgress?.({ attempt: attempts, status: "repairing", issues });
+    onProgress?.({ attempt: attempts, status: "repairing", issues, bindingChanges: current.bindingChanges });
     const raw = await propose({
       workflowSteps: current.steps,
       capabilities: context.capabilities,
@@ -325,19 +916,23 @@ export async function repairWorkflowPlan(
     }
     if (rejectionIssues.length) continue;
     current = inspectWorkflowPlan({ ...context, workflowSteps: proposed });
+    // Persist only patches that passed task/permission preservation checks.
+    // An incomplete graph is a repair checkpoint, never a completed blueprint.
+    saveCheckpoint?.(structuredClone(current.steps));
   }
   const issues = [...current.issues, ...rejectionIssues];
   if (!current.valid || rejectionIssues.length) {
-    onProgress?.({ attempt: attempts, status: "failed", issues });
+    onProgress?.({ attempt: attempts, status: "failed", issues, bindingChanges: current.bindingChanges });
     throw new Error(`WORKFLOW_DAG_INVALID: 工作流连线定向修复 ${attempts} 轮仍未通过：${issues.join("；")}`);
   }
-  onProgress?.({ attempt: attempts, status: "passed", issues: [] });
+  onProgress?.({ attempt: attempts, status: "passed", issues: [], bindingChanges: current.bindingChanges });
   return { workflowSteps: current.ordered, attempts };
 }
 
 export const WORKFLOW_REPAIR_PROMPT = `Repair only the supplied runtime Workflow DAG. Return JSON {"stepUpdates":[{"id":"exact-existing-id","changes":{"requires":["all retained and repaired input tokens"]}}],"addedSteps":[],"foldedSteps":[]}. Return ONLY changed fields for existing nodes; untouched nodes and fields are retained automatically. Arrays replace that field, so preserve valid entries. Never rename/delete a real task node. addedSteps is only for genuinely missing operations; each new step has id, capabilityIds[], role, when, input, action, output, fallback, requires[], produces[], mutates[], delivers[], resumeProduces[]. Do not re-emit the entire graph.
 Return compact JSON: no indentation/newlines outside string values. Preserve complete task behavior; save whitespace, not requirements. capabilityIds must use exact enabled ids from the supplied catalog: user/human/assistant are actors, not capability ids. Checkpoint and handoff steps use the semantic capability responsible for their input product.
 The declared input catalog is authoritative. Only $request, $source and the exact listed input:<id> tokens are initial roots. They describe runtime inputs, not evidence that the user already supplied them. Resolve from actual materials, or ask when absent. Never invent an input, add a derived artifact to the initial roots, or pretend an API/tool ran.
+An input:<id> token remains a runtime input even when an await-input checkpoint lists it in resumeProduces. It is not a business deliverable and may be rebound to a more specific reply token or removed when no downstream step consumes it. Preserve the checkpoint's await-input/await-approval role, but do not create a fake delivery merely to preserve a raw input token.
 Fix missing intermediate data by adding its real extraction/analysis step with an existing appropriate capability owner. Use identical producer/consumer tokens. A file is not its parsed contents; a task specification is not extracted keywords or a completed analysis. Do not replace all requires with $request.
 Feedback/approval after a draft is event-owned: add an await-input/await-approval checkpoint depending on that draft, emit $input_required/$approval_required now, and declare the feedback/approval token in resumeProduces. The revision step depends on the draft AND that actual reply. Do not make future feedback an initial root. Keep pre-draft and pre-delivery approvals separate. A pause is not completed delivery.
 Give each checkpoint distinct reply variables for its specific artifact version. For optional revision, use separate normal-delivery and revised-delivery steps, each depending on its actual produced artifact and corresponding approval. Never introduce an undefined final_* artifact to join branches. If one existing delivery uses an undefined final_* alias, bind it to the real original artifact and add a distinct revised delivery for the real revised artifact. Route all companion artifacts to review/delivery too. A persist step returning a file path must declare that path in produces; do not require the not-yet-saved file as input.

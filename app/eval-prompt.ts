@@ -1,6 +1,6 @@
 // Bump when compiler-owned fixtures change, so retrying an old session
 // rebuilds them from the task/material instead of repairing stale projections.
-export const EVAL_COMPILER_VERSION = "2.9";
+export const EVAL_COMPILER_VERSION = "2.14";
 
 /** Typography in a JSON string is not JSON syntax. Quotes may be literal
  * data, mixed-width punctuation, or part of a supplied counterexample.

@@ -119,17 +119,18 @@ test("knowledge sufficiency is recomputed from canonical four-category evidence"
   });
 });
 
-function compile() {
+function compile(extraAnswers = {}, capabilityDelta) {
   return compileSkillIR({
     skillName: "tailor-resume",
     idea: "根据 JD 修改简历",
-    answers: { inputs: "目标 JD；真实经历", "trigger-language": "根据这个 JD 修改简历" },
+    answers: { inputs: "目标 JD；真实经历", "trigger-language": "根据这个 JD 修改简历", ...extraAnswers },
     plan: fixturePlan(),
     loop: { mode: "hybrid", goal: "交付岗位匹配的简历", maxRounds: 3, stopConditions: ["核心检查通过"], escalationConditions: ["缺少 JD"], scopes: [] },
     requirements: [
       { id: "goal", requirement: "根据 JD 修改简历", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" },
       { id: "format-rule", requirement: "每条经历必须恰好 20 个字", provenance: "generator_default", modality: "MUST", hard: true, source: "generator default" },
     ],
+    ...(capabilityDelta ? { capabilityDelta } : {}),
   });
 }
 
@@ -149,6 +150,39 @@ test("the canonical runtime projection always satisfies the workflow heading gat
   const projected = projectSkillMarkdown(compile());
   assert.match(projected, /^## Workflow$/m);
   assert.equal(hasExecutableWorkflowHeading(projected), true);
+});
+
+test("a basic Skill compiles without invented capability lift or source evidence", () => {
+  const ir = compile();
+  assert.equal(ir.capabilityDelta.skillMustTeach.length, 0);
+  assert.equal(ir.knowledgeAssessment.status, "not-required");
+  assert.equal(ir.domainEvidence.length, 0);
+  assert.ok(ir.requirements.some((item) => item.id === "goal" && item.hard));
+  assert.match(projectSkillMarkdown(ir), /## Workflow/);
+  assert.doesNotMatch(projectSkillMarkdown(ir), /## Skill-specific capability delta/);
+});
+
+test("contract-only capability gaps do not create a false knowledge insufficiency", () => {
+  const ir = compile({}, {
+    status: "ready",
+    summary: "固定用户确认的输出契约",
+    bareModelCan: [],
+    skillMustTeach: [{
+      id: "wait-for-confirmation",
+      taskDecision: "先展示结果，再等待用户确认后继续",
+      bareModelBehavior: "裸模型可能遗漏用户明确要求的停顿并直接继续",
+      requiredSkillBehavior: "未收到真实用户确认时必须停止，不得自动推进",
+      whySkillIsNeeded: "避免把用户尚未确认的结果直接当作最终版本",
+      knowledgeNeed: "contract-only",
+      researchQuestions: [],
+    }],
+    excludedGenericKnowledge: [],
+    researchFocus: [],
+  });
+
+  assert.equal(ir.capabilityDelta.skillMustTeach.length, 1);
+  assert.equal(ir.knowledgeAssessment.status, "not-required");
+  assert.deepEqual(ir.knowledgeAssessment.requiredGapIds || [], []);
 });
 
 test("Canonical SkillIR compilation blocks a workflow with unmet artifact dependencies", () => {
@@ -212,6 +246,23 @@ test("Canonical SkillIR compilation rebinds a retained operation whose prior own
     requirements: [{ id: "goal", requirement: "根据 JD 修改简历", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
   });
   assert.deepEqual(ir.runtimeContract.workflow.find((step) => step.id === "orphan-step")?.capabilityIds, ["core-resume"]);
+});
+
+test("Canonical compilation accepts the same declared state roots as workflow preflight", () => {
+  const plan = fixturePlan();
+  plan.stateModel = { needed: true, scope: "session", fields: [{ name: "rawRecords", purpose: "当前输入", source: "user-claim", updateRule: "每轮更新" }], missingBehavior: "请求记录" };
+  plan.workflowSteps = [
+    { id: "compose", capabilityIds: ["core-resume"], role: "transform", when: "有输入", input: "$request", action: "整理记录", output: "草稿", fallback: "询问", requires: ["$request", "rawRecords"], produces: ["draft"], mutates: [] },
+    { id: "deliver", capabilityIds: ["core-resume"], role: "deliver", when: "草稿完成", input: "draft", action: "交付草稿", output: "结果", fallback: "询问", requires: ["draft"], produces: ["$output"], delivers: ["draft"], mutates: [] },
+  ];
+  const ir = compileSkillIR({
+    skillName: "stateful-workflow", idea: "根据记录整理周报", answers: { inputs: "原始材料" }, plan,
+    loop: { mode: "turn-based", goal: "交付周报", maxRounds: 2, stopConditions: [], escalationConditions: [], scopes: [] },
+    requirements: [{ id: "goal", requirement: "根据记录整理周报", provenance: "user_explicit", modality: "MUST", hard: true, source: "initial user goal" }],
+  });
+  assert.ok(ir.runtimeContract.workflow.some((step) => step.id === "compose"));
+  assert.equal(validateCanonicalSkillIR(ir).issues.some((issue) => /rawRecords/.test(issue)), false);
+  assert.equal(auditSkillIRFiles(projectSkillIRFiles(ir)).some((issue) => /rawRecords/.test(issue)), false);
 });
 
 test("Canonical SkillIR preserves an input-required branch beside the productive path", () => {
@@ -329,6 +380,28 @@ test("owner content permission is canonical and removes conflicting generator de
   assert.doesNotMatch(JSON.stringify(reconciled), /禁止编造经历|不把未知当作事实|禁止编造量化数据/);
 });
 
+test("canonical reconciliation removes lower-priority permission restrictions before runtime projection", () => {
+  const answers = { "evidence-policy": "可以自由补写经历和量化数据" };
+  const ir = compile(answers);
+  ir.requirements.push({
+    ...ir.requirements[0], id: "research-default-no-invention", provenance: "source_grounded",
+    source: "research", statement: "不得新增经历", originalQuote: undefined, evidenceKind: undefined,
+  });
+  ir.requirements.push({
+    ...ir.requirements[0], id: "owner-permission-paraphrase", provenance: "user_explicit",
+    source: "interview.evidence-policy", statement: "可以补写经历，但不得新增经历",
+    originalQuote: answers["evidence-policy"], evidenceKind: "explicit_authorization",
+  });
+  ir.domainEvidence = [{ id: "research-rule", decision: "事实保护", knowledge: "旧模板建议不补写经历", rule: "不得新增经历" }];
+  const reconciled = reconcileSkillIRContentPermission(ir, answers);
+  assert.equal(reconciled.requirements.some((item) => item.id === "research-default-no-invention"), false);
+  assert.equal(reconciled.requirements.find((item) => item.id === "owner-permission-paraphrase")?.originalQuote, answers["evidence-policy"]);
+  assert.doesNotMatch(reconciled.requirements.find((item) => item.id === "owner-permission-paraphrase")?.statement || "", /不得新增经历/);
+  assert.equal(reconciled.domainEvidence.length, 0);
+  assert.doesNotMatch(projectSkillMarkdown(reconciled), /不得新增经历/);
+  assert.match(projectSkillMarkdown(reconciled), /可以自由补写经历和量化数据/);
+});
+
 test("compiler deterministically scopes contradictory ask-first and autonomous runtime branches", () => {
   const ir = compile();
   const contradictory = "缺少信息时必须先询问用户确认，同时无需确认直接自主继续完成";
@@ -344,7 +417,7 @@ test("compiler deterministically scopes contradictory ask-first and autonomous r
   assert.match(projected, /其余不依赖该信息的可逆工作可以自主继续/);
 });
 
-test("compiler makes repeated confirmation and analysis-only completion impossible", () => {
+test("compiler prevents repeated confirmation and scopes final-output checks to the delivery branch", () => {
   const ir = compile();
   ir.runtimeContract.instructionPriority = [];
   ir.runtimeContract.completionChecks = [];
@@ -354,9 +427,12 @@ test("compiler makes repeated confirmation and analysis-only completion impossib
   const reconciled = reconcileSkillIRActionPermissions(ir);
   const projected = projectSkillMarkdown(reconciled);
   assert.match(projected, /never ask the user to confirm information or authority they already provided/i);
-  assert.match(projected, /analysis, a plan, or questions alone do not complete the workflow/i);
+  assert.match(projected, /Once the delivery branch's prerequisites are met, produce and check the actual task result/i);
   assert.deepEqual(reconciled.outputs[0].requiredSections, ["可检查的主要结果"]);
-  assert.ok(reconciled.outputs[0].validation.some((item) => /实际结果已经生成/.test(item)));
+  assert.ok(reconciled.outputs[0].validation.some((item) => /仅在交付分支的必需输入与确认均已满足时，检查实际结果已经生成/.test(item)));
+  assert.ok(reconciled.outputs[0].validation.some((item) => /缺失时列出具体缺口并展示不依赖缺口的安全中间结果/.test(item)));
+  assert.ok(reconciled.outputs[0].validation.some((item) => /若用户要求补齐后再成稿，不得提前要求或生成完整草稿/.test(item)));
+  assert.doesNotMatch(projected, /- 实际结果已经生成；不能只返回分析、计划、规则复述或待确认问题/);
 });
 
 test("projection repairs generated action conflicts but preserves conflicting user evidence for clarification", () => {
@@ -608,6 +684,23 @@ test("alternative input representations compile as one any-of source contract", 
   assert.equal(required[0].concept, "source-material");
   assert.deepEqual(required[0].representations, ["text", "structured-file"]);
   assert.match(projectSkillMarkdown({ ...compile(), inputs, tasks: [{ ...compile().tasks[0], requiredInputIds: [required[0].id], optionalInputIds: [] }] }), /支持：text、structured-file/);
+});
+
+test("alternative weekly record genres do not become separate mandatory inputs", () => {
+  const inputs = deriveTaskInputContract({
+    idea: "我要做一个每周汇报助手。",
+    answers: { inputs: "直接粘贴一周的聊天/群聊记录；会议纪要或邮件片段" },
+  });
+  assert.equal(inputs.filter((item) => item.required).length, 1);
+  assert.equal(inputs.find((item) => item.required)?.concept, "source-material");
+  assert.ok(inputs.find((item) => item.required)?.representations.includes("text"));
+  const mixed = deriveTaskInputContract({
+    idea: "我要做一个每周汇报助手。",
+    answers: { inputs: "零散流水记录：按天或按时间随手记的短句，需要先归并成事项；已有草稿：我已经写了一版，只需要按周报类型调整语气和格式" },
+  });
+  assert.equal(mixed.filter((item) => item.required).length, 1);
+  assert.equal(mixed.find((item) => item.required)?.concept, "source-material");
+  assert.equal(mixed.some((item) => /需要先归|成事项|调整语气|^格式$/.test(item.name)), false);
 });
 
 test("missing-input recovery answers remain policies rather than required materials", () => {
@@ -1076,6 +1169,28 @@ test("permission consistency audit and information dependencies use the same use
 
   files["evals/graders.json"] = JSON.stringify({ graders: [{ id: "grounding", rubric: "新增的量化内容不得因此扣分，也不得套用通用真实性禁令" }] });
   assert.equal(auditSkillIRFiles(files).some((item) => item.includes("USER_PERMISSION_EVAL_CONFLICT")), false);
+});
+
+test("scoped user limits survive IR projection without becoming a false runtime conflict", () => {
+  const answers = {
+    "evidence-policy": "可以自由补写经历和业绩内容，但数字必须标注让我确认",
+    "real-task": "不能自行编造数字和百分比",
+  };
+  const ir = bindSkillIREvals(reconcileSkillIRContentPermission(compile(answers), answers),
+    JSON.stringify({ evals: [{ id: "core-1", eval_family: "capability", capability_ids: ["core-resume"] }] }));
+  ir.informationDependencies = [{ field: "业绩数字", source_required: "用户确认", source_available: false,
+    inventable: false, missing_behavior: "标为待确认" }];
+  const files = {
+    "SKILL.md": `${projectSkillMarkdown(ir)}\n- 不得编造未经确认的数字。`,
+    "evals/skill-ir.json": JSON.stringify(ir),
+    "evals/capability-manifest.json": JSON.stringify(projectCapabilityManifest(ir)),
+    "evals/evals.json": projectEvalBank(ir),
+  };
+  let issues = auditSkillIRFiles(files);
+  assert.equal(issues.some((item) => /USER_PERMISSION_(?:RUNTIME|IR)_CONFLICT/.test(item)), false);
+  files["SKILL.md"] += "\n- 不得新增经历。";
+  issues = auditSkillIRFiles(files);
+  assert.ok(issues.some((item) => item.includes("USER_PERMISSION_RUNTIME_CONFLICT")));
 });
 
 test("generic input compiler models task specifications, source material, and promised examples", () => {

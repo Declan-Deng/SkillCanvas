@@ -58,7 +58,12 @@ export async function POST(request: Request) {
     resolved: cleanStrings(body.resolved),
     introduced: cleanStrings(body.introduced),
     blockers: cleanStrings(body.blockers),
+    queries: cleanStrings(body.queries, 4),
     updatedPaths: cleanStrings(body.updatedPaths),
+    bindingChanges: (Array.isArray(body.bindingChanges) ? body.bindingChanges : []).slice(0, 8).flatMap((value) => {
+      if (!value || typeof value !== "object" || !["normalize-bindings", "bind-capabilities", "close-deliveries"].includes(value.stage)) return [];
+      return [{ stage: value.stage as string, stepIds: cleanStrings(value.stepIds, 32).map((id) => id.replace(/[^a-zA-Z0-9_-]/g, "").slice(0, 80)) }];
+    }),
     reason: typeof body.reason === "string" ? body.reason.replace(/[\r\n]+/g, " ").slice(0, 300) : "",
   };
   const diagnosticMode = event.startsWith("notification_")
@@ -72,7 +77,9 @@ export async function POST(request: Request) {
       : "personalization";
   const diagnosticReason = [
     entry.reason,
+    entry.queries.length ? `queries: ${entry.queries.join("；")}` : "",
     entry.blockers.length ? `blockers: ${entry.blockers.join("；")}` : "",
+    entry.bindingChanges.length ? `bindings: ${entry.bindingChanges.map((change) => `${change.stage}[${change.stepIds.join(",")}]`).join("; ")}` : "",
   ].filter(Boolean).join(" | ").slice(0, 1_200);
   const level = event === "generation_loop_failed" || event.startsWith("ai_client") || event.endsWith("_failed") ? "error" : "info";
   recordAiDiagnostic(level, {

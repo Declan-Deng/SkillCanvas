@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { validateBundleContentCoherence, validateBundleStructure } from "../app/bundle-validator.ts";
+import { resolveContentPermission } from "../app/evidence-gates.ts";
 
 function baseBundle() {
   return {
@@ -107,6 +108,18 @@ test("P1 contract gate allows pause-resume and productive missing-input branches
   assert.equal(issues.some((issue) => issue.code === "CONTRADICTORY_ACTION_PERMISSION"), false);
 });
 
+test("P1 contract gate does not invert a negated autonomous action", () => {
+  const files = baseBundle();
+  files["references/output-contract.md"] = `# Output contract
+
+- Validation:
+- 清单输出后停下等待用户确认，未自动执行对外发送
+- 等待用户确认，并未直接发送任何消息
+`;
+  const issues = validateBundleContentCoherence(files);
+  assert.equal(issues.some((issue) => issue.code === "CONTRADICTORY_ACTION_PERMISSION"), false);
+});
+
 test("P1 separates research hypotheses from executable permission while preserving the workflow gate", () => {
   const files = baseBundle();
   const conflict = "必须先询问用户确认，同时自动处理并继续执行。";
@@ -116,7 +129,7 @@ test("P1 separates research hypotheses from executable permission while preservi
   assert.equal(validateBundleContentCoherence(files).some((issue) => issue.code === "CONTRADICTORY_ACTION_PERMISSION"), true);
 });
 
-test("P1 gate blocks regressed generated Skills with generic delta, bypassed knowledge, truncated evals, and fabricated facts", () => {
+test("P1 gate blocks regressed generated Skills with generic delta, truncated evals, and fabricated facts", () => {
   const files = baseBundle();
   files["evals/skill-ir.json"] = JSON.stringify({
     capabilityDelta: {
@@ -139,8 +152,59 @@ test("P1 gate blocks regressed generated Skills with generic delta, bypassed kno
   const issues = validateBundleContentCoherence(files);
   const codes = new Set(issues.map((issue) => issue.code));
   assert.equal(codes.has("NON_DEFENSIBLE_CAPABILITY_DELTA"), true);
-  assert.equal(codes.has("KNOWLEDGE_REQUIREMENT_BYPASSED"), true);
+  assert.equal(codes.has("KNOWLEDGE_REQUIREMENT_BYPASSED"), false);
   assert.equal(codes.has("UNSUPPORTED_FACT_CREATION"), true);
   assert.equal(codes.has("INCOMPLETE_PROMPT"), true);
   assert.equal(codes.has("BOILERPLATE_INPUT_OVERLAP"), true);
+});
+
+test("knowledge gate accepts contract-only gaps and blocks only external gaps marked not-required", () => {
+  const contractOnly = baseBundle();
+  contractOnly["evals/skill-ir.json"] = JSON.stringify({
+    capabilityDelta: {
+      status: "ready",
+      skillMustTeach: [{
+        id: "wait-for-confirmation",
+        taskDecision: "先交付草稿，再等待真实用户确认后继续修改",
+        bareModelBehavior: "裸模型可能把尚未确认的草稿直接当作最终版本",
+        requiredSkillBehavior: "没有真实用户回复时必须停止，不得自动确认或继续修改",
+        whySkillIsNeeded: "避免把用户尚未确认的内容错误提交为最终结果",
+        knowledgeNeed: "contract-only",
+        researchQuestions: [],
+      }],
+    },
+    knowledgeAssessment: { status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [] },
+  });
+  const contractCodes = new Set(validateBundleContentCoherence(contractOnly).map((issue) => issue.code));
+  assert.equal(contractCodes.has("KNOWLEDGE_REQUIREMENT_BYPASSED"), false);
+
+  const external = structuredClone(contractOnly);
+  external["evals/skill-ir.json"] = JSON.stringify({
+    capabilityDelta: {
+      status: "ready",
+      skillMustTeach: [{
+        id: "weekly-status-classification",
+        taskDecision: "当零散记录同时像进展与风险时，依据专业判据选择主分类",
+        bareModelBehavior: "裸模型可能按关键词误判，混淆已经发生的结果与潜在影响",
+        requiredSkillBehavior: "先区分已发生变化、潜在影响和计划动作，再映射到周报栏目",
+        whySkillIsNeeded: "避免同一事实进入错误栏目并造成主管误判项目状态",
+        knowledgeNeed: "external",
+        researchQuestions: ["专业项目状态报告如何区分进展、风险和计划动作"],
+      }],
+    },
+    knowledgeAssessment: { status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [] },
+  });
+  const externalCodes = new Set(validateBundleContentCoherence(external).map((issue) => issue.code));
+  assert.equal(externalCodes.has("KNOWLEDGE_REQUIREMENT_BYPASSED"), true);
+});
+
+test("source-evidence creation gate respects the user's factual scope", () => {
+  const files = baseBundle();
+  files["evals/skill-ir.json"] = JSON.stringify({ controlModel: { contentPermission: resolveContentPermission({
+    "evidence-policy": "可以自由补写经历，但数字必须标注让我确认",
+  }) } });
+  files["references/source-evidence.md"] = "# 资料\n\n- 可以编造未经确认的数据。";
+  assert.ok(validateBundleContentCoherence(files).some((issue) => issue.code === "UNSUPPORTED_FACT_CREATION"));
+  files["references/source-evidence.md"] = "# 资料\n\n- 可以编造新经历。";
+  assert.equal(validateBundleContentCoherence(files).some((issue) => issue.code === "UNSUPPORTED_FACT_CREATION"), false);
 });

@@ -31,7 +31,7 @@ SkillCanvas 把这些问题分别交给引导式交互、Canonical SkillIR、Bui
 | 阶段 | 用户看到什么 | 系统在做什么 | 阶段产物 |
 | --- | --- | --- | --- |
 | 1. 描述需求 | 输入一句目标，上传 PDF 或补充参考 | 解析资料、识别直接标识、生成代表性任务 | 初始 Goal、来源证据、理解预演输入 |
-| 2. 预演理解 | 先看 AI 做一次，再选择哪里不够懂 | 根据预演偏差生成最多四轮动态问题，补齐真正影响结果的决定 | 16 个需求维度中的有效证据 |
+| 2. 需求细化 | 先看 AI 做一次，再选择哪里不够懂 | 根据预演偏差生成最多四轮动态问题，补齐真正影响结果的决定 | 16 个需求维度中的有效证据 |
 | 3. 确认工作方式 | 查看并编辑目标、输入、流程、边界、输出和测试 | 编译 Requirement、Capability、Loop、State 与 Output Contract | 经用户确认的生成蓝图 |
 | 4. 生成并优化 | 查看 Build Loop 与 Optimization Loop 的真实状态 | 研究领域知识、生成 Bundle、修复契约、冻结 Eval、试跑与回滚 | 当前最佳 Skill Bundle |
 | 5. 验证效果 | 用一个真实任务运行 Skill Demo，可继续对话 | 执行当前 Skill、找出可见偏差，把反馈转成 Canonical Mutation 后回归验证 | 经验证的个性化候选版本 |
@@ -140,7 +140,9 @@ evals/skill-ir.json
     ↓
 生成检索问题
     ↓
-Firecrawl / SearXNG 获取公开来源
+Firecrawl / SearXNG / DeepSeek 联网搜索发现公开来源
+    ↓
+服务端读取网页正文（DeepSeek 的模型总结不作为证据）
     ↓
 来源去重、Authority Ranking、时间与可追溯性检查
     ↓
@@ -440,7 +442,7 @@ generated-skill/
 ## API 与数据流
 
 - `POST /api/ai`：统一承载 Preview、Interview、Blueprint、Build、Repair、Eval、Optimize、Demo 和 Personalize 模式。
-- `POST /api/research`：调用 Firecrawl 或 SearXNG，返回受来源策略约束的研究结果。
+- `POST /api/research`：调用 Firecrawl、SearXNG 或 DeepSeek 服务端 Web Search，统一读取原网页正文并返回受来源策略约束的研究结果。
 - `POST /api/parse-pdf`：提取 PDF 文本并生成页码级证据。
 - `POST /api/validate-bundle`：执行服务端 Bundle 验证。
 - `POST /api/download`：生成最终 ZIP。
@@ -467,7 +469,7 @@ pnpm dev
 
 第一次本地启动会在被 Git 忽略的 `.wrangler/skillcanvas-vault-key` 生成凭据加密密钥。D1 数据、加密凭据和诊断日志保存在项目本地 Wrangler 状态中。
 
-本地开发默认使用 BYOK：在模型设置中选择 DeepSeek、OpenAI 或 OpenAI-Compatible 接口并保存 API Key；联网知识研究可连接 Firecrawl 或自部署 SearXNG。公开部署也支持平台托管模式，由服务端 Secret 提供模型与检索凭据，访客无需填写 Key，浏览器只会收到“服务已配置”的状态。
+本地开发默认使用 BYOK：在模型设置中选择 DeepSeek、OpenAI 或 OpenAI-Compatible 接口并保存 API Key；联网知识研究可连接 Firecrawl、自部署 SearXNG，或在模型服务为 DeepSeek 时复用同一 Key 调用 DeepSeek 服务端 Web Search。公开部署也支持平台托管模式，由服务端 Secret 提供模型与检索凭据，访客无需填写 Key，浏览器只会收到“服务已配置”的状态。
 
 浏览器通知只在用户点击“确认理解并生成 Skill”后请求授权；允许后，长时间 Build/Optimization 完成、暂停或失败时自动通知，不影响未授权用户继续生成。
 
@@ -482,7 +484,7 @@ pnpm dev
 | `SKILLCANVAS_SHARED_MODEL` | 托管模式必需 | 平台统一使用的模型 ID |
 | `SKILLCANVAS_SHARED_BASE_URL` | 托管模式必需 | 模型服务 API 地址 |
 | `SKILLCANVAS_SHARED_API_KEY` | 托管模式必需、Secret | 仅供服务端代理调用的模型凭据 |
-| `SKILLCANVAS_SHARED_RESEARCH_PROVIDER` | 可选 | 平台统一提供的研究服务，例如 `firecrawl` |
+| `SKILLCANVAS_SHARED_RESEARCH_PROVIDER` | 可选 | 平台统一提供的研究服务：`firecrawl`、`searxng` 或 `deepseek`；后者复用 DeepSeek 模型凭据 |
 | `SKILLCANVAS_SHARED_RESEARCH_BASE_URL` | 可选 | 研究服务 API 地址 |
 | `SKILLCANVAS_SHARED_RESEARCH_API_KEY` | 使用 Firecrawl 时必需、Secret | 仅供服务端检索代理调用的凭据 |
 

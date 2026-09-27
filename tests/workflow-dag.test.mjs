@@ -149,6 +149,15 @@ test("state mutations require explicit read and write ordering", () => {
   assert.equal(compileWorkflowDag([{ ...writer, requires: [] }], ["state"]).valid, false);
 });
 
+test("terminal labels do not exempt simultaneous shared writes, including external persistence", () => {
+  for (const role of ["deliver", "persist"]) {
+    const writer = (id) => ({ ...step(id, ["$request", "shared"], ["$output"]), role, delivers: ["shared"], mutates: ["shared"] });
+    const result = compileWorkflowDag([writer("a"), writer("b")], ["$request", "shared"], { terminalOutputs: ["$output"] });
+    assert.equal(result.valid, false);
+    assert.ok(result.issues.some((issue) => issue.type === "unordered-mutation"));
+  }
+});
+
 test("reference resources bind inside their consuming operation, not as fake completions", () => {
   const consumer = { ...step("compose", ["$request"], ["report"]), role: "deliver" };
   const workflow = bindWorkflowCapabilities([consumer], [
@@ -165,6 +174,28 @@ test("several mutually exclusive branches may produce the same terminal output",
     step("path-b", ["$request"], ["$output"]),
   ], ["$request"], { terminalOutputs: ["$output"] });
   assert.equal(compiled.valid, true, compiled.issues.map((item) => item.message).join("；"));
+});
+
+test("reference metadata variants preserve routing and explicit reference producers", () => {
+  for (const affects of [undefined, [], ["output-contract"], ["runtime-workflow"]]) {
+    const reference = { id: "guide", kind: "reference", input: "Context", output: "Guidance", affects,
+      activationCondition: "Only for weekly reports", fallback: "Disclose unavailable guidance" };
+    const capabilities = [{ id: "compose", kind: "llm", input: "$request", output: "Report", fallback: "stop" }, reference];
+    const before = structuredClone(capabilities);
+    const consumer = { ...step("compose", ["$request"], ["report"]), role: "transform" };
+    const routed = bindWorkflowCapabilities([consumer], capabilities);
+    assert.equal(routed.length, 1);
+    assert.ok(routed[0].capabilityIds.includes("guide"));
+    assert.deepEqual(capabilities, before);
+    assert.deepEqual(bindWorkflowCapabilities(routed, capabilities), routed);
+
+    const reader = { ...step("read-guide", ["$request"], ["guidance"]), role: "read", capabilityIds: ["guide"] };
+    const explicit = bindWorkflowCapabilities([reader, { ...consumer, requires: ["guidance"], input: "guidance" }], capabilities);
+    assert.equal(explicit.length, 2);
+    assert.deepEqual(explicit[0].produces, ["guidance"]);
+    assert.deepEqual(explicit[1].requires, ["guidance"]);
+    assert.deepEqual(explicit[1].capabilityIds, ["compose"]);
+  }
 });
 
 test("dollar-prefixed generated artifacts are valid persistence inputs, raw request is not", () => {

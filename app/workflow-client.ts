@@ -6,15 +6,31 @@ type WorkflowSnapshot = {
   nodes: WorkflowNode[];
 };
 
-async function workflowRequest(body: Record<string, unknown>) {
-  const response = await fetch("/api/workflows", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
+export async function workflowRequest(body: Record<string, unknown>, timeoutMs = 8_000) {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("Workflow journal request timed out"));
+    }, timeoutMs);
   });
-  const data = await response.json().catch(() => ({})) as WorkflowSnapshot & { error?: string };
-  if (!response.ok) throw new Error(data.error || `Workflow request failed (${response.status})`);
-  return data;
+  try {
+    return await Promise.race([timeout, (async () => {
+      const response = await fetch("/api/workflows", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+        signal: controller.signal,
+      });
+      const data = await response.json().catch(() => ({})) as WorkflowSnapshot & { error?: string };
+      if (!response.ok) throw new Error(data.error || `Workflow request failed (${response.status})`);
+      if (!data.run?.id || !Array.isArray(data.nodes)) throw new Error("Workflow journal returned an incomplete snapshot");
+      return data;
+    })()]);
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /**
@@ -26,6 +42,7 @@ async function workflowRequest(body: Record<string, unknown>) {
  */
 export class DurableWorkflowJournal {
   private snapshot: WorkflowSnapshot;
+  private unavailable = false;
 
   private constructor(snapshot: WorkflowSnapshot) {
     this.snapshot = snapshot;
@@ -44,19 +61,25 @@ export class DurableWorkflowJournal {
   }
 
   async complete(nodeId: string, output: unknown) {
+    if (this.unavailable) return false;
     try {
       const existing = this.snapshot.nodes.find((node) => node.nodeId === nodeId);
       if (existing?.status === "completed") return true;
       this.snapshot = await workflowRequest({ action: "claim", runId: this.runId });
-      if (this.snapshot.run.currentNodeId !== nodeId) return false;
+      if (this.snapshot.run.currentNodeId !== nodeId) {
+        this.unavailable = true;
+        return false;
+      }
       this.snapshot = await workflowRequest({ action: "complete", runId: this.runId, nodeId, output });
       return true;
     } catch {
+      this.unavailable = true;
       return false;
     }
   }
 
   async fail(error: unknown) {
+    if (this.unavailable) return false;
     try {
       const currentNodeId = this.snapshot.run.currentNodeId;
       if (!currentNodeId) return false;
@@ -70,6 +93,7 @@ export class DurableWorkflowJournal {
       });
       return true;
     } catch {
+      this.unavailable = true;
       return false;
     }
   }

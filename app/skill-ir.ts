@@ -1,6 +1,9 @@
 import {
   authoritativeAnswerEvidenceText,
   hasContentPermissionConflict,
+  contentPermissionConflictLocations,
+  isFactualScopeAuthorized,
+  isFactualScopeRestricted,
   reconcileContentPermissionText,
   resolveContentPermission,
   normalizeAnswerEvidence,
@@ -9,7 +12,13 @@ import {
 import { EMPTY_CAPABILITY_DELTA, normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta.ts";
 import { EVAL_COMPILER_VERSION } from "./eval-prompt.ts";
 import { hostEvidenceAdapter } from "./host-evidence-adapters.ts";
-import { assessKnowledgeEvidence, hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
+import { hasVerifiedKnowledgeSupport } from "./knowledge-evidence.ts";
+import {
+  REQUIRED_KNOWLEDGE_CATEGORIES,
+  knowledgeRequirementPolicy,
+  normalizeKnowledgeAssessmentForPolicy,
+  type KnowledgeAssessment,
+} from "./knowledge-contract.ts";
 import { assertWorkflowDag, bindWorkflowCapabilities, closeWorkflowDagTerminals, compileWorkflowDag, isReadOnlyHostEvidence, normalizeWorkflowDagSteps, workflowCapabilityRouteIssues, WORKFLOW_TERMINALS, type WorkflowDagStep } from "./workflow-dag.ts";
 import { hasUnscopedActionPermissionConflict, reconcileActionPermissionText, reconcileProjectedActionPermissionMarkdown } from "./action-permission.ts";
 import { confirmationCheckpoints, confirmationConflicts, negativeExampleStatement, requirementEvidence, type EvidenceMetadata } from "./user-evidence.ts";
@@ -85,18 +94,7 @@ export type SkillIR = {
     observableIndicators: string[];
   };
   capabilityDelta: CapabilityDelta;
-  knowledgeAssessment: {
-    status: "sufficient" | "insufficient" | "not-required";
-    requiredCategories: string[];
-    coveredCategories: string[];
-    missingCategories: string[];
-    requiredGapIds?: string[];
-    coveredGapIds?: string[];
-    missingGapIds?: string[];
-    observedCategories?: string[];
-    verifiedRuleCount?: number;
-    advisoryRuleCount?: number;
-  };
+  knowledgeAssessment: KnowledgeAssessment;
   tasks: Array<{
     id: string;
     intent: string;
@@ -204,22 +202,16 @@ export type SkillIR = {
   }>;
 };
 
-const REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES = ["decision_rules", "failure_modes", "edge_cases", "verification_methods"];
-
 /** Recompute sufficiency from canonical atoms. Caller-supplied coverage is a
  * hint only; it cannot claim sufficient/not-required while the IR disagrees. */
 export function normalizeKnowledgeAssessment(value: SkillIR["knowledgeAssessment"] | undefined, domainEvidence: unknown[], knowledgeRequired = false, requiredGapIds: string[] = value?.requiredGapIds || []): SkillIR["knowledgeAssessment"] {
-  if (!knowledgeRequired && !requiredGapIds.length && (!value || value.status === "not-required") && domainEvidence.length === 0) {
-    return { status: "not-required", requiredCategories: [], coveredCategories: [], missingCategories: [] };
-  }
-  const requiredCategories = Array.from(new Set((value?.requiredCategories?.length ? value.requiredCategories : REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES)
-    .filter((category) => REQUIRED_DOMAIN_KNOWLEDGE_CATEGORIES.includes(category))));
-  const coverage = assessKnowledgeEvidence(domainEvidence, requiredGapIds, requiredCategories);
-  return {
-    status: coverage.missingCategories.length || coverage.missingGapIds.length || !requiredGapIds.length ? "insufficient" : "sufficient",
-    requiredCategories,
-    ...coverage,
-  };
+  const legacyExplicitRequirement = Boolean(value && value.status !== "not-required" && value.requiredCategories?.length);
+  const required = knowledgeRequired || legacyExplicitRequirement;
+  return normalizeKnowledgeAssessmentForPolicy(value, domainEvidence, {
+    required,
+    requiredGapIds,
+    requiredCategories: required ? [...REQUIRED_KNOWLEDGE_CATEGORIES] : [],
+  });
 }
 
 function permissionEvidenceFingerprint(ir: SkillIR) {
@@ -266,7 +258,37 @@ export function reconcileSkillIRContentPermission(ir: SkillIR, answers: Record<s
     }
     return value;
   };
-  const reconciled = permission.explicitRestriction ? ir : visit(ir);
+  const visited = permission.explicitRestriction ? ir : visit(ir);
+  // Evidence quotations are immutable, but a model-authored interpretation of
+  // that evidence is not. Earlier reconciliation skipped every requirement
+  // object, allowing lower-priority source/domain claims to reintroduce a
+  // blanket prohibition after the user's permission had been compiled.
+  const reconciled = permission.allowFactualCreation && !permission.explicitRestriction
+    ? {
+      ...visited,
+      requirements: visited.requirements.flatMap((item) => {
+        if (item.provenance === "user_explicit" || item.provenance === "user_example") {
+          const ownerQuote = item.originalQuote || item.statement;
+          // Preserve the owner's words. Only a conflicting model paraphrase
+          // may be corrected, and only when the quote itself is unambiguous.
+          if (!hasContentPermissionConflict(item.statement, permission)
+            || hasContentPermissionConflict(ownerQuote, permission)) return [item];
+          return [{ ...item, statement: reconcileContentPermissionText(item.statement, permission).trim() || ownerQuote }];
+        }
+        const statement = reconcileContentPermissionText(item.statement, permission).trim();
+        return statement ? [{ ...item, statement }] : [];
+      }),
+      // A verified external rule can inform the task, but cannot supersede a
+      // user's confirmed content authority. Remove conflicting rule atoms
+      // rather than rewriting their evidence and pretending it was verified.
+      domainEvidence: visited.domainEvidence.filter((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return true;
+        const rule = item as Record<string, unknown>;
+        return !hasContentPermissionConflict([
+          rule.decision, rule.knowledge, rule.rule, rule.applies_when, rule.exception,
+        ].filter((value) => typeof value === "string").join("\n"), permission);
+      }),
+    } : visited;
   return {
     ...reconciled,
     controlModel: { ...reconciled.controlModel, contentPermission: permission, contentPermissionEvidenceFingerprint: permissionEvidenceFingerprint(reconciled) },
@@ -383,10 +405,13 @@ export function reconcileSkillIRActionPermissions(ir: SkillIR): SkillIR {
       })),
       completionChecks: unique([
         ...(ir.runtimeContract?.completionChecks || []),
-        "At least one declared user-facing output exists and contains the actual task result; analysis, a plan, or questions alone do not complete the workflow.",
+        "If required input or approval is missing, show the specific gap and any independently safe work, then pause for a real user reply; do not require or create a full draft when the owner asked to fill gaps before drafting. This is not final completion. Once the delivery branch's prerequisites are met, produce and check the actual task result rather than ending with analysis, a plan, or questions alone.",
         "No question repeats a value, permission, or decision already present in the current request.",
         ...(!contentPermission.allowFactualCreation
           ? ["Any newly proposed factual detail not present in the user's material is visibly marked as a proposal, placeholder, or item to verify rather than presented as a user fact."]
+          : []),
+        ...(contentPermission.restrictedFactualScopes?.length
+          ? [`For the owner's restricted factual scopes (${contentPermission.restrictedFactualScopes.join(", ")}), preserve the stated confirmation or no-invention boundary even when other content may be expanded.`]
           : []),
       ]),
     },
@@ -395,7 +420,7 @@ export function reconcileSkillIRActionPermissions(ir: SkillIR): SkillIR {
       requiredSections: output.requiredSections.length ? output.requiredSections : ["可检查的主要结果"],
       validation: unique([
         ...output.validation,
-        "实际结果已经生成；不能只返回分析、计划、规则复述或待确认问题",
+        "仅在交付分支的必需输入与确认均已满足时，检查实际结果已经生成；缺失时列出具体缺口并展示不依赖缺口的安全中间结果，按用户约定暂停；若用户要求补齐后再成稿，不得提前要求或生成完整草稿，也不得假称已交付",
       ]),
     })),
   };
@@ -585,18 +610,28 @@ function splitCapabilityInputCandidates(value: string) {
 }
 
 function splitDeclaredInputCandidates(value: string) {
-  return unique(splitList(value).flatMap((item) => splitTopLevel(item, new Set(["，", ","])).flatMap((part) => (
-    /[（(【[]/.test(part)
-      ? [part]
-      : part.split(/\s*(?:并且|并|以及|与|和)\s*/i)
-  )).map((part) => part.trim()).filter(Boolean))).slice(0, 12);
+  // Interview option text contains clauses such as "需要先归并成事项" and
+  // "调整语气和格式". Splitting on every Chinese 并/和 creates fictitious
+  // mandatory materials. Only a second explicit submission verb separates
+  // two input roles inside one answer.
+  return unique(splitList(value).flatMap((item) => /[（(【[]/.test(item)
+    ? [item]
+    : item.split(/(?:[，,]\s*)?并(?=(?:上传|提供|粘贴|输入|附上|导入|发送|给出|读取|提交))/i)
+  ).map((part) => part.trim()).filter(Boolean)).slice(0, 12);
 }
 
 export type DerivedTaskInput = SkillIR["inputs"][number];
 
+export function declaredWorkflowStateRoots(stateModel: Record<string, unknown> | undefined) {
+  if (!stateModel?.needed || !Array.isArray(stateModel.fields)) return [];
+  return stateModel.fields.flatMap((field) => field && typeof field === "object" && typeof (field as { name?: unknown }).name === "string"
+    ? [(field as { name: string }).name.trim()] : []).filter(Boolean);
+}
+
 const VAGUE_INPUT_STRATEGY = /^(?:通常|一般|有时|可能)?(?:只有)?(?:一句|简单想法)|会提供(?:文件|链接|资料|案例)|需要\s*AI\s*(?:主动)?追问|有固定模板或数据|(?:我)?不确定|请\s*AI\s*(?:帮我)?判断/i;
 const INPUT_HANDLING_POLICY = /(?:先|同时|继续|直接).{0,12}(?:标记|询问|列出|请求|处理|生成|补充)|(?:缺少|缺失|不足|混乱|无法读取).{0,24}(?:时|则|先|标记)|how.{0,16}(?:handle|recover)/i;
 const INPUT_REPRESENTATION_OPTION = /^(?:纯文本(?:粘贴)?|文本粘贴|(?:上传|提供)?\s*(?:PDF|Word|DOCX|Excel|XLSX|CSV|JSON|Markdown|MD|图片|截图|扫描件|音频|录音|视频|文档|文件)|结构化(?:表格|文件|数据)(?:（[^）]+）|\([^)]*\))?|网页链接|URL|邮件|聊天记录)(?:（[^）]+）|\([^)]*\))?$/i;
+const ALTERNATIVE_RECORD_SOURCE = /(?:记录|纪要|摘录|片段|清单|草稿|流水|日志|笔记|邮件|聊天|群聊|访谈|transcript|notes?|draft|log|email)/i;
 
 function inputRepresentations(value: string) {
   const representations: string[] = [];
@@ -748,10 +783,17 @@ export function deriveTaskInputContract(input: {
     && !/^(?:供|以便|方便).{0,20}(?:补充|确认|处理)|^(?:继续)?(?:标记|列出|询问|请求)/.test(value));
   const representationOptions = declaredAnswerInputs.filter((value) => INPUT_REPRESENTATION_OPTION.test(value));
   const mergeRepresentationOptions = representationOptions.length >= 2 && representationOptions.length === declaredAnswerInputs.length;
-  if (mergeRepresentationOptions) {
-    add("source-material", "完成任务所依据的原始材料", true, representationOptions.flatMap(inputRepresentations));
+  // A list of alternative record genres is one source contract, not a demand
+  // that the user supply every genre. Keep genuinely different roles (such as
+  // a target specification AND source material) separate.
+  const mergeAlternativeRecords = declaredAnswerInputs.length >= 2
+    && !/(?:同时提供|全部提供|均需提供|都要提供|各一份|both required)/i.test(answers.inputs || "")
+    && declaredAnswerInputs.every((value) => ALTERNATIVE_RECORD_SOURCE.test(value))
+    && !declaredAnswerInputs.some((value) => /(?:目标规范|验收标准|决策规则|评分规则|权限|账号|密钥|target specification|acceptance criteria|credentials?)/i.test(value));
+  if (mergeRepresentationOptions || mergeAlternativeRecords) {
+    add("source-material", "完成任务所依据的原始材料", true, declaredAnswerInputs.flatMap(inputRepresentations));
   }
-  declaredAnswerInputs.filter((value) => !mergeRepresentationOptions || !representationOptions.includes(value)).forEach((value) => {
+  declaredAnswerInputs.filter((value) => !(mergeAlternativeRecords || (mergeRepresentationOptions && representationOptions.includes(value)))).forEach((value) => {
     const semanticName = semanticInputName(value);
     const concept = conceptForInput(semanticName);
     const definition = INPUT_CONCEPTS.find((item) => item.concept === concept);
@@ -1014,7 +1056,8 @@ export function compileSkillIR(input: {
   // Normalize at the IR boundary as well as at the API call site so restored
   // sessions and alternate callers cannot persist a gap the validator rejects.
   const capabilityDelta = normalizeCapabilityDelta(input.capabilityDelta || EMPTY_CAPABILITY_DELTA);
-  const knowledgeAssessment = normalizeKnowledgeAssessment(input.knowledgeAssessment, domainEvidence, capabilityDelta.skillMustTeach.length > 0, capabilityDelta.skillMustTeach.map((gap) => gap.id));
+  const knowledgePolicy = knowledgeRequirementPolicy(capabilityDelta);
+  const knowledgeAssessment = normalizeKnowledgeAssessmentForPolicy(input.knowledgeAssessment, domainEvidence, knowledgePolicy);
   const capabilities: SkillIRCapability[] = input.plan.items.filter(activeCapability).map((item) => {
     const necessity = item.necessity ? { ...item.necessity, reason: item.reason || item.deterministicAdvantage || "由资源必要性分析决定" } : fallbackNecessity(item);
     const scope = item.scope || (item.kind === "llm" ? "task-specific" : /当|如果|若|when|if/i.test(item.activationCondition || item.routingCondition) ? "conditional" : "task-specific");
@@ -1112,7 +1155,11 @@ export function compileSkillIR(input: {
   const ownerlessStep = workflowSource.find((step) => step.capabilityIds.length === 0);
   if (ownerlessStep) throw new Error(`WORKFLOW_DAG_INVALID: Workflow step ${ownerlessStep.id} 没有可执行的 capability owner`);
   if (!workflowSource.length) throw new Error("WORKFLOW_DAG_INVALID: Workflow 没有可执行步骤");
-  const workflowInitialInputs = ["$request", "$source", ...inputs.map((item) => `input:${item.id}`)];
+  // The blueprint preflight treats declared session state as runtime roots.
+  // Canonical compilation must use the same roots, otherwise a plan that
+  // passed preflight can fail later with every state field "unmet".
+  const stateRoots = declaredWorkflowStateRoots(input.plan.stateModel);
+  const workflowInitialInputs = ["$request", "$source", ...inputs.map((item) => `input:${item.id}`), ...stateRoots];
   const closedWorkflow = closeWorkflowDagTerminals(workflowSource, workflowInitialInputs);
   const workflow = assertWorkflowDag(
     closedWorkflow,
@@ -1235,7 +1282,7 @@ export function compileSkillIR(input: {
     },
     traceability: [],
   };
-  return bindSkillIREvals(reconcileSkillIRContentPermission(ir, input.answers), "");
+  return reconcileSkillIRStateLoops(bindSkillIREvals(reconcileSkillIRContentPermission(ir, input.answers), ""));
 }
 
 function yamlString(value: string) {
@@ -1880,6 +1927,29 @@ export function skillIRDigest(ir: SkillIR) {
   return `fnv1a-${(hash >>> 0).toString(16).padStart(8, "0")}`;
 }
 
+/** Longitudinal control is meaningful only when the canonical state contract
+ * actually provides persistent fields, update rules and expiry semantics.
+ * Keep this invariant at the IR boundary so restores, repairs and projections
+ * cannot reintroduce a stale model-authored loop. */
+export function reconcileSkillIRStateLoops(ir: SkillIR): SkillIR {
+  const state = ir.stateRequirement || {};
+  const persistent = state.needed === true && state.scope === "persistent";
+  const scopes = Array.isArray(ir.controlModel?.scopes) ? ir.controlModel.scopes as Array<Record<string, unknown>> : [];
+  const reconciledScopes = persistent ? scopes : scopes.filter((scope) => scope.scope !== "longitudinal");
+  if (reconciledScopes.length === scopes.length) return ir;
+  const escalation = Array.isArray(ir.controlModel?.escalationConditions)
+    ? ir.controlModel.escalationConditions.map(String)
+    : [];
+  return {
+    ...ir,
+    controlModel: {
+      ...ir.controlModel,
+      scopes: reconciledScopes,
+      escalationConditions: [...new Set([...escalation, "跨会话继续时，请用户重新提供必要状态；当前 Skill 不承诺自动恢复历史状态"])],
+    },
+  };
+}
+
 /** One freeze boundary for every deterministic semantic projection. Compile
  * from the persisted shape, never from a subtly different in-memory object.
  * Caller-owned implementations and source evidence are left untouched. */
@@ -1888,16 +1958,16 @@ export function projectSkillIRFiles(ir: SkillIR, files: Record<string, string> =
   // validator. This is intentionally deterministic: never ask a repair model
   // to edit compiler-owned Capability Delta rationale.
   const normalizedDelta = normalizeCapabilityDelta(ir.capabilityDelta);
-  const normalizedIR: SkillIR = {
+  const knowledgePolicy = knowledgeRequirementPolicy(normalizedDelta);
+  const normalizedIR: SkillIR = reconcileSkillIRStateLoops({
     ...ir,
     capabilityDelta: normalizedDelta,
-    knowledgeAssessment: normalizeKnowledgeAssessment(
+    knowledgeAssessment: normalizeKnowledgeAssessmentForPolicy(
       ir.knowledgeAssessment,
       Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
-      normalizedDelta.skillMustTeach.length > 0,
-      normalizedDelta.skillMustTeach.map((gap) => gap.id),
+      knowledgePolicy,
     ),
-  };
+  });
   const persistedIR = JSON.parse(JSON.stringify(normalizedIR)) as SkillIR;
   const projections: Record<string, string> = {
     "evals/capability-manifest.json": JSON.stringify(projectCapabilityManifest(persistedIR), null, 2),
@@ -2007,18 +2077,18 @@ export function auditSkillIRFiles(files: Record<string, string>) {
   if (!ir.runtimeContract?.workflow?.length) issues.push("Canonical SkillIR 缺少可投影的 Runtime Workflow");
   const dag = compileWorkflowDag(
     normalizeWorkflowDagSteps(ir.runtimeContract?.workflow),
-    ["$request", "$source", ...ir.inputs.map((item) => `input:${item.id}`)],
+    ["$request", "$source", ...ir.inputs.map((item) => `input:${item.id}`), ...declaredWorkflowStateRoots(ir.stateRequirement)],
     {
       terminalOutputs: Object.values(WORKFLOW_TERMINALS),
       requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed],
     },
   );
   issues.push(...dag.issues.map((item) => item.message), ...workflowCapabilityRouteIssues(ir.runtimeContract.workflow, ir.capabilities));
-  const canonicalKnowledgeAssessment = normalizeKnowledgeAssessment(
+  const knowledgePolicy = knowledgeRequirementPolicy(ir.capabilityDelta);
+  const canonicalKnowledgeAssessment = normalizeKnowledgeAssessmentForPolicy(
     ir.knowledgeAssessment,
     Array.isArray(ir.domainEvidence) ? ir.domainEvidence : [],
-    Boolean(ir.capabilityDelta?.skillMustTeach?.length),
-    ir.capabilityDelta?.skillMustTeach?.map((gap) => gap.id) || [],
+    knowledgePolicy,
   );
   for (const item of ir.domainEvidence || []) {
     if (item && typeof item === "object" && Array.isArray((item as Record<string, unknown>).source_urls)
@@ -2065,15 +2135,12 @@ export function auditSkillIRFiles(files: Record<string, string>) {
     if (!output.producerCapabilityIds.some((id) => capabilityIds.has(id))) issues.push(`输出 ${output.id} 没有真实文件生产能力`);
   });
   const contentPermission = contentPermissionFromIR(ir);
-  const runtimeInstructions = Object.entries(files)
-    .filter(([path]) => path === "SKILL.md" || /^references\/.*\.(?:md|txt|json|ya?ml)$/i.test(path))
-    .map(([, value]) => value)
-    .join("\n");
-  const runtimePermissionConflict = hasContentPermissionConflict(runtimeInstructions, contentPermission);
-  if (runtimePermissionConflict) {
+  const runtimePermissionConflicts = contentPermissionConflictLocations(files, contentPermission);
+  if (runtimePermissionConflicts.length) {
+    const first = runtimePermissionConflicts[0];
     issues.push(contentPermission.allowFactualCreation
-      ? "[USER_PERMISSION_RUNTIME_CONFLICT] 运行规则收紧了用户明确确认的内容补写或新增权限"
-      : "[UNCONFIRMED_CONTENT_RESTRICTION] 运行规则加入了用户没有选择的‘禁止补写或禁止新增事实’限制");
+      ? `[USER_PERMISSION_RUNTIME_CONFLICT] ${first.path}:${first.line} 的运行规则收紧了用户明确确认的内容补写或新增权限`
+      : `[UNCONFIRMED_CONTENT_RESTRICTION] ${first.path}:${first.line} 的运行规则加入了用户没有选择的内容限制`);
   }
   const evaluationPermissionClaims: string[] = [...(ir.evaluationPlan.failureModes || [])];
   try {
@@ -2101,7 +2168,11 @@ export function auditSkillIRFiles(files: Record<string, string>) {
   }
   if (contentPermission.allowFactualCreation) {
     const dependencies = Array.isArray(ir.informationDependencies) ? ir.informationDependencies as Array<Record<string, unknown>> : [];
-    if (dependencies.some((item) => /事实|数字|经历|业绩/i.test(String(item.field || "")) && item.inventable === false)) issues.push("[USER_PERMISSION_IR_CONFLICT] Information Dependency 把用户已明确允许补写的内容标记为不可生成");
+    if (dependencies.some((item) => {
+      const field = String(item.field || "");
+      return /事实|数字|数据|经历|业绩|成果|结论/i.test(field) && item.inventable === false
+        && isFactualScopeAuthorized(field, contentPermission) && !isFactualScopeRestricted(field, contentPermission);
+    })) issues.push("[USER_PERMISSION_IR_CONFLICT] Information Dependency 把用户已明确允许补写的内容标记为不可生成");
   }
   const manifestIR = manifest.skill_ir && typeof manifest.skill_ir === "object" ? manifest.skill_ir as Record<string, unknown> : {};
   if (manifestIR.path !== "evals/skill-ir.json") issues.push("Capability Manifest 没有声明 Canonical SkillIR 路径");

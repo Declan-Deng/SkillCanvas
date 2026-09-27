@@ -88,14 +88,20 @@ export function composeEvaluationEpisodes(cases: SkillEvalCase[], maxEpisodes = 
     const representative = [...bucket].sort((left, right) => right.prompt.length - left.prompt.length)[0];
     const materialPrompt = episodeMaterialPrompt(representative.prompt);
     const capabilities = uniqueStrings(bucket.flatMap((item) => item.capabilityIds), 16);
+    const pendingCheckpoint = ["required-value-missing", "productive-partial-delivery", "core-input-missing"]
+      .includes(String(representative.context.workflow_checkpoint || ""));
     const expectedBehaviors = uniqueStrings([
       "收到后续材料后继续同一任务，不重复索取已经提供的内容",
-      "最终一轮交付可直接检查的任务结果，而不是只给计划或问题清单",
-      ...bucket.flatMap((item) => item.expected.behaviors).filter((item) => /完成|交付|输出|使用|匹配|生成|调整|验证|确认/u.test(item)),
+      pendingCheckpoint
+        ? "材料回合交付符合当前工作流阶段的可检查中间结果，并列出具体缺口；若用户要求补齐后再成稿，暂停等待真实答复，不把完整草稿或最终文件当成本回合义务"
+        : "最终一轮交付可直接检查的任务结果，而不是只给计划或问题清单",
+      ...bucket.flatMap((item) => item.expected.behaviors).filter((item) =>
+        /完成|交付|输出|使用|匹配|生成|调整|验证|确认/u.test(item)
+        && (!pendingCheckpoint || !/完成当前实际任务并交付至少一个符合输出契约的可检查结果|最终一轮交付|最终结果/u.test(item))),
     ], 7);
     const mustNot = uniqueStrings([
       "提前使用尚未提供的材料或把缺失内容说成已经确认",
-      ...bucket.flatMap((item) => item.expected.mustNot).filter((item) => /虚构|忽略|只描述|不产生|只提出|重复|泄露/u.test(item)),
+      ...bucket.flatMap((item) => item.expected.mustNot).filter((item) => /虚构|忽略|只描述|不产生|只提出|重复|泄露|提前|越过|缺口.{0,16}生成/u.test(item)),
     ], 6);
     const counterexamples = [...new Map(bucket.flatMap((item) => item.expected.userCounterexamples || [])
       .map((item) => [`${item.requirement_id}:${item.originalQuote}`, item])).values()];
@@ -107,6 +113,7 @@ export function composeEvaluationEpisodes(cases: SkillEvalCase[], maxEpisodes = 
       context: {
         ...representative.context,
         episode: true,
+        expectedStage: pendingCheckpoint ? "await-user-reply" : "final-delivery",
         mergedCaseIds: bucket.map((item) => item.id),
       },
       capabilityIds: capabilities,
@@ -231,6 +238,12 @@ export type BenchmarkCaseComparison = {
   skillPassed: boolean;
   failureReason: string;
   dimensionGaps: string[];
+  /** Optional display evidence attached after the anonymous comparison is revealed. */
+  taskPrompt?: string;
+  baselineOutput?: string;
+  skillOutput?: string;
+  blindVerdict?: "baseline" | "candidate" | "tie";
+  comparisonEvidence?: string;
 };
 
 export type BenchmarkComparisonSummary = {

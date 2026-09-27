@@ -10,6 +10,8 @@ import { normalizePlannedDemoTurns } from "../app/demo-episode.ts";
 import { completedNumericDecisionFixture, confirmedCorrectionEvalEvidence, productiveCheckpointRequested } from "../app/workflow-compiler.ts";
 import { compileSkillIR, bindSkillIREvals, ensureSkillIREvalCoverage, projectEvalBank, reconcileSkillIRContentPermission, reconcileSkillIRActionPermissions, reconcileSkillIRInputResolutions, reconcileSkillIRSourceEvidence } from "../app/skill-ir.ts";
 import { reconcileRuntimeInputResources } from "../app/bundle-resource-repair.ts";
+import { capabilityOwnsArtifacts, caseProvidesCapabilityEvidence } from "../app/skill-pipeline-core.ts";
+import { evalCaseIsRunnable } from "../app/skill-ir.ts";
 import { capabilities, workflow } from "./fixtures/blueprint.mjs";
 
 const source = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
@@ -25,13 +27,19 @@ const dependencies = {
   // simple text-only plan. Prompt construction and Canonical projection run.
   reconcileCapabilityPlanContentPermission: (plan) => plan,
   confirmedContentPolicy: () => "按用户材料执行",
-  capabilityOwnsArtifacts: () => false,
+  capabilityOwnsArtifacts,
   normalizeCapabilityScope: () => "task-specific",
 };
 const compiled = ts.transpileModule(functions.join("\n"), { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
-const { createSpecificEvals, normalizeSkillDemo, reconcileConfirmedContentPolicyArtifact, ensureCanonicalBundledResources } = new Function(...Object.keys(dependencies), `${compiled}; return { createSpecificEvals, normalizeSkillDemo, reconcileConfirmedContentPolicyArtifact, ensureCanonicalBundledResources };`)(...Object.values(dependencies));
+const { createSpecificEvals, firstTaskExample, normalizeSkillDemo, reconcileConfirmedContentPolicyArtifact, ensureCanonicalBundledResources } = new Function(...Object.keys(dependencies), `${compiled}; return { createSpecificEvals, firstTaskExample, normalizeSkillDemo, reconcileConfirmedContentPolicyArtifact, ensureCanonicalBundledResources };`)(...Object.values(dependencies));
 const promptIssues = (files) => validateBundleContentCoherence(files).filter((issue) => issue.code === "INCOMPLETE_PROMPT");
 const longTask = `请分析以下完整要求：“${"竞品的选品、渠道与价格需要有证据，".repeat(9)}不要把折扣价当成日常价”。`;
+
+test("confirmed task wording overrides an earlier preview example in Eval fixtures", () => {
+  assert.equal(firstTaskExample({ __previewTask: "替我发送周报给主管", "trigger-language": "帮我整理周报，发送由我决定" }, "整理周报"), "帮我整理周报，发送由我决定");
+  assert.equal(firstTaskExample({ __previewTask: "替我发送周报给主管", "trigger-language": "帮我整理这周周报", "real-task": "以聊天记录为主，需要它提炼接口依赖" }, "整理周报"), "帮我整理这周周报");
+  assert.equal(firstTaskExample({ __previewTask: "替我发送周报给主管", "real-task": "只生成周报文件" }, "整理周报"), "只生成周报文件");
+});
 
 test("long quoted tasks and materials survive the production Eval compiler and canonical projection", () => {
   for (const [open, close] of [["“", "”"], ["「", "」"], ["『", "』"], ["（", "）"], ["【", "】"]]) {
@@ -69,6 +77,35 @@ test("every synthesized negative/permission fixture retains the full task rather
   }
 });
 
+test("file-delivery Eval has its own approved turn while semantic Eval still waits for approval", () => {
+  const plan = structuredClone(capabilities.capabilityPlan);
+  plan.outputContract = { mode: "artifact", format: "Markdown", requiredSections: ["报告"], artifactPatterns: ["outputs/*.md"], validation: ["文件存在"] };
+  const writer = {
+    ...structuredClone(plan.items[0]), id: "host-file-workspace", kind: "builtin-tool", name: "读取与编辑工作区文件",
+    affects: ["artifact-output", "output-contract"], output: "真实存在的 Markdown 文件",
+    activationCondition: "用户确认后写入文件", requirement: "创建并交付 Markdown 文件",
+    evaluationCriteria: ["文件路径可检查"],
+  };
+  plan.items.push(writer);
+  const bank = JSON.parse(createSpecificEvals("weekly-report", "整理每周汇报", {
+    inputs: "一周工作记录", __previewInput: "周一完成接口联调；周三确认下周发布窗口。",
+    "delivery-checkpoint": "先给我看草稿，等我确认后再定稿",
+  }, workflow.loopPlan, plan));
+  const semantic = bank.evals.find((item) => item.id === "core-core");
+  const file = bank.evals.find((item) => item.id === "core-host-file-workspace");
+  assert.equal(semantic.context.workflow_checkpoint, "productive-partial-delivery");
+  assert.match(semantic.prompt, /不得把尚未收到的答复说成已经确认/);
+  assert.doesNotMatch(semantic.prompt, /优先级规则|每次确认规则/);
+  assert.match(semantic.expected.behaviors.join("；"), /必要输入或确认缺失时，不要求最终产物/);
+  assert.doesNotMatch(semantic.expected.behaviors.join("；"), /完成当前实际任务并交付至少一个符合输出契约的可检查结果/);
+  assert.equal(file.context.workflow_checkpoint, "required-value-provided");
+  assert.equal(evalCaseIsRunnable(file), true);
+  assert.deepEqual(file.expected.artifacts, ["outputs/*.md"]);
+  assert.match(file.prompt, /隔离评测前置回合：用户已补齐/);
+  assert.doesNotMatch(file.prompt, /本用例没有提供优先级规则等关键决策/);
+  assert.equal(caseProvidesCapabilityEvidence(file, writer), true);
+});
+
 test("literal, mixed and unbalanced punctuation inside input is not proof of a truncated model response", () => {
   const prompts = [
     '请将字符 “ 替换为直角引号，并保留其余内容。',
@@ -94,9 +131,9 @@ test("Demo normalization keeps complete executable input, including the text aft
 });
 
 test("legacy Eval banks are migrated before P0/P1 repair and cannot hide behind a restored frozen version", () => {
-  assert.equal(EVAL_COMPILER_VERSION, "2.9");
+  assert.equal(EVAL_COMPILER_VERSION, "2.14");
   assert.match(source, /evalNeedsRebuild = parsed\.version !== EVAL_COMPILER_VERSION/);
-  assert.match(source, /restoreFrozenBundleExactly = savedEvalVersion === EVAL_COMPILER_VERSION/);
+  assert.match(source, /restoreFrozenBundleExactly = saved\.sessionSchemaVersion === SESSION_SCHEMA_VERSION[\s\S]*saved\.pipelineContractVersion === PIPELINE_CONTRACT_VERSION[\s\S]*savedEvalVersion === EVAL_COMPILER_VERSION/);
   const loop = source.slice(source.indexOf("async function runOptimizationLoop("));
   assert.ok(loop.indexOf("evalVersion !== EVAL_COMPILER_VERSION") < loop.indexOf("await runP0StaticRepairLoop("));
   assert.ok(loop.indexOf("evalVersion !== EVAL_COMPILER_VERSION") < loop.indexOf("await runP1ContractRepairLoop("));
@@ -106,9 +143,9 @@ test("legacy Eval banks are migrated before P0/P1 repair and cannot hide behind 
 test("permission reconciliation and final freeze never rewrite Eval prompts, material, counterexamples or assertions", () => {
   const task = "检查产品材料并生成报告";
   const sample = evidence.realisticFailureFixtures(task)[0].prompt;
-  // This is the exact deterministic failure mechanism: the old generic
-  // runtime rewriter deletes the disavowed quotation and its closing quote.
-  assert.match(evidence.reconcileContentPermissionText(sample, evidence.resolveContentPermission({})), /采用“$/);
+  // Without permission to create new facts, there is no content-permission
+  // conflict to reconcile, so the quoted counterexample stays intact.
+  assert.equal(evidence.reconcileContentPermissionText(sample, evidence.resolveContentPermission({})), sample);
   for (const answers of [{}, { "evidence-policy": "可以扩写并新增内容" }, { "evidence-policy": "只润色，不新增事实" }]) {
     const plan = capabilities.capabilityPlan;
     const ir = compileSkillIR({ skillName: "inspect-product", idea: task, answers, plan, loop: workflow.loopPlan, requirements: [] });

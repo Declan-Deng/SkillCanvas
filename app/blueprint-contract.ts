@@ -2,6 +2,48 @@ export type BlueprintPlanningMode = "blueprint-foundation" | "blueprint-capabili
 type JsonObject = Record<string, unknown>;
 export type BlueprintIssue = { path: string; code: "missing" | "type" | "empty" | "invalid" | "duplicate"; expected: string };
 const object = (value: unknown): value is JsonObject => Boolean(value) && typeof value === "object" && !Array.isArray(value);
+const FOUNDATION_IDS = ["goal", "understanding", "working-style", "boundary", "output", "eval"] as const;
+const FOUNDATION_TITLES = ["目标与适用场景", "理解与事实状态", "工作方式与流程", "边界与协作规则", "输出质量与失败模式", "评测与验收"] as const;
+
+/** The six review slots are application-owned, not model-authored IDs. Keep
+ * every returned piece of content; a missing slot remains invalid and goes to
+ * targeted content repair instead of silently inventing requirements. */
+function normalizeFoundationSections(value: unknown[]): JsonObject[] {
+  const slots: JsonObject[][] = FOUNDATION_IDS.map(() => []);
+  const deferred: Array<{ section: JsonObject; position: number; hint: number }> = [];
+  value.forEach((entry, position) => {
+    const section = object(entry) ? entry : {};
+    const index = typeof section.index === "string" && /^[A-F]$/i.test(section.index)
+      ? section.index.toUpperCase().charCodeAt(0) - 65 : -1;
+    const id = FOUNDATION_IDS.indexOf(section.id as typeof FOUNDATION_IDS[number]);
+    const hint = index >= 0 ? index : id;
+    if (hint >= 0 && !slots[hint].length) slots[hint].push(section);
+    else deferred.push({ section, position, hint });
+  });
+  for (const { section, position, hint } of deferred) {
+    // An explicitly labelled duplicate belongs to its labelled slot; do not
+    // misfile that content under a different requirement merely to fill a gap.
+    if (hint >= 0) { slots[hint].push(section); continue; }
+    const available = slots.findIndex((slot) => !slot.length);
+    const target = position < slots.length && !slots[position].length ? position : available;
+    slots[target >= 0 ? target : slots.length - 1].push(section);
+  }
+  return slots.map((bucket, index) => {
+    const base = bucket[0] || {};
+    const contents = bucket.map((section) => section.content).filter((content): content is string => typeof content === "string" && Boolean(content.trim()));
+    const conflictingLabel = bucket.some((section) =>
+      (FOUNDATION_IDS.includes(section.id as typeof FOUNDATION_IDS[number]) && section.id !== FOUNDATION_IDS[index])
+      || (typeof section.index === "string" && /^[A-F]$/i.test(section.index) && section.index.toUpperCase() !== String.fromCharCode(65 + index)));
+    const section: JsonObject = {
+      ...base, id: FOUNDATION_IDS[index], index: String.fromCharCode(65 + index),
+      title: typeof base.title === "string" && base.title.trim() ? base.title : FOUNDATION_TITLES[index],
+      status: bucket.length === 1 && !conflictingLabel && ["ready", "attention"].includes(String(base.status)) ? base.status : "attention",
+    };
+    if (contents.length) section.content = contents.join("\n\n");
+    else delete section.content;
+    return section;
+  });
+}
 
 // Shared with the generation/repair prompt. Null means “not applicable” only
 // for these kind-specific wire fields, never for task content or permissions.
@@ -29,11 +71,7 @@ export function normalizeBlueprintStage(mode: BlueprintPlanningMode, value: unkn
   const result = structuredClone(value);
   if (!object(result)) return result;
   if (mode === "blueprint-foundation") {
-    if (Array.isArray(result.sections)) for (const section of result.sections) {
-      // An omitted review badge is unknown, NOT an approved requirement.
-      // Retain the complete evidence and ask for review instead of regenerating.
-      if (object(section) && section.status == null) section.status = "attention";
-    }
+    if (Array.isArray(result.sections)) result.sections = normalizeFoundationSections(result.sections);
     return result;
   }
   if (mode === "blueprint-capabilities") {
