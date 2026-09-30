@@ -57,6 +57,14 @@ test('does not ship stale proof metrics or external icon dependencies', () => {
   assert(!engineering.includes('unpkg.com'));
 });
 
+test('uses the generated transparent icon set across the main and detail pages', () => {
+  const assets = ['context-stack.png', 'clarify.png', 'blueprint.png', 'knowledge.png', 'tools.png', 'eval.png', 'regression.png', 'weekly-report.png'];
+  for (const asset of assets) assert(page.includes(asset) || examples.includes(asset) || engineering.includes(asset), asset);
+  assert.match(page, /loading="lazy"/);
+  assert.match(css, /\.sc-step-icon/);
+  assert.match(css, /prefers-reduced-motion: reduce/);
+});
+
 function luminance(hex) {
   const rgb = hex.match(/[\da-f]{2}/gi).map(value => parseInt(value, 16) / 255);
   const linear = rgb.map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
