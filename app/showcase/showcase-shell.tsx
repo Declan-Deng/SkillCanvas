@@ -24,10 +24,10 @@ export function ShowcaseFooter() {
     <footer className="sc-footer">
       <div>
         <Image src="/skillcanvas-icon-small.png" width="44" height="44" alt="" />
-        <h2>把反复解释给 AI 的内容，变成可以持续使用的个人能力。</h2>
+        <h2>把你的工作方法，变成 AI 可以稳定执行的能力。</h2>
       </div>
       <a className="sc-button sc-button-primary" href={productUrl}>开始创建我的 Skill <span aria-hidden="true">→</span></a>
-      <p>SkillCanvas · AI 产品设计与工程实践</p>
+      <p>SkillCanvas · 可复用 AI Skill 的设计与验证</p>
     </footer>
   );
 }

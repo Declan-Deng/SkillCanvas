@@ -9,8 +9,8 @@ const engineering = readFileSync(new URL('../app/showcase/engineering/page.tsx',
 const shell = readFileSync(new URL('../app/showcase/showcase-shell.tsx', import.meta.url), 'utf8');
 
 test('leads with the user problem and keeps the primary product link', () => {
-  assert(page.includes('不再每次从头教 AI'));
-  assert(page.includes('同一种任务做过很多次，下一次还是要重新解释'));
+  assert(page.includes('不必反复教 AI'));
+  assert(page.includes('反复使用 AI'));
   assert(page.includes('https://skillcanvas-studio.declandeng.chatgpt.site/'));
 });
 
@@ -30,9 +30,16 @@ test('shows a concrete example rather than an abstract requirements grid', () =>
 
 test('provides dedicated examples and engineering pages', () => {
   for (const title of ['基金周报助手', '竞品研究助手', '写作修改助手']) assert(examples.includes(title));
-  for (const title of ['所有文件都从一份 SkillIR 出发', '能力不是越多越好', '改动必须证明自己更好']) assert(engineering.includes(title));
+  for (const title of ['共享同一份 SkillIR', '由任务价值决定', '都要证明更好']) assert(engineering.includes(title));
   assert(shell.includes('/showcase/examples'));
   assert(shell.includes('/showcase/engineering'));
+});
+
+test('uses semantic title lines instead of accidental browser wrapping', () => {
+  assert(page.includes('className="sc-title-line"'));
+  assert(examples.includes('className="sc-title-line"'));
+  assert(engineering.includes('className="sc-title-line"'));
+  assert.match(css, /\.sc-title-line \{ display: block;/);
 });
 
 test('mobile navigation remains available and layout collapses without hiding content', () => {
@@ -57,8 +64,14 @@ test('does not ship stale proof metrics or external icon dependencies', () => {
   assert(!engineering.includes('unpkg.com'));
 });
 
-test('uses the generated transparent icon set across the main and detail pages', () => {
-  const assets = ['context-stack.png', 'clarify.png', 'blueprint.png', 'knowledge.png', 'tools.png', 'eval.png', 'regression.png', 'weekly-report.png'];
+test('uses distinct generated icons for methods, diagnosis and case studies', () => {
+  const assets = [
+    'goal.png', 'interview.png', 'skill-build.png', 'compare.png',
+    'workflow-simple.png', 'judgment.png', 'boundary.png',
+    'drift.png', 'knowledge-gap.png', 'broken-flow.png', 'rollback.png',
+    'calendar-simple.png', 'competitor.png', 'writing.png', 'system-hub.png',
+    'single-source.png', 'independent-check.png',
+  ];
   for (const asset of assets) assert(page.includes(asset) || examples.includes(asset) || engineering.includes(asset), asset);
   assert.match(page, /loading="lazy"/);
   assert.match(css, /\.sc-step-icon/);

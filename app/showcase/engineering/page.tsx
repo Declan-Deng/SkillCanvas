@@ -5,7 +5,7 @@ import "../showcase.css";
 
 export const metadata: Metadata = {
   title: "工程设计 | SkillCanvas",
-  description: "了解 SkillCanvas 如何用统一蓝图、能力路由、质量门禁、独立评测与版本回滚生成可靠的 AI Skill。",
+  description: "了解 SkillCanvas 如何用统一蓝图、能力路由、质量门禁和回归验证生成可靠的 AI Skill。",
 };
 
 const sourceItems = [
@@ -49,33 +49,33 @@ export default function ShowcaseEngineeringPage() {
       <header className="sc-subpage-hero">
         <div>
           <p className="sc-section-label">工程设计</p>
-          <h1>把模型的不确定性，限制在可以检查和回滚的流程里。</h1>
+          <h1><span className="sc-title-line">把模型的不确定性，</span><span className="sc-title-line">限制在可检查、可回滚的流程里。</span></h1>
         </div>
-        <div className="sc-subpage-intro"><Image src="/showcase-icons/regression.png" width={138} height={138} alt="" priority /><p>SkillCanvas 不把完整产物交给一次模型生成。需求、知识、能力、工作流和评测由统一蓝图维护，并在不同阶段接受确定性检查。</p></div>
+        <div className="sc-subpage-intro"><Image src="/showcase-icons/system-hub.png" width={138} height={138} alt="" priority /><p>完整产物不由一次模型输出决定。统一蓝图维护需求、知识、能力、工作流与评测关系，并在关键阶段接受确定性检查。</p></div>
       </header>
 
       <section className="sc-engineering-section">
-        <header><Image className="sc-section-icon" src="/showcase-icons/blueprint.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">统一设计源</p><h2>所有文件都从一份 SkillIR 出发。</h2><p>用户确认和系统判断先进入统一蓝图，再投影成 Skill 文件。后续修改也先更新蓝图，减少局部修补造成的冲突。</p></header>
+        <header><Image className="sc-section-icon" src="/showcase-icons/single-source.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">统一设计源</p><h2><span className="sc-title-line">所有文件，</span><span className="sc-title-line">共享同一份 SkillIR。</span></h2><p>用户确认和系统判断先进入统一蓝图，再投影成 Skill 文件。后续修改同样先更新蓝图，避免局部规则相互冲突。</p></header>
         <DetailList items={sourceItems} />
       </section>
 
       <section className="sc-engineering-section">
-        <header><Image className="sc-section-icon" src="/showcase-icons/tools.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">能力路由</p><h2>能力不是越多越好。</h2><p>每项能力都需要明确的任务价值、调用位置和失败处理。没有可观察产出和使用路径的能力不会进入最终 Skill。</p></header>
+        <header><Image className="sc-section-icon" src="/showcase-icons/tools.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">能力路由</p><h2><span className="sc-title-line">能力选择，</span><span className="sc-title-line">由任务价值决定。</span></h2><p>每项能力都必须说明任务价值、调用位置和失败处理。缺少可观察产出与使用路径的能力不会进入最终 Skill。</p></header>
         <DetailList items={capabilityItems} />
       </section>
 
       <section className="sc-engineering-section">
-        <header><Image className="sc-section-icon" src="/showcase-icons/context-stack.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">生成质量门禁</p><h2>模型生成候选，规则决定它能否继续。</h2><p>确定性修复只处理可以安全判断的结构问题。涉及用户意图或业务语义时，系统保留现场并要求重新生成或确认。</p></header>
+        <header><Image className="sc-section-icon" src="/showcase-icons/context-stack.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">生成质量门禁</p><h2><span className="sc-title-line">模型提出候选，</span><span className="sc-title-line">规则决定能否继续。</span></h2><p>确定性修复只处理可以安全判断的结构问题。涉及用户意图或业务语义时，系统保留现场并重新生成或请求确认。</p></header>
         <DetailList items={gateItems} />
       </section>
 
       <section className="sc-engineering-section">
-        <header><Image className="sc-section-icon" src="/showcase-icons/eval.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">验证与优化</p><h2>改动必须证明自己更好。</h2><p>执行、判断与修改彼此隔离。候选版本只有在代表性任务改善，并且原有能力没有退化时才会被保留。</p></header>
+        <header><Image className="sc-section-icon" src="/showcase-icons/independent-check.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">验证与优化</p><h2><span className="sc-title-line">每次改动，</span><span className="sc-title-line">都要证明更好。</span></h2><p>执行、判断与修改彼此隔离。候选版本只有改善代表性任务，并且不损害原有能力时才会保留。</p></header>
         <DetailList items={evalItems} />
       </section>
 
       <section className="sc-engineering-section">
-        <header><Image className="sc-section-icon" src="/showcase-icons/regression.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">完整生产线</p><h2>从用户确认到可回滚版本。</h2><p>每一阶段都有明确输入、产物和继续条件。失败时保留最近一次有效状态，避免整条链路从头开始。</p></header>
+        <header><Image className="sc-section-icon" src="/showcase-icons/rollback.png" width={120} height={120} alt="" loading="lazy" /><p className="sc-section-label">完整生产线</p><h2><span className="sc-title-line">从用户确认，</span><span className="sc-title-line">到可回滚版本。</span></h2><p>每一阶段都有明确输入、产物和继续条件。失败时保留最近一次有效状态，避免整条链路重新开始。</p></header>
         <div className="sc-pipeline">
           <div><span>01</span><strong>需求契约</strong><p>确认目标、边界与验收标准。</p></div>
           <div><span>02</span><strong>统一蓝图</strong><p>组织知识、能力和工作流关系。</p></div>
