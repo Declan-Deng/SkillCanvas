@@ -56,7 +56,7 @@ export default function ShowcasePage() {
           <p className="sc-hero-summary">从一句目标开始，先看 AI 如何完成任务，再通过选项和资料，逐步校准你的<span className="sc-phrase">工作流程</span>、<span className="sc-phrase">判断标准</span>与<span className="sc-phrase">个人偏好</span>。生成后用<span className="sc-phrase">真实任务</span>验证效果，持续优化。</p>
           <div className="sc-actions">
             <a className="sc-button sc-button-primary" href={productUrl}>创建我的 Skill <ShowcaseArrow /></a>
-            <a className="sc-button sc-button-secondary" href="#method">看看它怎么工作</a>
+            <a className="sc-button sc-button-secondary" href="https://github.com/Declan-Deng/SkillCanvas" target="_blank" rel="noopener noreferrer"><span className="sc-github-icon" aria-hidden="true" />查看 GitHub 链接</a>
           </div>
         </div>
         <picture className="sc-hero-art">

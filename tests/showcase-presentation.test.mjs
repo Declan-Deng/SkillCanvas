@@ -99,6 +99,18 @@ test('first screen preserves the supplied headline and complete explanatory copy
   for (const phrase of ['工作流程', '判断标准', '个人偏好', '真实任务']) assert(page.includes(`<span className="sc-phrase">${phrase}</span>`));
 });
 
+test('hero GitHub link retains its button style and puts a local brand icon before the label', () => {
+  const hero = page.slice(page.indexOf('<header className="sc-hero"'), page.indexOf('</header>'));
+  assert.match(hero, /className="sc-button sc-button-secondary" href="https:\/\/github.com\/Declan-Deng\/SkillCanvas" target="_blank" rel="noopener noreferrer"><span className="sc-github-icon" aria-hidden="true" \/>查看 GitHub 链接<\/a>/);
+  assert(!hero.includes('看看它怎么工作'));
+  assert.match(css, /\.sc-github-icon \{[^}]*background: currentColor;[^}]*flex: 0 0 auto;[^}]*height: 20px;[^}]*width: 20px;[^}]*mask-image: url\("\/icons\/octicons\/mark-github-24.svg"\)/);
+  const icon = readFileSync(new URL('../public/icons/octicons/mark-github-24.svg', import.meta.url), 'utf8');
+  assert(icon.includes('viewBox="0 0 24 24"'));
+  assert(icon.includes('<path d='));
+  assert(!/<script|onload=|https?:/i.test(icon.replace('xmlns="http://www.w3.org/2000/svg"', '')));
+  assert(readFileSync(new URL('../public/icons/octicons/LICENSE', import.meta.url), 'utf8').includes('Copyright (c) 2026 GitHub Inc.'));
+});
+
 test('second screen explains all three problems and concludes with reusable, verifiable methods', () => {
   for (const text of ['为什么需要 SkillCanvas', '你有自己的工作方法，', '重新学。', '每次重新交代', '经验难以说清', '结果难以验证', '成为可复用、可验证的 AI Skill。']) assert(page.includes(text));
   assert(page.includes('className="sc-problem-card"'));
