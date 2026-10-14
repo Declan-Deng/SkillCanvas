@@ -1,6 +1,7 @@
 "use client";
 
 import { useId, useState } from "react";
+import { ShowcaseArrow } from "./showcase-arrow";
 
 type LoopStep = { title: string; detail: string; phase: string };
 
@@ -35,7 +36,7 @@ export function LoopDiagram({ steps }: { steps: LoopStep[] }) {
           <li>{node(1)}</li>
         </ol>
       </div>
-      <div className="showcase-cycle-entry" aria-hidden="true"><span>进入评测</span><b>↓</b></div>
+      <div className="showcase-cycle-entry" aria-hidden="true"><span>进入评测</span><ShowcaseArrow direction="down" /></div>
       <div className="showcase-cycle-track">
         <svg className="showcase-cycle-connectors" viewBox="0 0 900 330" preserveAspectRatio="none" aria-hidden="true">
           <defs>
@@ -61,7 +62,7 @@ export function LoopDiagram({ steps }: { steps: LoopStep[] }) {
           {steps.slice(2).map((step, index) => <li key={step.title}>{node(index + 2)}</li>)}
         </ol>
         <div className="showcase-cycle-center">
-          <strong>执行 → 评分 → 修复 → 再验证</strong>
+          <strong>执行 <ShowcaseArrow /> 评分 <ShowcaseArrow /> 修复 <ShowcaseArrow /> 再验证</strong>
         </div>
       </div>
       <div className={`showcase-cycle-detail ${current.phase === "Harness" ? "is-harness" : "is-loop"}`}>
@@ -71,7 +72,7 @@ export function LoopDiagram({ steps }: { steps: LoopStep[] }) {
           <p>{current.detail}</p>
         </div>
         <button type="button" onClick={() => setSelected(next)} aria-label={`查看下一步：${steps[next].title}`}>
-          {selected === steps.length - 1 ? "再看一轮" : "下一步"} <span aria-hidden="true">→</span>
+          {selected === steps.length - 1 ? "再看一轮" : "下一步"} <ShowcaseArrow />
         </button>
       </div>
     </div>

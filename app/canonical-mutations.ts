@@ -71,7 +71,7 @@ export function isAuthoredReferencePath(path: string) {
 
 /** Non-projected reference documents already are file-backed implementations.
  * Require a real active owner; don't silently drop the very file a repair needs. */
-export function validateImplementationFiles(ir: SkillIR, value: Record<string, unknown> = {}): Record<string, string> {
+export function validateImplementationFiles(ir: SkillIR | null, value: Record<string, unknown> = {}): Record<string, string> {
   const result: Record<string, string> = {};
   for (const [path, content] of Object.entries(value)) {
     if (COMPILER_OWNED_SEMANTIC_PATHS.has(path)) {
@@ -80,8 +80,8 @@ export function validateImplementationFiles(ir: SkillIR, value: Record<string, u
     if (!isRepairImplementationPath(path) || typeof content !== "string" || !content.trim()) {
       throw new Error(`IMPLEMENTATION_FILE_INVALID: ${path}；仅支持 scripts/assets 和非编译器管理的 references/*.md 或 *.txt，不能用文本冒充二进制文件`);
     }
-    if (path.startsWith("references/") && !ir.capabilities.some((item) => item.kind === "reference"
-      && item.necessity.decision !== "exclude" && item.implementation.path === path)) {
+    if (path.startsWith("references/") && !ir?.capabilities.some((item) => item.kind === "reference"
+      && item.necessity.decision !== "exclude" && item.implementation.status !== "not-needed" && item.implementation.path === path)) {
       throw new Error(`REFERENCE_OWNER_MISSING: ${path} 没有已启用的参考能力；请同时修改对应 capability 的 implementation 和 routingCondition`);
     }
     result[path] = content;

@@ -39,3 +39,7 @@ yarn-error.log*
 /outputs/
 /work/
 *.tsbuildinfo
+
+# Local diagnostic data and generated delivery artifacts
+/tmp/
+/output/

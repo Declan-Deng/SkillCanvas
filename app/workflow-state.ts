@@ -80,10 +80,12 @@ export function reconcileBlueprintProvenance<T extends BlueprintLike>(sections: 
     for (const term of terms) {
       if (!content.includes(term)) continue;
       const escaped = term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      // Mentioning a field in a requirement does not supply its runtime
+      // value. Only correct an explicit claim that the user has not chosen
+      // whether to require that field. Never rewrite missing-data policies,
+      // conditional tests, or quoted source facts by substring matching.
       const patterns = [
-        new RegExp(`(?:用户)?(?:尚未|没有|未)(?:明确|提及|提供)[^，。；\\n]{0,28}${escaped}[^，。；\\n]{0,18}`, "gi"),
-        new RegExp(`待确认[：:]?[^，。；\\n]{0,28}${escaped}[^，。；\\n]{0,18}`, "gi"),
-        new RegExp(`${escaped}[^，。；\\n]{0,16}(?:仍)?(?:待确认|未明确|不确定)`, "gi"),
+        new RegExp(`(?:用户)?(?:尚未|没有|未)(?:明确|确认)(?:是否|要不要)(?:需要|包含|输出|提供|采用|保留)${escaped}`, "g"),
       ];
       patterns.forEach((pattern) => {
         content = content.replace(pattern, (match) => {

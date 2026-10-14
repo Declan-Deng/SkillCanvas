@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-require-imports */
 const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
@@ -125,7 +126,7 @@ async function captureScreenshots() {
       });
       console.log('Captured: 09-model-settings.png');
       // Close modal if any
-      const escape = await desktopPage.evaluate(() => {
+      await desktopPage.evaluate(() => {
         document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
       });
     }

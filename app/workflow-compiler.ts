@@ -265,7 +265,7 @@ export function semanticIssueContradictsOwnMissingFieldClaim(evidence: string) {
 export function semanticIssueContradictsBundleBranchClaim(evidence: string, skill: string) {
   const normalizedEvidence = evidence.replace(/\s+/g, " ").trim();
   const quotedBranches = [
-    ...normalizedEvidence.matchAll(/(?:主文件|SKILL\.md|运行时|风险)?\s*分支[^“\"]{0,40}[“\"]([^”\"]{8,360})[”\"]/gi),
+    ...normalizedEvidence.matchAll(/(?:主文件|SKILL\.md|运行时|风险)?\s*分支[^“"]{0,40}[“"]([^”"]{8,360})[”"]/gi),
   ];
   return quotedBranches.some((match) => {
     const claim = match[1]?.trim();

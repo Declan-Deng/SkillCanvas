@@ -10,6 +10,59 @@ const node = (id, requires, produces, role = "transform", capabilityIds = ["core
   input: requires.join(", "), action: id, output: produces.join(", "), fallback: "Ask for the missing input; do not invent it", mutates: [],
 });
 
+test("a checkpoint owns its actual reply, not an undeclared mutable confirmation alias", async () => {
+  const context = { capabilities: [cap("core", "llm", "Code", "Review")], inputs: [], workflowSteps: [
+    node("review", ["$request"], ["$issues"]),
+    { ...node("await-confirmation", ["$issues", "$confirmed"], ["$input_required"], "await-input"),
+      input: "$issues", resumeProduces: ["$confirmed"], mutates: ["user_confirmation"] },
+    { ...node("explain", ["$issues", "$confirmed"], ["$output"], "deliver"), delivers: ["$issues"] },
+  ] };
+  const before = structuredClone(context);
+  const result = await repairWorkflowPlan(context, () => assert.fail("reply serialization does not need a model"));
+  const checkpoint = result.workflowSteps.find((step) => step.id === "await-confirmation");
+  assert.deepEqual(checkpoint.requires, ["$issues"]);
+  assert.deepEqual(checkpoint.mutates, []);
+  assert.deepEqual(checkpoint.resumeProduces, ["$confirmed"]);
+  assert.equal(checkpoint.role, "await-input");
+  assert.ok(result.workflowSteps.find((step) => step.id === "explain").requires.includes("$confirmed"));
+  assert.deepEqual(context, before);
+  assert.deepEqual(inspectWorkflowPlan({ ...context, workflowSteps: result.workflowSteps }).steps, result.workflowSteps);
+});
+
+test("reply normalization preserves declared state writes and explicit future-reply conditions", () => {
+  const context = { capabilities: [cap("core", "llm", "Code", "Review")], inputs: [], stateFields: ["user_confirmation"], workflowSteps: [
+    node("review", ["$request"], ["$issues"]),
+    { ...node("wait", ["$issues", "$confirmed"], ["$input_required"], "await-input"),
+      input: "$issues", when: "After $confirmed", resumeProduces: ["$confirmed"], mutates: ["user_confirmation"] },
+    { ...node("deliver", ["$issues", "$confirmed"], ["$output"], "deliver"), delivers: ["$issues"] },
+  ] };
+  const checked = inspectWorkflowPlan(context);
+  assert.equal(checked.valid, false);
+  assert.deepEqual(checked.steps.find((step) => step.id === "wait").mutates, ["user_confirmation"]);
+  assert.ok(checked.steps.find((step) => step.id === "wait").requires.includes("$confirmed"));
+});
+
+test("repair requests expose exact effect locks and never offer scripts as foldable helpers", async () => {
+  const context = { capabilities: [cap("core", "llm", "Code", "Review"), cap("check", "script", "Review", "Receipt")],
+    inputs: [], stateFields: ["reportState"], workflowSteps: [
+      { ...node("draft", ["$request"], ["report" ]), mutates: ["reportState"] },
+      node("step-capability-check", ["unbound:step-capability-check:input"], ["receipt"], "validate", ["check"]),
+      { ...node("deliver", ["report"], ["$output"], "deliver"), delivers: ["report"] },
+      node("broken", ["unknown"], ["unused"]),
+    ] };
+  let requests = 0;
+  await assert.rejects(repairWorkflowPlan(context, async (request) => {
+    requests++;
+    assert.deepEqual(request.constraints.stateFields, ["reportState"]);
+    assert.deepEqual(request.constraints.foldableStepIds, []);
+    assert.deepEqual(request.constraints.protectedSteps.find((step) => step.id === "draft").mutates, ["reportState"]);
+    assert.deepEqual(request.constraints.protectedSteps.find((step) => step.id === "step-capability-check").capabilityIds, ["check"]);
+    assert.ok(request.constraints.compilerIssues.some((issue) => issue.type === "unmet-dependency" && issue.stepId === "broken"));
+    return { stepUpdates: [] };
+  }), /WORKFLOW_DAG_INVALID/);
+  assert.equal(requests, 2);
+});
+
 for (const role of ["await-input", "await-approval"]) for (const placement of ["requires", "input", "when", "all"]) {
   test(`completion aliases bind atomically: ${role}, ${placement}, with reference metadata omitted`, async () => {
     const terminal = role === "await-input" ? "$input_required" : "$approval_required";
@@ -827,7 +880,8 @@ test("observed terse repair response inherits roles and control ownership, binds
   context.workflowSteps[0].input = "用户提供的简历PDF";
   context.capabilities[2] = { ...context.capabilities[2], optional: true, requirement: "Search and verify current sources", purpose: "Search for source evidence", activationCondition: "Only when a material claim needs fresh external verification" };
   const shortResponse = repaired.map((step) => {
-    const { role, ...short } = step;
+    const short = { ...step };
+    delete short.role;
     if (step.id === "extract-resume") return { ...short, input: "用户提供的简历PDF", requires: ["$resume_pdf"] };
     if (step.id === "rewrite-resume") return { ...short, capabilityIds: ["core"] };
     if (step.id === "collect-feedback") return { ...short, action: "等待用户反馈", capabilityIds: ["user"] };

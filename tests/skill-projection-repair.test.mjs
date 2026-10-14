@@ -56,7 +56,7 @@ test("canonical hash matches JSON persistence without hiding meaningful contract
   optional.capabilities[0].connection = undefined;
   optional.identity.unused = undefined;
   assert.equal(skillIRDigest(optional), skillIRDigest(JSON.parse(JSON.stringify(optional))));
-  const sparse = { ...optional, testMetadata: [undefined, , null, NaN, Infinity] };
+  const sparse = { ...optional, testMetadata: [undefined, undefined, null, NaN, Infinity] };
   assert.equal(skillIRDigest(sparse), skillIRDigest(JSON.parse(JSON.stringify(sparse))));
   const changed = structuredClone(ir);
   changed.identity.intent += "另外改变任务范围";

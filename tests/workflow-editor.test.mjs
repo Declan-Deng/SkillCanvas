@@ -7,10 +7,10 @@ import vm from "node:vm";
 function loadModule(path, dependencies = {}) {
   const source = fs.readFileSync(path, "utf8");
   const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } }).outputText;
-  const module = { exports: {} };
-  const context = vm.createContext({ module, exports: module.exports, require: (id) => dependencies[id], structuredClone });
+  const commonJsModule = { exports: {} };
+  const context = vm.createContext({ module: commonJsModule, exports: commonJsModule.exports, require: (id) => dependencies[id], structuredClone });
   new vm.Script(compiled, { filename: path }).runInContext(context);
-  return module.exports;
+  return commonJsModule.exports;
 }
 
 const workflowDag = loadModule("app/workflow-dag.ts", { "./host-evidence-adapters.ts": { hostEvidenceAdapter: () => null } });

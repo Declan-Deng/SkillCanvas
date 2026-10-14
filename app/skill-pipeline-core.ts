@@ -94,6 +94,8 @@ export type OpenSkillQualityReport = {
 
 export type ScopedCapability = {
   id?: string;
+  name?: string;
+  requirement?: string;
   kind?: string;
   path?: string;
   scope?: CapabilityScope;
@@ -105,6 +107,7 @@ export type ScopedCapability = {
   enabled?: boolean;
   status?: string;
   evaluationCriteria?: string[];
+  optional?: boolean;
   necessity?: {
     successLift: "high" | "medium" | "low";
     bareModelReliable: boolean;

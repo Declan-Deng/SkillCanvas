@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { canonicalBuildContext, generationAttemptBudget, generationClientBudget } from "../app/generation-request.ts";
+import { canonicalBuildContext, generationAttemptBudget, generationClientBudget, structuredAttemptTimeout } from "../app/generation-request.ts";
 
 test("canonical build removes only repeated projections, preserving complete contract and final decisions", () => {
   const ir = {
@@ -21,6 +21,14 @@ test("canonical build removes only repeated projections, preserving complete con
   assert.equal(result.userProvidedMaterial, body.sourceText);
   assert.deepEqual(body, snapshot, "transport must not modify the saved instance");
   assert.doesNotMatch(JSON.stringify(result), /duplicate-blueprint|duplicate-plan|duplicate-loop/);
+});
+
+test("browser deadlines cover both server attempts for every structured operation", () => {
+  for (const provider of ["deepseek", "openai", "compatible"]) {
+    for (const mode of ["interview", "preview", "blueprint-foundation", "blueprint-capabilities", "blueprint-workflow", "workflow-repair", "eval-grade", "eval-execute", "demo", "evaluate", "personalize"]) {
+      assert.ok(generationClientBudget(mode, provider) > structuredAttemptTimeout(mode, 1, provider) + structuredAttemptTimeout(mode, 2, provider), `${provider}/${mode}`);
+    }
+  }
 });
 
 test("missing or legacy canonical contracts keep the legacy prompt inputs", () => {

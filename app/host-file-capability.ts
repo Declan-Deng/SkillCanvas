@@ -7,5 +7,5 @@ export const HOST_FILE_WORKSPACE_CAPABILITY = {
   output: "可验证的文件内容或明确的文件变更", fallback: "请用户粘贴必要内容，或只给出不会冒充已写入文件的操作说明",
   routingCondition: "任务明确涉及已有文件、项目目录或文件交付时", deterministicAdvantage: "宿主直接读写文件比让模型猜测内容可靠",
   evaluationCriteria: ["只访问任务范围内文件", "修改结果可定位并可复核"], optional: true, enabled: false, recommended: false,
-  category: "文件与内容", hosts: ["Codex", "Claude Code", "Cursor", "Gemini CLI"],
+  category: "文件与内容" as const, hosts: ["Codex", "Claude Code", "Cursor", "Gemini CLI"],
 };

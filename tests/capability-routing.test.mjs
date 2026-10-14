@@ -140,6 +140,28 @@ test("folding a duplicate reader retains its consumed product on the real extrac
   assert.throws(() => applyWorkflowStepPatch(steps.map((step) => step.id === helper.id ? { ...step, mutates: ["state"] } : step), payload, catalog), /不能合并/);
 });
 
+test("a validated reader fold survives the full repair preservation gate, not only patch application", async () => {
+  const core = { id: "core", kind: "llm", input: "Materials", output: "Report", fallback: "Stop" };
+  const context = { inputs: [], capabilities: [core, catalog.find((item) => item.id === "host-document-reading")], workflowSteps: [
+    node("extract", ["$source"], ["facts"], "read", ["host-document-reading"]),
+    node("step-capability-host-document-reading", ["$source"], ["facts"], "read", ["host-document-reading"]),
+    node("compose", ["facts"], ["report"], "transform", ["core"]),
+    { ...node("deliver", ["report"], ["$output"], "deliver", ["core"]), delivers: ["report"] },
+  ] };
+  const original = structuredClone(context);
+  assert.equal(inspectWorkflowPlan(context).valid, false);
+  const result = await repairWorkflowPlan(context, async (request) => {
+    assert.ok(request.constraints.foldableStepIds.includes("step-capability-host-document-reading"));
+    return { stepUpdates: [{ id: "extract", changes: { action: "Read source with the host parser and reuse the actual parsed facts" } }],
+      foldedSteps: [{ id: "step-capability-host-document-reading", intoStepId: "extract" }] };
+  });
+  assert.equal(result.attempts, 1);
+  assert.equal(result.workflowSteps.length, 3);
+  assert.ok(result.workflowSteps.find((step) => step.id === "extract").produces.includes("facts"));
+  assert.ok(result.workflowSteps.find((step) => step.id === "compose").requires.includes("facts"));
+  assert.deepEqual(context, original);
+});
+
 test("unknown capability ids are rejected before rebinding creates phantom tool nodes", async () => {
   const core = { id: "core", kind: "llm", input: "Source", output: "Report", fallback: "Stop" };
   const context = { inputs: [], capabilities: [core], workflowSteps: [node("compose", ["missing"], ["report"], "transform", ["core"]),

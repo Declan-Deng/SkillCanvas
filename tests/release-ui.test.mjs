@@ -65,14 +65,14 @@ test("quick-start options stretch equally and new controls have focus and narrow
 test("question toggle shares tag dimensions, capability heading has an icon, and only pending steps are muted", async () => {
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
-  assert.match(css, /\.question-meta\s*\{[^}]*--question-tag-height: 20px;/);
-  assert.match(css, /\.question-meta i,\s*\.question-multiple-toggle\s*\{[^}]*font-size: 8\.75px;[^}]*height: var\(--question-tag-height\);[^}]*padding: 0 6px;/);
+  assert.match(css, /\.question-meta\s*\{[^}]*--question-tag-height: 24px;/);
+  assert.match(css, /\.question-meta i,\s*\.question-multiple-toggle\s*\{[^}]*font-size: var\(--app-type-caption, 8\.75px\);[^}]*height: var\(--question-tag-height\);[^}]*padding: 0 6px;/);
   assert.match(page, /className="question-index"[\s\S]*?className="question-number"[\s\S]*?className="question-dimension"/);
   assert.match(css, /\.question-index\s*\{[^}]*display: grid;[^}]*gap: 9px;/);
   assert.doesNotMatch(css, /\.question-multiple-toggle\s*\{[^}]*min-height:/);
   assert.match(css, /\.question-multiple-toggle::after\s*\{[^}]*inset: -12px -4px;/);
   assert.match(page, /className="capability-library-title"><img src="\/icons\/tabler\/plug.svg" alt="" aria-hidden="true" \/>添加能力/);
-  assert.match(css, /\.capability-library-control strong\s*\{[^}]*font-size: 18px;/);
+  assert.match(css, /\.capability-library-control strong\s*\{[^}]*font-size: var\(--app-type-title, 18px\);/);
   assert.match(css, /\.step-item:not\(\.active\):not\(\.done\)\s*\{[^}]*color: #6c7571;/);
   assert.match(css, /\.step-item:not\(\.active\):not\(\.done\) \.step-index\s*\{[^}]*border-color: #c3cbc6;/);
   assert.doesNotMatch(css, /\.step-item:hover\s*\{/);

@@ -17,10 +17,9 @@ test("hero asset uses a right-sized transparent fallback and an AVIF source", ()
   assert.match(page, /src="\/skillcanvas-hero-helper-emoji-512\.png" width="512" height="512"/);
 });
 
-test("quick-start text is 25 percent smaller without reducing its hit target", () => {
+test("quick-start text follows the product control scale without reducing its hit target", () => {
   const rule = css.match(/\.starter-row button\s*\{([^}]+)\}/)[1];
-  assert.match(rule, /font-size: 10\.5px;/);
-  assert.equal(10.5 / 14, .75);
+  assert.match(rule, /font-size: var\(--app-type-label, 10\.5px\);/);
   assert.match(rule, /min-height: 44px;/);
 });
 
@@ -107,10 +106,10 @@ test("workflow recommendation keeps the decision and removes redundant explanati
   assert.match(page, /<h3>工作流<\/h3>/);
   assert.match(css, /\.loop-plan-card\s*\{[^}]*background: rgba\(255, 255, 255, 0\.58\);[^}]*border: 1px solid var\(--line\);/);
   assert.match(css, /\.workflow-editor\s*\{[^}]*background: #17211f;/);
-  assert.match(css, /\.workflow-step-card\s*\{[^}]*height: 230px;/);
+  assert.match(css, /\.workflow-step-card\s*\{[^}]*min-height: 300px;/);
   assert.match(css, /\.adopted-capability-grid \.capability-icon\s*\{[^}]*background: transparent;/);
-  assert.match(css, /\.ai-output-scroll pre\s*\{[^}]*font-size: 10\.1px;/);
-  assert.match(css, /\.busy-execution-status p\s*\{[^}]*color: var\(--ink\);[^}]*font-size: 10\.4px;/);
+  assert.match(css, /\.ai-output-scroll pre\s*\{[^}]*font-size: var\(--app-type-code, 10\.1px\);/);
+  assert.match(css, /\.busy-execution-status p\s*\{[^}]*color: var\(--ink\);[^}]*font-size: var\(--app-type-label, 10\.4px\);/);
   assert.match(page, /Math\.min\(2_750, Math\.max\(1_300, maxScroll \* 3\.125\)\)/);
   assert.match(page, /1 - Math\.pow\(1 - progress, 3\)/);
 });

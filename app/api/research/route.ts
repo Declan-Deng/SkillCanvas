@@ -201,14 +201,15 @@ export async function POST(request: Request) {
     const body = await request.json() as RequestBody;
     const credentialState = await readServerCredentialState(tenant.tenantId);
     const stored = credentialState.config;
-    const requestedProvider = body.provider;
-    const provider: ResearchProviderId = credentialState.researchManaged
-      ? requestedProvider === "deepseek" && stored?.provider === "deepseek"
-        ? "deepseek"
-        : requestedProvider === stored?.researchProvider
-          ? requestedProvider
-          : stored?.researchProvider || "disabled"
-      : requestedProvider || stored?.researchProvider || "disabled";
+    const requestedProvider = (["disabled", "firecrawl", "searxng", "deepseek"] as ResearchProviderId[]).includes(body.provider as ResearchProviderId)
+      ? body.provider as ResearchProviderId
+      : undefined;
+    let provider: ResearchProviderId = requestedProvider || stored?.researchProvider || "disabled";
+    if (credentialState.researchManaged) {
+      if (requestedProvider === "deepseek" && stored?.provider === "deepseek") provider = "deepseek";
+      else if (requestedProvider && requestedProvider === stored?.researchProvider) provider = requestedProvider;
+      else provider = stored?.researchProvider || "disabled";
+    }
     if (!(["firecrawl", "searxng", "deepseek"] as ResearchProviderId[]).includes(provider)) return Response.json({ error: "尚未配置可用的专业知识联网服务" }, { status: 400 });
     const queries = body.action === "test" ? [provider === "deepseek" ? "DeepSeek API official documentation" : "Firecrawl search documentation"] : Array.isArray(body.queries)
       ? Array.from(new Set(body.queries.filter((item): item is string => typeof item === "string").map((item) => item.replace(/\s+/g, " ").trim().slice(0, 180)).filter(Boolean))).slice(0, 4)

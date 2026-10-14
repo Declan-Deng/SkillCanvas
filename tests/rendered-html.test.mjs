@@ -21,14 +21,16 @@ async function render() {
 test("evaluation UI hides unobserved rows and counts without changing optimization targets", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   const css = await readFile(new URL("../app/globals.css", import.meta.url), "utf8");
-  const reportStart = page.indexOf('<section className="eval-report-panel expanded"');
+  const reportStart = page.indexOf('<details className="eval-report-panel eval-full-results"');
   const report = page.slice(reportStart, page.indexOf('<div className="finding-card"', reportStart));
   assert.match(report, /formalComparisonRows\.length > 0 \? formalComparisonRows\.map/);
   assert.match(report, /formalImprovementRows\.length/);
   assert.match(report, /formalGapRows\.length/);
   assert.match(page, /async function openOptimization\(index: number\)/);
   assert.doesNotMatch(report, /pendingEvals|还没测到|还没有测到|为什么还不能判断|换场景验证/);
-  assert.match(report, /裸模型 vs 当前 Skill · 同题匿名对照/);
+  assert.match(report, /普通 AI 与你的 Skill · 使用同一测试任务/);
+  assert.match(report, /查看完整测试结果/);
+  assert.doesNotMatch(report.slice(0, report.indexOf("<summary>")), /\bopen(?:=|\s|>)/);
   assert.match(report, /这份 Skill 带来的具体提升/);
   assert.doesNotMatch(report, /内部观察分|\/100|验证分/);
   assert.match(css, /\.eval-report-counts\s*\{[^}]*repeat\(2, minmax\(72px, 1fr\)\)/);
@@ -114,7 +116,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /version:\s*EVAL_COMPILER_VERSION/);
   assert.match(page, /本用例携带的代表性输入材料如下，必须实际处理这些内容/);
   assert.match(page, /本用例没有携带核心输入材料/);
-  assert.match(page, /__previewInput:\s*skillDemo\?\.userPrompt\s*\|\|\s*discoveryPreview\?\.sampleInput/);
+  assert.match(page, /__previewInput:\s*skillDemo\?\.userPrompt\s*\|\|\s*\(previewFixtureMatchesAnswers\(interviewRounds\[0\]\.questions, answers\)/);
   assert.match(page, /JSON\.stringify\(publicContract\)\.length\s*>\s*12_000/);
   assert.match(route, /Keep each output at or below 2500 characters/);
   assert.match(page, /function createEvalRunner\(/);
@@ -165,7 +167,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /function reconcileConfirmedContentPolicy\(/);
   assert.match(page, /function normalizeEvalResults\(/);
   assert.match(page, /function normalizeSkillDemo\(/);
-  assert.match(page, /function createPersonalizedFeedbackOptions\(/);
+  assert.doesNotMatch(page, /function createPersonalizedFeedbackOptions\(/);
+  assert.match(page, /normalizeDemoFeedbackOptions/);
+  assert.match(page, /normalized\.some\(hasObservedDemoMismatch\)/);
   assert.match(page, /function createDemoFeedbackFallback\(/);
   assert.match(page, /function WaitingDotField\(/);
   assert.match(page, /setBusyOutputText\(data\.content\.slice\(0, 16_000\)\)/);
@@ -272,7 +276,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /optimizationHistory/);
   assert.match(page, /新 Demo/);
   assert.match(page, /async function repairSkill\(/);
-  assert.match(page, /callAI<\{ updatedFiles\?: Record<string, unknown>/);
+  assert.match(page, /callAI<StaticRepairPayload>/);
+  assert.match(page, /staticRepairReplacements\(repairedResult, currentFiles, parseCanonicalSkillIR\(currentFiles\), p0Issues\)/);
   assert.match(page, /AI 修复并重新评估/);
   assert.match(page, /AI 正在修复发布前问题/);
   assert.doesNotMatch(page, /文件发布检查已通过|还有少量不会阻止下载的提醒/);
@@ -307,7 +312,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /mode === "optimization-patch-plan"/);
   assert.match(route, /mode === "optimization-research"/);
   assert.match(route, /compactSkillBundleForOptimization/);
-  assert.match(route, /attempt === 1 && body\.mode !== "eval-execute"/);
+  assert.match(route, /attempt === 1 && \(body\.mode !== "eval-execute" \|\| singleExecution\)/);
   assert.match(route, /"eval-grade", "eval-compare"\]\.includes\(body\.mode\)/);
   assert.match(route, /BASELINE MODE/);
   assert.match(route, /Obey the supplied mutation budget exactly/);
@@ -413,7 +418,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(page, /<strong className="capability-library-title"><img[^>]*\/>添加能力<\/strong>/);
   assert.doesNotMatch(page, /宿主 Tools 与外部 MCP 分开选择/);
   assert.match(page, /function explainSkillFile\(/);
-  assert.match(page, /里面具体有什么/);
+  assert.match(await readFile(new URL("../app/skill-file-workspace.tsx", import.meta.url), "utf8"), /里面具体有什么/);
   assert.match(page, /确认并生成下一版 Demo/);
   assert.match(page, /已经采用的建议/);
   assert.match(page, /feedbackRequirementMutations/);
@@ -471,7 +476,9 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.doesNotMatch(page, /files\["references\/confirmed-content-policy\.md"\] =/);
   assert.match(page, /## Content transformation/);
   assert.match(page, /Compiler、Manifest、Eval、运行指标与全部文件/);
-  assert.match(page, /className="skill-file-editor"/);
+  const fileWorkspace = await readFile(new URL("../app/skill-file-workspace.tsx", import.meta.url), "utf8");
+  assert.match(page, /<SkillFileWorkspace/);
+  assert.match(fileWorkspace, /className="skill-file-editor"/);
   assert.match(page, /function updateSelectedFileContent\(/);
   assert.match(page, /完整 Skill 文件/);
   assert.match(page, /release-skill-preview/);
@@ -508,7 +515,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(route, /create references\/source-evidence\.md/);
   assert.match(route, /filename and page marker/);
   assert.match(route, /MAX_OUTPUT_TOKENS/);
-  assert.match(route, /42_000/);
+  assert.match(route, /return structuredAttemptTimeout\(mode, attempt, provider\)/);
   assert.match(route, /ai_request_started/);
   assert.match(route, /ai_repair_payload/);
   assert.match(route, /requestBody\.thinking = \{ type: "disabled" \}/);
@@ -603,8 +610,8 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
   assert.match(css, /\.release-skill-preview/);
   assert.match(css, /grid-template-areas:\s*"icon name action" "icon state action"/);
   assert.doesNotMatch(css, /\.selection-note/);
-  assert.match(css, /font-size:\s*17px/);
-  assert.match(css, /font-size:\s*clamp\(46px, 5\.4vw, 74px\)/);
+  assert.match(css, /--app-type-body:\s*16px/);
+  assert.match(css, /--app-type-display:\s*clamp\(46px, 5\.4vw, 74px\)/);
   assert.match(css, /min-height:\s*100dvh/);
   assert.match(css, /--coral:\s*#c94b38/);
   assert.match(css, /brief-content-enter 420ms var\(--ease-out\)/);
@@ -614,7 +621,7 @@ test("keeps the generator compiler, privacy gate, and prompts wired", async () =
 test("validation navigation paints before evaluation starts and exposes exact search queries", async () => {
   const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
   assert.match(page, /evaluationLaunchPendingRef/);
-  assert.match(page, /setStep\("evaluate"\)[\s\S]{0,500}requestAnimationFrame/);
+  assert.match(page, /setStep\("evaluate"\)[\s\S]{0,1800}requestAnimationFrame/);
   assert.match(page, /查看实际发送的检索问题/);
   assert.match(page, /phase: "knowledge-query-plan"/);
   assert.match(page, /queries: selectedQueries/);

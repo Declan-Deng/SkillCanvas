@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { validateBundleContentCoherence, validateBundleStructure } from "../app/bundle-validator.ts";
+import { buildFailureEvidence, missingIndependentScriptTests, validateBundleContentCoherence, validateBundleStructure } from "../app/bundle-validator.ts";
+import { staticRepairReplacements } from "../app/static-repair-contract.ts";
 import { resolveContentPermission } from "../app/evidence-gates.ts";
 
 function baseBundle() {
@@ -16,6 +17,20 @@ function baseBundle() {
     "evals/artifact_checker.py": "# skillcanvas-owned-artifact-checker:v1\ndef inspect_bundle(root):\n    return {}\n",
   };
 }
+
+test("external provenance paths do not create phantom P0 dependencies, but runtime local paths still do", () => {
+  const files = baseBundle();
+  files["SKILL.md"] += "Read [playbook](references/domain-playbook.md).\n";
+  files["references/domain-playbook.md"] = '- Source support: {"quote":"[references/onboarding-contract.md](https://example.com/skill/references/onboarding-contract.md)"}\n- Proposed action: Ask the user to choose between the identified tradeoffs.\n';
+  assert.equal(validateBundleStructure(files).executionReady, true);
+  files["references/domain-playbook.md"] += "Read references/actual-local.md before delivering.\n";
+  const failed = validateBundleStructure(files);
+  assert.equal(failed.executionReady, false);
+  assert.deepEqual(failed.issues.filter((issue) => issue.code === "MISSING_REFERENCED_FILE").map((issue) => issue.path), ["references/actual-local.md"]);
+  assert.match(buildFailureEvidence(failed, []).join("\n"), /MISSING_REFERENCED_FILE.*references\/actual-local.md/);
+  assert.ok(buildFailureEvidence(failed, ["User confirmation is missing"]).includes("User confirmation is missing"));
+  assert.deepEqual(buildFailureEvidence(validateBundleStructure(baseBundle()), []), []);
+});
 
 test("deterministic validator separates execution blockers from contract blockers", () => {
   const files = baseBundle();
@@ -40,6 +55,25 @@ test("structurally valid bundle clears the deterministic P0 gate", () => {
   assert.equal(result.executionReady, true);
   assert.equal(result.contractReady, true);
   assert.deepEqual(result.issues, []);
+});
+
+test("missing independent script tests enter the shared P0 file repair gate before Eval", () => {
+  const files = { ...baseBundle(), "scripts/process_records.py": "def total(values):\n    return sum(values)\n" };
+  const original = structuredClone(files);
+  const checked = validateBundleStructure(files);
+  const path = "evals/script-tests/test_process_records.py";
+  const issue = checked.issues.find((item) => item.path === path);
+  assert.equal(checked.executionReady, false);
+  assert.equal(issue.code, "MISSING_REQUIRED_FILE");
+  assert.equal(issue.repairRoute, "static-execution");
+  assert.deepEqual(missingIndependentScriptTests(files), [{ scriptPath: "scripts/process_records.py", testPath: path }]);
+  const testBytes = "import unittest\nfrom scripts.process_records import total\nclass Checks(unittest.TestCase):\n    def test_total(self):\n        self.assertEqual(total([2, 3]), 5)\n    def test_empty(self):\n        self.assertEqual(total([]), 0)\n    def test_invalid(self):\n        with self.assertRaises(TypeError):\n            total(None)\n";
+  const replacements = staticRepairReplacements({ canonicalMutations: [], updatedFiles: { [path]: testBytes } }, files, null, checked.issues);
+  const repaired = { ...files, ...replacements };
+  assert.equal(validateBundleStructure(repaired).executionReady, true, "presence routing is separate from actual Python test execution");
+  assert.deepEqual(missingIndependentScriptTests(repaired), []);
+  assert.deepEqual(files, original);
+  assert.equal(validateBundleStructure({ ...repaired, [path]: "" }).executionReady, false);
 });
 
 test("frontmatter enforces portable Agent Skill name and description limits", () => {

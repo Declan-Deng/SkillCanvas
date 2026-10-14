@@ -532,6 +532,7 @@ type CapabilityInput = {
   activationCondition?: string;
   affects?: string[];
   mustNotAffect?: string[];
+  optional?: boolean;
   enabled?: boolean;
   connection?: { server: string; tools: string[]; verified: boolean };
   necessity?: Omit<SkillIRCapability["necessity"], "reason">;

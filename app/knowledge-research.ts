@@ -932,7 +932,9 @@ export function buildOptimizationResearchQueries(domain: string, gaps: string[])
   return uniqueGaps.map((gap, index) => `${cleanedDomain} ${gap} ${hints[index % hints.length]}`.trim());
 }
 
-export function knowledgePackIsPublishable(pack: KnowledgePack | null | undefined): pack is KnowledgePack {
+export function knowledgePackIsPublishable(pack: KnowledgePack): boolean;
+export function knowledgePackIsPublishable(pack: KnowledgePack | null | undefined): pack is KnowledgePack;
+export function knowledgePackIsPublishable(pack: KnowledgePack | null | undefined): boolean {
   return Boolean(pack
     && (pack.status === "ready" || pack.status === "partial")
     && pack.atoms.length > 0

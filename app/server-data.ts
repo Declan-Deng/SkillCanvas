@@ -47,7 +47,7 @@ declare global {
   var __skillCanvasDatabaseSchemaVersion: number | undefined;
 }
 
-export type WorkflowRunStatus = "queued" | "running" | "input_required" | "approval_required" | "completed" | "failed" | "cancelled";
+export type WorkflowRunStatus = "queued" | "running" | "retry_scheduled" | "input_required" | "approval_required" | "completed" | "failed" | "cancelled";
 export type WorkflowNodeStatus = "pending" | "running" | "input_required" | "approval_required" | "completed" | "failed" | "skipped";
 
 export type StoredWorkflowRun = {
@@ -314,7 +314,7 @@ export async function readMcpConnection(tenantId: string, connectionId: string):
   };
 }
 
-export async function listMcpConnections(tenantId: string) {
+export async function listMcpConnections(tenantId: string): Promise<Array<{ id: string; name: string; serverUrl: string; configured: boolean; updatedAt: string }>> {
   const db = runtime().DB;
   if (!db) {
     const values = await Promise.all([...((globalThis.__skillCanvasMcpConnectionFallback ||= new Map()).entries())]
@@ -325,7 +325,13 @@ export async function listMcpConnections(tenantId: string) {
   await ensureTables(db);
   const rows = await db.prepare("SELECT id, name, server_url as serverUrl, updated_at as updatedAt FROM skillcanvas_mcp_connections WHERE tenant_id = ? ORDER BY updated_at DESC")
     .bind(tenantId).all<Record<string, unknown>>();
-  return (rows.results || []).map((row) => ({ ...row, configured: true }));
+  return (rows.results || []).map((row) => ({
+    id: String(row.id),
+    name: String(row.name),
+    serverUrl: String(row.serverUrl),
+    configured: true,
+    updatedAt: String(row.updatedAt),
+  }));
 }
 
 export async function deleteMcpConnection(tenantId: string, connectionId: string) {

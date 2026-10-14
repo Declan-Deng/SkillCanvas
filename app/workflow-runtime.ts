@@ -269,7 +269,10 @@ export async function failWorkflowNode(tenantId: string, runId: string, nodeId: 
   };
   const updatedRun: StoredWorkflowRun = {
     ...snapshot.run,
-    status: retryable ? "queued" : "failed",
+    // A browser journal cannot execute the handler again by itself. Mark the
+    // checkpoint truthfully as retryable instead of pretending queued work is
+    // actively scheduled. A later claim explicitly resumes this same node.
+    status: retryable ? "retry_scheduled" : "failed",
     currentNodeId: nodeId,
     error: errorValue,
     version: snapshot.run.version + 1,

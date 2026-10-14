@@ -12,6 +12,10 @@ const ALLOWED_EVENTS = new Set([
   "generation_loop_candidate",
   "generation_loop_finished",
   "generation_loop_failed",
+  "evaluation_started",
+  "evaluation_blocked",
+  "evaluation_finished",
+  "evaluation_failed",
   "ai_client_timeout",
   "ai_client_transport_retry",
   "ai_client_network_error",
@@ -70,6 +74,8 @@ export async function POST(request: Request) {
     ? "browser-notification"
     : event.startsWith("ai_client")
     ? (typeof body.mode === "string" ? body.mode.replace(/[\r\n]+/g, " ").slice(0, 60) : "ai-client")
+    : event.startsWith("evaluation_")
+    ? "evaluation"
     : event.startsWith("generation_loop")
     ? "generation-loop"
     : event.startsWith("repair_gate")

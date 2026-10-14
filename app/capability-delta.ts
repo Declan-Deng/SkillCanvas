@@ -70,7 +70,6 @@ export function normalizeCapabilityDelta(value: unknown): CapabilityDelta {
     const taskDecision = clean(candidate.taskDecision, "", 260);
     const requiredSkillBehavior = clean(candidate.requiredSkillBehavior, "", 420);
     const whySkillIsNeeded = clean(candidate.whySkillIsNeeded, "", 360);
-    const combined = `${taskDecision} ${requiredSkillBehavior} ${whySkillIsNeeded}`;
     if (!capabilityDeltaGapIsDefensible({
       taskDecision,
       bareModelBehavior: clean(candidate.bareModelBehavior, "", 360),
@@ -83,7 +82,7 @@ export function normalizeCapabilityDelta(value: unknown): CapabilityDelta {
     if (seen.has(key)) return [];
     seen.add(key);
     const researchQuestions = list(candidate.researchQuestions, 8, 260);
-    const knowledgeNeed = candidate.knowledgeNeed === "contract-only" || candidate.knowledgeNeed === "external"
+    const knowledgeNeed: CapabilityDeltaGap["knowledgeNeed"] = candidate.knowledgeNeed === "contract-only" || candidate.knowledgeNeed === "external"
       ? candidate.knowledgeNeed
       : researchQuestions.length ? "external" : "contract-only";
     return [{

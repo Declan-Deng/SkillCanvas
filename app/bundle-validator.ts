@@ -4,6 +4,7 @@ import { capabilityDeltaGapIsDefensible, type CapabilityDeltaGap } from "./capab
 import { knowledgeRequirementBypassReason } from "./knowledge-contract.ts";
 import { danglingPromptDelimiter } from "./eval-prompt.ts";
 import { isFactualScopeAuthorized, type ContentPermission } from "./evidence-gates.ts";
+import { runtimeFileMentions } from "./gate-rules.ts";
 
 export type BundleIssuePriority = "P0" | "P1";
 export type BundleIssueCategory = "P0_EXECUTION_BLOCKER" | "P1_CONTRACT_BLOCKER";
@@ -33,6 +34,15 @@ export type BundleStaticValidation = {
   checks: BundleStaticCheck[];
 };
 
+/** Preserve execution failures when semantic repair was intentionally skipped.
+ * Reporting an empty P1 issue list must never turn a failed P0 gate green. */
+export function buildFailureEvidence(validation: BundleStaticValidation, contractEvidence: string[]) {
+  return [...new Set([
+    ...validation.issues.map((issue) => `[${issue.code}] ${issue.path || "bundle"}: ${issue.message}`),
+    ...contractEvidence,
+  ].filter(Boolean))];
+}
+
 const REQUIRED_HARNESS = [
   "evals/capability-manifest.json",
   "evals/evals.json",
@@ -42,7 +52,6 @@ const REQUIRED_HARNESS = [
   "evals/artifact_checker.py",
 ];
 
-const RUNTIME_FILE_REFERENCE = /\b(?:references|scripts|assets|integrations)\/[A-Za-z0-9_./-]+\.(?:md|json|py|sh|csv|tsv|txt|ya?ml|html|xlsx?)\b/g;
 const PROMPT_TEMPLATE_SIGNAL = /(?:相邻任务|complete the task|do the task|待替换|在此(?:填写|输入)|placeholder|示例任务(?:\s*\d+)?)/i;
 const GENERIC_INPUT_SIGNAL = /^(?:用户)?(?:补充|其他|相关|必要|更多|通用)?(?:的)?(?:输入|信息|资料|内容|上下文|材料)$/i;
 const VAGUE_TASK_INPUT_SIGNAL = /^(?:我)?(?:不确定[,，；;\s]*)?(?:请)?\s*(?:AI|模型)?\s*(?:帮我)?(?:判断|决定|处理)|^(?:当前)?(?:任务)?(?:说明)?与(?:所需)?材料$/i;
@@ -74,6 +83,18 @@ export function classifyBundleIssue(code: string): Pick<BundleStaticIssue, "prio
   return executionBlocker
     ? { priority: "P0", category: "P0_EXECUTION_BLOCKER", detector: "deterministic", repairRoute: "static-execution" }
     : { priority: "P1", category: "P1_CONTRACT_BLOCKER", detector: "deterministic", repairRoute: "semantic-contract" };
+}
+
+/** Shared Build/release requirement. Report the actual missing test path so
+ * static file repair can supply it before Eval, not only at the final UI. */
+export function missingIndependentScriptTests(files: Record<string, string>) {
+  return Object.keys(files).filter((path) => path.startsWith("scripts/") && path.endsWith(".py"))
+    .flatMap((scriptPath) => {
+      const stem = scriptPath.split("/").pop()!.replace(/\.py$/, "");
+      const exists = Object.entries(files).some(([path, content]) => path.startsWith("evals/script-tests/")
+        && path.endsWith(".py") && path.includes(stem) && content.trim());
+      return exists ? [] : [{ scriptPath, testPath: `evals/script-tests/test_${stem}.py` }];
+    });
 }
 
 function safeBundlePath(path: string) {
@@ -383,6 +404,9 @@ export function validateBundleStructure(files: Record<string, string>): BundleSt
   REQUIRED_HARNESS.forEach((path) => {
     if (!files[path]?.trim()) pushIssue(issues, "MISSING_REQUIRED_FILE", path, `缺少运行所需文件：${path}`);
   });
+  for (const { scriptPath, testPath } of missingIndependentScriptTests(files)) {
+    pushIssue(issues, "MISSING_REQUIRED_FILE", testPath, `生成脚本 ${scriptPath} 缺少独立 unittest：${testPath}`);
+  }
   let manifestDeclaresSkillIR = false;
   try {
     const manifest = JSON.parse(files["evals/capability-manifest.json"] || "{}") as { version?: string; skill_ir?: unknown };
@@ -420,7 +444,7 @@ export function validateBundleStructure(files: Record<string, string>): BundleSt
     .filter(([path]) => path === "SKILL.md" || path.startsWith("references/"))
     .map(([, content]) => content)
     .join("\n");
-  const references = [...new Set(runtimeText.match(RUNTIME_FILE_REFERENCE) || [])];
+  const references = runtimeFileMentions(runtimeText);
   references.filter((path) => !files[path]?.trim()).forEach((path) => {
     pushIssue(issues, "MISSING_REFERENCED_FILE", path, `运行时引用指向不存在的文件：${path}`);
   });

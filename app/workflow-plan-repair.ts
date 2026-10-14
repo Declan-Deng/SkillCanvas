@@ -15,6 +15,17 @@ export type WorkflowPlanContext = {
   stateFields?: string[];
 };
 
+/** Compatibility entry point for deterministic, lossless normalization only.
+ * Branch topology, approvals and mutable tool effects are task semantics; they
+ * cannot be rebuilt from array order. Invalid plans need bounded field repair. */
+export function compileDeterministicWorkflowPlan(context: WorkflowPlanContext): WorkflowDagStep[] {
+  const inspected = inspectWorkflowPlan(context);
+  if (!inspected.valid) throw new Error(
+    `WORKFLOW_DAG_INVALID: 需要保留业务语义的定向修复：${inspected.issues.join("；")}`,
+  );
+  return inspected.ordered;
+}
+
 const normalizedLabel = (value: string) => value.replace(/^(?:\$|input:|input-|custom-)+/g, "").replace(/[\s_.:\-/]+/g, "").toLowerCase();
 const fileAlias = /[_-](pdf|docx?|txt|csv|xlsx?|json|png|jpe?g|md|text)$/i;
 const canonicalReplyToken = (token: string) => {
@@ -267,6 +278,36 @@ function bindDeclaredStateReads(steps: WorkflowDagStep[], stateFields: string[])
   });
 }
 
+/** An undeclared confirmation alias owned by a real checkpoint is a reply,
+ * not a shared state variable. Do not ask the checkpoint to read its own
+ * future reply before pausing. Declared state, other writers and ambiguous
+ * ownership remain untouched; they need explicit state/effect repair. */
+function bindCheckpointEventInputs(steps: WorkflowDagStep[], stateFields: string[]) {
+  const declared = new Set(stateFields);
+  const owners = new Map<string, Set<string>>();
+  for (const step of steps) for (const token of [...step.produces, ...(step.resumeProduces || [])]) {
+    const ids = owners.get(token) || new Set<string>(); ids.add(step.id); owners.set(token, ids);
+  }
+  return steps.map((step) => {
+    if (!["await-input", "await-approval"].includes(step.role || "")) return step;
+    const replies = new Set(step.resumeProduces || []);
+    const aliases = step.mutates.filter((token) => !declared.has(token)
+      && isUserReplyToken(canonicalReplyToken(token))
+      && [...replies].some((reply) => canonicalReplyToken(reply) === canonicalReplyToken(token))
+      && !steps.some((other) => other.id !== step.id && (other.mutates.includes(token) || other.produces.includes(token))));
+    for (const token of aliases) replies.add(token);
+    const selfReplies = new Set([...replies].filter((token) => !declared.has(token)
+      && (!owners.has(token) || owners.get(token)!.size === 1 && owners.get(token)!.has(step.id))
+      && (!step.mutates.includes(token) || aliases.includes(token))));
+    // An explicit input/condition on the future reply is still a semantic
+    // error. Leave it for repair instead of inventing a replacement condition.
+    const mentions = new Set(`${step.input} ${step.when}`.match(/\$?[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || []);
+    const removable = new Set([...selfReplies].filter((token) => !mentions.has(token)));
+    return { ...step, mutates: step.mutates.filter((token) => !aliases.includes(token)),
+      resumeProduces: [...replies], requires: step.requires.filter((token) => !removable.has(token)) };
+  });
+}
+
 /** Pause markers and completion markers are runtime control signals, not
  * business payloads. Models sometimes serialize a checkpoint as reading its
  * own `$input_required`/`$approval_required`, or make it depend on `$output`
@@ -292,7 +333,7 @@ function bindCheckpointControlEdges(steps: WorkflowDagStep[]) {
     let requires = step.requires.filter((token) => token !== pause);
     let input = step.input;
     let when = step.when;
-    const mentionsCompletion = (text: string) => (text.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || []).includes(WORKFLOW_TERMINALS.completed);
+    const mentionsCompletion = (text: string) => ((text.match(/\$[a-zA-Z_][a-zA-Z0-9_.:-]*/g) || []) as string[]).includes(WORKFLOW_TERMINALS.completed);
     if (requires.includes(WORKFLOW_TERMINALS.completed) || mentionsCompletion(input) || mentionsCompletion(when)) {
       const replies = new Set(step.resumeProduces || []);
       const upstreamArtifacts = steps.filter((candidate) => candidate.id !== step.id
@@ -379,7 +420,7 @@ function closeOutputlessClarifications(steps: WorkflowDagStep[]) {
  * artifact and creates the missing hand-off for an already produced result.
  */
 export function stabilizeBoundWorkflowPlan(steps: WorkflowDagStep[], capabilities: WorkflowPlanCapability[]) {
-  const next = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], mutates: [...step.mutates],
+  const next: WorkflowDagStep[] = steps.map((step) => ({ ...step, requires: [...step.requires], produces: [...step.produces], mutates: [...step.mutates],
     delivers: [...(step.delivers || [])], resumeProduces: [...(step.resumeProduces || [])] }));
   const capabilityById = new Map(capabilities.map((item) => [item.id, item]));
   const occupied = new Set(next.flatMap((step) => [...step.requires, ...step.produces, ...(step.resumeProduces || [])]));
@@ -655,6 +696,7 @@ export function normalizeWorkflowPlanBindings(context: WorkflowPlanContext, prev
   steps = closeOutputlessClarifications(steps);
   steps = bindCheckpointReplyOwnership(steps);
   steps = bindCheckpointControlEdges(steps);
+  steps = bindCheckpointEventInputs(steps, context.stateFields || []);
   steps = normalizeOptionalCheckpointReads(steps);
   steps = bindExplicitTokenReads(steps);
   steps = bindDeclaredStateReads(steps, context.stateFields || []);
@@ -779,6 +821,13 @@ export type WorkflowRepairRequest = {
   initialInputs: string[];
   issues: string[];
   attempt: number;
+  /** Executable repair policy mirrors the preservation checks below. */
+  constraints: {
+    stateFields: string[];
+    foldableStepIds: string[];
+    protectedSteps: Array<{ id: string; capabilityIds: string[]; requires: string[]; mutates: string[]; role?: string }>;
+    compilerIssues: Array<{ type: string; stepId: string; dependency?: string }>;
+  };
 };
 
 /** Apply a small graph patch without making the model reproduce (and sometimes
@@ -861,6 +910,10 @@ export async function repairWorkflowPlan(
     .filter((token) => !isUserReplyToken(token) && !current.initialInputs.includes(token) && !structuralProductions.has(token) && !(step.role && ["deliver", "persist"].includes(step.role) && /^\$output_(?:final|revised|draft)$/.test(token)
       && !step.delivers?.includes(token) && !originalSteps.some((consumer) => consumer.requires.includes(token))))));
   const cyclicSteps = new Set(originalCompile.issues.filter((issue) => issue.type === "cycle").map((issue) => issue.stepId));
+  const protectedSteps = originalSteps.filter((entry) => !entry.id.startsWith("step-capability-")
+    || entry.capabilityIds.some((id) => !context.capabilities.some((item) => item.id === id && isReadOnlyHostEvidence(item)))
+    || entry.mutates.length || ["persist", "await-input", "await-approval"].includes(entry.role || "")
+    || originalSteps.some((consumer) => consumer.id !== entry.id && entry.produces.some((token) => consumer.requires.includes(token))));
   let rejectionIssues: string[] = [];
   let attempts = 0;
   while ((!current.valid || rejectionIssues.length) && attempts < 2) {
@@ -872,6 +925,23 @@ export async function repairWorkflowPlan(
       capabilities: context.capabilities,
       inputs: context.inputs.map((input) => ({ token: `input:${input.id}`, name: input.name, required: input.required, availability: "Resolve from the user's runtime request/materials; if absent, ask. Not fabricated or assumed present." })),
       initialInputs: current.initialInputs, issues, attempt: attempts,
+      constraints: {
+        stateFields: context.stateFields || [],
+        foldableStepIds: current.steps.filter((step) => step.id.startsWith("step-capability-")
+          && step.capabilityIds.length === 1 && context.capabilities.some((item) => item.id === step.capabilityIds[0] && isReadOnlyHostEvidence(item))
+          && !step.mutates.length && !step.delivers?.length && !step.resumeProduces?.length
+          && ["read", "transform"].includes(step.role || "transform")
+          && !step.produces.some(isWorkflowTerminal)).map((step) => step.id),
+        protectedSteps: protectedSteps.map((step) => ({ id: step.id,
+          capabilityIds: step.capabilityIds.filter((id) => context.capabilities.some((item) => item.id === id && ["builtin-tool", "mcp", "script"].includes(item.kind))),
+          requires: step.requires.filter((token) => !cyclicSteps.has(step.id) && originalArtifacts.has(token) && !isWorkflowTerminal(token)),
+          mutates: [...step.mutates],
+          ...(["persist", "await-input", "await-approval"].includes(step.role || "") ? { role: step.role } : {}),
+        })),
+        compilerIssues: compileWorkflowDag(current.steps, current.initialInputs, {
+          terminalOutputs: Object.values(WORKFLOW_TERMINALS), requiredTerminalOutputs: [WORKFLOW_TERMINALS.completed],
+        }).issues.map(({ type, stepId, dependency }) => ({ type, stepId, ...(dependency ? { dependency } : {}) })),
+      },
     });
     const payload = raw && typeof raw === "object" && !Array.isArray(raw) ? raw as Record<string, unknown> : {};
     let patched;
@@ -880,6 +950,11 @@ export async function repairWorkflowPlan(
     const proposed = normalizeWorkflowPlanBindings({ ...context, workflowSteps: normalizeWorkflowDagSteps(patched) }, current.steps);
     const retainedIds = new Set(proposed.map((step) => step.id));
     const production = new Set(proposed.flatMap((entry) => [...entry.produces, ...(entry.resumeProduces || [])]));
+    // applyWorkflowStepPatch has already validated this explicit transfer:
+    // read-only helper owner, its actual inputs and every consumed product
+    // move to the target. Do not then reject that same legal fold as deletion.
+    const absorbedIds = new Set(Array.isArray(payload.stepUpdates) && Array.isArray(payload.foldedSteps)
+      ? payload.foldedSteps.map((fold: { id?: string }) => fold.id) : []);
     rejectionIssues = [];
     if (!proposed.length) rejectionIssues.push("修复必须返回完整 workflowSteps，不能返回说明文字或空数组");
     for (const step of proposed) {
@@ -889,9 +964,8 @@ export async function repairWorkflowPlan(
     }
     // Preserve actual task operations and their artifacts. Auto-inserted
     // resource helpers may be folded into an explicit consuming operation.
-    for (const step of originalSteps.filter((entry) => !entry.id.startsWith("step-capability-")
-      || entry.mutates.length || ["persist", "await-input", "await-approval"].includes(entry.role || "")
-      || originalSteps.some((consumer) => consumer.id !== entry.id && entry.produces.some((token) => consumer.requires.includes(token))))) {
+    for (const step of protectedSteps) {
+      if (absorbedIds.has(step.id) && !retainedIds.has(step.id)) continue;
       if (!retainedIds.has(step.id)) rejectionIssues.push(`修复不能删除原任务步骤 ${step.id}；请保留该步骤并修复依赖`);
       const replacement = proposed.find((entry) => entry.id === step.id);
       for (const id of step.capabilityIds.filter((id) => context.capabilities.some((capability) => capability.id === id && ["builtin-tool", "mcp", "script"].includes(capability.kind)))) {
@@ -930,6 +1004,8 @@ export async function repairWorkflowPlan(
 }
 
 export const WORKFLOW_REPAIR_PROMPT = `Repair only the supplied runtime Workflow DAG. Return JSON {"stepUpdates":[{"id":"exact-existing-id","changes":{"requires":["all retained and repaired input tokens"]}}],"addedSteps":[],"foldedSteps":[]}. Return ONLY changed fields for existing nodes; untouched nodes and fields are retained automatically. Arrays replace that field, so preserve valid entries. Never rename/delete a real task node. addedSteps is only for genuinely missing operations; each new step has id, capabilityIds[], role, when, input, action, output, fallback, requires[], produces[], mutates[], delivers[], resumeProduces[]. Do not re-emit the entire graph.
+The supplied constraints are mandatory, not suggestions: preserve every protectedSteps mutation, required tool, business dependency and locked role. Only constraints.foldableStepIds may appear in foldedSteps; scripts and MCP writers cannot be folded or downgraded. For an orphan script, connect its real expected input and its output to the consuming operation instead. Do not solve unordered writes by deleting mutates. Add a real version/completion dependency when the task semantics require ordering; never force mutually exclusive alternatives into a linear chain. stateFields are the only declared shared state roots, not permission to invent new roots.
+For a checkpoint's self-dependency, its resumeProduces values are outputs of a real future user event, not pre-pause inputs. Preserve its role and reply outputs, but remove those future values from its requires/input/when; use the actual reviewed artifact as the pre-pause input and condition. If a checkpoint updates real state, retain that state write and declare its prior value; do not turn an approval into an automatic inference. Inspect the structured compilerIssues before returning, not just the last prose error.
 Return compact JSON: no indentation/newlines outside string values. Preserve complete task behavior; save whitespace, not requirements. capabilityIds must use exact enabled ids from the supplied catalog: user/human/assistant are actors, not capability ids. Checkpoint and handoff steps use the semantic capability responsible for their input product.
 The declared input catalog is authoritative. Only $request, $source and the exact listed input:<id> tokens are initial roots. They describe runtime inputs, not evidence that the user already supplied them. Resolve from actual materials, or ask when absent. Never invent an input, add a derived artifact to the initial roots, or pretend an API/tool ran.
 An input:<id> token remains a runtime input even when an await-input checkpoint lists it in resumeProduces. It is not a business deliverable and may be rebound to a more specific reply token or removed when no downstream step consumes it. Preserve the checkpoint's await-input/await-approval role, but do not create a fake delivery merely to preserve a raw input token.

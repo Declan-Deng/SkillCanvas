@@ -35,6 +35,14 @@ import {
   runtimeFileMentions,
 } from "../app/gate-rules.ts";
 
+test("external source quotes and linked path labels are not local dependencies", () => {
+  const quoted = '- Source support: A page recommends `references/quoted.md` and [references/remote.md](https://example.com/skill/references/remote.md).';
+  assert.deepEqual(runtimeFileMentions(quoted), []);
+  assert.deepEqual(runtimeFileMentions('Read [references/remote.md](https://example.com/skill/references/remote.md) or https://example.com/scripts/remote.py.'), []);
+  assert.deepEqual(runtimeFileMentions(`${quoted}\n- Proposed action: Read [required](references/required.md), then run scripts/check.sh.`), ["references/required.md", "scripts/check.sh"]);
+  assert.deepEqual(runtimeFileMentions('Use [local file](references/local.md) and `scripts/run.py`.'), ["references/local.md", "scripts/run.py"]);
+});
+
 test("repair progress is accepted only when it resolves blockers without introducing new ones", () => {
   assert.deepEqual(compareGateBlockers(["A", "B", "C"], ["B"]), {
     resolved: ["A", "C"],
@@ -53,7 +61,7 @@ test("generated Python tests use the current interpreter instead of a non-portab
   const repaired = reconcilePythonTestInterpreter("import subprocess\n\ndef run():\n    return subprocess.run(['python', 'scripts/run.py'])\n");
   assert.match(repaired, /^import sys$/m);
   assert.match(repaired, /subprocess\.run\(\[sys\.executable,/);
-  assert.doesNotMatch(repaired, /\[['\"]python(?:3)?['\"]/);
+  assert.doesNotMatch(repaired, /\[['"]python(?:3)?['"]/);
 });
 
 test("a concise but executable eval prompt is not rejected as a broken contract", () => {

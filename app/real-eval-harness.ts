@@ -9,6 +9,7 @@
  * targets SkillCanvas' multi-provider browser workflow.
  */
 
+import { normalizeAnonymousComparisonDisplay } from "./comparison-presentation.ts";
 import type {
   DimensionGrade,
   FailedCaseEvidence,
@@ -244,6 +245,7 @@ export type BenchmarkCaseComparison = {
   skillOutput?: string;
   blindVerdict?: "baseline" | "candidate" | "tie";
   comparisonEvidence?: string;
+  comparisonDisplay?: { title: string; baseline: string; skill: string };
 };
 
 export type BenchmarkComparisonSummary = {
@@ -264,7 +266,7 @@ export type BlindComparison = {
     A: { criterionScores: Record<string, number>; criterionEvidence: Record<string, string>; overallScore: number; perfectScoreQualified: boolean; strengths: string[]; weaknesses: string[] };
     B: { criterionScores: Record<string, number>; criterionEvidence: Record<string, string>; overallScore: number; perfectScoreQualified: boolean; strengths: string[]; weaknesses: string[] };
   } | null;
-  caseResults: Array<{ caseId: string; winner: "A" | "B" | "tie"; evidence: string }>;
+  caseResults: Array<{ caseId: string; winner: "A" | "B" | "tie"; evidence: string; display?: { title: string; A: string; B: string } }>;
 };
 
 /** Build the exact runtime view an executing Agent is allowed to see.
@@ -798,7 +800,8 @@ export function normalizeBlindComparison(value: unknown, caseIds: string[]): Bli
     const item = entry as Record<string, unknown>;
     const caseId = clean(item.caseId, 120);
     const itemWinner = ["A", "B", "tie"].includes(String(item.winner)) ? item.winner as "A" | "B" | "tie" : null;
-    return allowed.has(caseId) && itemWinner ? [{ caseId, winner: itemWinner, evidence: clean(item.evidence, 500) }] : [];
+    const display = normalizeAnonymousComparisonDisplay(item.display);
+    return allowed.has(caseId) && itemWinner ? [{ caseId, winner: itemWinner, evidence: clean(item.evidence, 500), ...(display ? { display } : {}) }] : [];
   });
   if (caseResults.length !== allowed.size) return null;
   const rubricRaw = raw.rubric && typeof raw.rubric === "object" ? raw.rubric as Record<string, unknown> : null;

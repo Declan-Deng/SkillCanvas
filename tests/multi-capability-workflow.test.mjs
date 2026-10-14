@@ -103,9 +103,9 @@ test("adapters bound to a real intermediate artifact fold only into its actual c
 
 test("do not fold required tools, required MCP, writes, consumed products or real business outputs", () => {
   for (const change of [
-    (c, h) => { c.scope = "global"; c.optional = false; },
-    (c, h) => { c.kind = "mcp"; c.optional = false; },
-    (c, h) => { c.affects = ["file-output"]; },
+    (c) => { c.scope = "global"; c.optional = false; },
+    (c) => { c.kind = "mcp"; c.optional = false; },
+    (c) => { c.affects = ["file-output"]; },
     (c, h) => { h.role = "persist"; },
     (c, h) => { h.requires = ["derived_records"]; },
     (c, h) => { h.produces = ["$saved_spreadsheet"]; },

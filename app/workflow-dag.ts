@@ -100,6 +100,7 @@ function explicitDelivery(step: WorkflowDagStep) {
 /** Preserve every business token. Only explicit delivery and user checkpoints
  * can close a path; a disconnected helper remains a diagnosable graph error. */
 export function closeWorkflowDagTerminals(steps: WorkflowDagStep[], _initialInputs: string[] = ["$request", "$source"]) {
+  void _initialInputs;
   return steps.map((step): WorkflowDagStep => {
     const pause = pauseTerminalForStep(step);
     if (pause) {

@@ -288,7 +288,13 @@ export function reconcilePythonOutputContract(scriptText: string, contractText: 
 }
 
 export function runtimeFileMentions(text: string) {
-  return [...new Set(text.match(/\b(?:references|scripts|assets|integrations)\/[A-Za-z0-9_./-]+\.(?:md|json|py|csv|tsv|txt|yaml|yml|html|xlsx?)\b/g) || [])];
+  // Provenance quotes and external link labels are data, not instructions to
+  // load local files. Keep ordinary runtime prose, relative links and code
+  // commands intact so a genuinely missing local dependency still blocks.
+  const runtime = text.split("\n").filter((line) => !/^\s*[-*]?\s*(?:Source mechanism|Source support|Sources|Evidence type|Confidence|Verification|Eval failure evidence)\s*:/i.test(line)).join("\n")
+    .replace(/\[[^\]\n]*\]\(\s*(?:https?:\/\/|\/\/)[^\s)]*(?:\s+["'][^"']*["'])?\s*\)/gi, " ")
+    .replace(/\bhttps?:\/\/[^\s<>"'`\]]+/gi, " ");
+  return [...new Set(runtime.match(/\b(?:references|scripts|assets|integrations)\/[A-Za-z0-9_./-]+\.(?:md|json|py|sh|csv|tsv|txt|yaml|yml|html|xlsx?)\b/g) || [])];
 }
 
 function numericPolicyTokens(text: string) {

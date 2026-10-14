@@ -1,4 +1,5 @@
 import { createStoredZip } from "../../zip-utils";
+import { validateBundleStructure } from "../../bundle-validator";
 
 type DownloadPayload = { files?: Record<string, unknown>; rootName?: unknown };
 
@@ -20,6 +21,15 @@ export async function POST(request: Request) {
     )));
     if (!rootName || !files["SKILL.md"] || !Object.keys(files).length || Object.keys(files).length > 80) {
       return new Response("Invalid Skill bundle", { status: 400 });
+    }
+    // Current compiler bundles carry an IR. Check the actual export bytes,
+    // including post-redaction projections, rather than trusting a stale UI
+    // audit. Keep standalone legacy SKILL.md downloads backward-compatible.
+    if (files["evals/skill-ir.json"]) {
+      const validation = validateBundleStructure(files);
+      if (!validation.executionReady || !validation.contractReady) {
+        return Response.json({ error: "导出包检查未通过，请保留当前 Skill 并修复后重试", issues: validation.issues.map((issue) => ({ code: issue.code, path: issue.path })) }, { status: 422 });
+      }
     }
     const zip = createStoredZip(files, rootName);
     return new Response(zip, {

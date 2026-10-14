@@ -49,7 +49,7 @@ test("node retries from its checkpoint and becomes failed only after its retry b
   let snapshot = await createWorkflowRun({ tenantId, kind: "mcp-call", nodes: [{ id: "call", maxAttempts: 2 }] });
   snapshot = await claimWorkflowNode(tenantId, snapshot.run.id);
   snapshot = await failWorkflowNode(tenantId, snapshot.run.id, "call", new Error("temporary network error"));
-  assert.equal(snapshot.run.status, "queued");
+  assert.equal(snapshot.run.status, "retry_scheduled");
   assert.equal(snapshot.nodes[0].attempt, 1);
 
   snapshot = await claimWorkflowNode(tenantId, snapshot.run.id);

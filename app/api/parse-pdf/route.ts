@@ -57,6 +57,7 @@ export async function POST(request: Request) {
     return errorResponse(message, 422);
   } finally {
     if (timeoutId) clearTimeout(timeoutId);
-    if (pdf && typeof pdf.destroy === "function") await pdf.destroy().catch(() => undefined);
+    const disposable = pdf as (typeof pdf & { destroy?: () => Promise<void> }) | null;
+    if (typeof disposable?.destroy === "function") await disposable.destroy().catch(() => undefined);
   }
 }

@@ -5,7 +5,7 @@ import ts from "typescript";
 import * as canonical from "../app/canonical-mutations.ts";
 import { compileSkillIR, auditSkillIRFiles, projectEvalBank, projectSkillIRFiles, bindSkillIREvals, ensureSkillIREvalCoverage, reconcileSkillIRContentPermission, skillIRDigest } from "../app/skill-ir.ts";
 import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract, contractRepairFailureReason } from "../app/skill-projection-repair.ts";
-import { validateBundleContentCoherence } from "../app/bundle-validator.ts";
+import { buildFailureEvidence, classifyBundleIssue, validateBundleContentCoherence } from "../app/bundle-validator.ts";
 import { compileWorkflowDag } from "../app/workflow-dag.ts";
 import { validateImplementationFiles, applySkillIRMutations, validateCanonicalSkillIR } from "../app/canonical-mutations.ts";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "../app/bundle-resource-repair.ts";
@@ -16,6 +16,7 @@ import { capabilities, workflow } from "./fixtures/blueprint.mjs";
 import { providerRepairNeedsUserAction } from "../app/eval-prompt.ts";
 import { isCompilerOwnedEvalCoverageIssue } from "../app/eval-repair-routing.ts";
 import { compilerOwnedContractIssues } from "../app/contract-repair-routing.ts";
+import { staticRepairReplacements, staticBlockerSignature, changedBundlePaths } from "../app/static-repair-contract.ts";
 
 function fixture(inputName = "合同 PDF", path = "references/contract.pdf") {
   const plan = structuredClone(capabilities.capabilityPlan);
@@ -178,6 +179,89 @@ test("no-op and regressive repairs are not progress", () => {
   assert.equal(contractRepairProgress([a], []).improved, true);
 });
 
+// Reproduce the actual static coordinator, not a parallel implementation.
+async function runStaticRepairScenario(response) {
+  const source = ts.createSourceFile("page.tsx", await readFile(new URL("../app/page.tsx", import.meta.url), "utf8"), ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
+  let fn;
+  function visit(node) {
+    if (ts.isFunctionDeclaration(node) && node.name?.text === "runP0StaticRepairLoop") fn = node.getText(source);
+    ts.forEachChild(node, visit);
+  }
+  visit(source);
+  assert.ok(fn);
+  const code = ts.transpileModule(fn, { compilerOptions: { target: ts.ScriptTarget.ES2022 } }).outputText;
+  const { ir } = fixture("学习规则", "references/check-rules.md");
+  const initial = project(ir).files;
+  const calls = [], events = [];
+  const deps = {
+    ...canonical, staticRepairReplacements, staticBlockerSignature, changedBundlePaths,
+    requirementEvidence: () => ({}), STATIC_REPAIR_MAX_ROUNDS: 5,
+    idea: "每日学习计划", demoAnswers: {}, sourceInsightText: "", loopPlan: workflow.loopPlan,
+    isSafeSkillFilePath: (path) => !path.includes(".."),
+    showLocalBusy: () => {}, setBuildLoop: () => {}, setGenerationLoop: () => {}, setFiles: () => {},
+    reportClientGenerationLoopEvent: (event, data) => events.push({ event, ...data }),
+    providerRepairNeedsUserAction,
+    finalizeSkillFiles: (files, _idea, _answers, _source, _plan, _loop, value) => ({ ...files, ...projectSkillIRFiles(value) }),
+    validateBundle: async (files) => ({
+      executionReady: Boolean(files["references/check-rules.md"]),
+      issues: files["references/check-rules.md"] ? [] : [{ priority: "P0", code: "MISSING_FILE", path: "SKILL.md", message: "缺少 references/check-rules.md" }],
+    }),
+    callAI: async (_mode, body) => { calls.push(body); return response; },
+  };
+  const run = new Function(...Object.keys(deps), `${code}\nreturn runP0StaticRepairLoop;`)(...Object.values(deps));
+  const result = await run(initial, capabilities.capabilityPlan);
+  return { result, initial, calls, events };
+}
+
+test("production P0 accepts owner-backed authored reference bytes returned in implementationFiles", async () => {
+  const contents = "# 每日学习清单\n先根据实际水平安排学习活动，再明确时长和完成标准；信息不足时先询问，不虚构学习结果。";
+  const run = await runStaticRepairScenario({ canonicalMutations: [], updatedFiles: {}, implementationFiles: { "references/check-rules.md": contents } });
+  assert.equal(run.result.validation.executionReady, true);
+  assert.equal(run.result.files["references/check-rules.md"], contents);
+  assert.equal(run.calls.length, 1);
+});
+
+test("production P0 stops an identical no-op repair instead of spending all five rounds", async () => {
+  const run = await runStaticRepairScenario({ updatedFiles: {}, implementationFiles: {} });
+  assert.equal(run.result.validation.executionReady, false);
+  assert.deepEqual(run.result.files, run.initial);
+  assert.equal(run.calls.length, 1);
+});
+
+test("static repair preserves the legacy updatedFiles route with the same reference ownership checks", () => {
+  const { ir } = fixture("学习规则", "references/check-rules.md");
+  const files = project(ir).files;
+  const bytes = "# 学习规则\n根据实际反馈调整，不虚构事实。";
+  assert.deepEqual(staticRepairReplacements({ updatedFiles: { "references/check-rules.md": bytes } }, files, ir, []), { "references/check-rules.md": bytes });
+  for (const field of ["updatedFiles", "implementationFiles"]) {
+    assert.throws(() => staticRepairReplacements({ [field]: { "references/unowned.md": bytes } }, files, ir, []), /REFERENCE_OWNER_MISSING/);
+    assert.throws(() => staticRepairReplacements({ [field]: { "references/fake.pdf": bytes } }, files, ir, []), /STATIC_REPAIR_INVALID|IMPLEMENTATION_FILE_INVALID/);
+    assert.throws(() => staticRepairReplacements({ [field]: { "scripts/../escape.py": bytes } }, files, ir, []), /INVALID/);
+  }
+});
+
+test("static repair rejects conflicting containers, disabled owners and semantic edits", () => {
+  const { ir } = fixture("学习规则", "references/check-rules.md");
+  const files = project(ir).files;
+  assert.throws(() => staticRepairReplacements({ updatedFiles: { "references/check-rules.md": "first" }, implementationFiles: { "references/check-rules.md": "second" } }, files, ir, []), /STATIC_REPAIR_CONFLICT/);
+  assert.throws(() => staticRepairReplacements({ implementationFiles: { "SKILL.md": "replace instructions" } }, files, ir, []), /IMPLEMENTATION_FILE_INVALID/);
+  assert.throws(() => staticRepairReplacements({ canonicalMutations: [{ type: "identity.update", changes: { name: "wrong" } }] }, files, ir, []), /P0 修复不能修改业务契约/);
+  ir.capabilities.find((item) => item.id === "document-reader").implementation.status = "not-needed";
+  assert.throws(() => staticRepairReplacements({ implementationFiles: { "references/check-rules.md": "rules" } }, files, ir, []), /REFERENCE_OWNER_MISSING/);
+});
+
+test("static repair can fix an independent runner even before the malformed IR is repaired", () => {
+  assert.deepEqual(staticRepairReplacements({ implementationFiles: { "scripts/check.py": "print('ready')" } }, {}, null, []), { "scripts/check.py": "print('ready')" });
+  assert.throws(() => staticRepairReplacements({ implementationFiles: { "references/check-rules.md": "rules" } }, {}, null, []), /REFERENCE_OWNER_MISSING/);
+});
+
+test("static blocker fingerprints are order-independent and file diffs include removals", () => {
+  const a = { priority: "P0", code: "A", path: "SKILL.md", message: "missing" };
+  const b = { priority: "P0", code: "B", path: "scripts/check.py", message: "syntax" };
+  assert.equal(staticBlockerSignature([a, b]), staticBlockerSignature([b, a]));
+  assert.deepEqual(changedBundlePaths({ a: "same", b: "old", c: "removed" }, { a: "same", b: "new", d: "added" }), ["b", "c", "d"]);
+});
+
 // Run the actual page repair coordinator and candidate application. Only the
 // model and UI are mocked; IR mutation, resource validation and projection run.
 async function runRepairScenario(responses, options = {}) {
@@ -272,9 +356,14 @@ async function runRepairScenario(responses, options = {}) {
       ...coverageIssues,
     ] };
   };
-  const validate = (files) => ({ executionReady: !(options.rebuildIntroducesP0 && files !== initial), contractReady: collect(files).issues.length === 0 });
+  const validate = (files) => {
+    const executionReady = !(options.executionBlocked || options.rebuildIntroducesP0 && files !== initial);
+    return { valid: executionReady, executionReady, contractReady: collect(files).issues.length === 0, checks: [], issues: executionReady ? [] : [{
+      ...classifyBundleIssue("MISSING_REFERENCED_FILE"), code: "MISSING_REFERENCED_FILE", path: "references/local-required.md", message: "Runtime reference is missing",
+    }] };
+  };
   const deps = {
-    ...canonical, reconcileRuntimeInputResources, missingBundleResources, contractRepairProgress, providerRepairNeedsUserAction,
+    ...canonical, buildFailureEvidence, reconcileRuntimeInputResources, missingBundleResources, contractRepairProgress, providerRepairNeedsUserAction,
     contentPermissionConflictLocations, resolveContentPermission,
     bindSkillIREvals, ensureSkillIREvalCoverage, projectEvalBank,
     isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, contractRepairFailureReason,
@@ -306,6 +395,15 @@ async function runRepairScenario(responses, options = {}) {
   const result = await run({ files: initial, validation: validate(initial), generationPlan: capabilities.capabilityPlan, answers: options.answers || {}, sourceText: "", skillIR: ir });
   return { result, initial, events, calls };
 }
+
+test("production repair preserves P0 failure evidence even when there are no P1 issues", async () => {
+  const run = await runRepairScenario([], { referencePresent: true, executionBlocked: true });
+  assert.equal(run.result.passed, false);
+  assert.equal(run.calls.length, 0, "semantic repair must not run while execution is blocked");
+  assert.match(run.result.failureReason, /P0 Execution Gate.*references\/local-required.md/);
+  assert.match(run.result.failureEvidence.join("\n"), /MISSING_REFERENCED_FILE/);
+  assert.ok(run.events.some((event) => event.phase === "contract-validation" && event.blockers?.some((text) => text.includes("references/local-required.md"))));
+});
 
 test("production P1 repairs projection drift without a model call or consuming semantic rounds", async () => {
   const run = await runRepairScenario([], { drift: true, referencePresent: true });

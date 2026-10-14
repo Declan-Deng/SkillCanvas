@@ -3,7 +3,7 @@ import type { PipelineIssue } from "./skill-pipeline-core.ts";
 
 const BINARY_REFERENCE = /^references\/[A-Za-z0-9._/-]+\.(?:pdf|docx?|xlsx?|pptx?|png|jpe?g|webp|mp3|mp4|zip)$/i;
 export const hasRuntimeInputBinding = (value: string, id: string) =>
-  (value.match(/input:[\p{L}\p{N}_.-]+/gu) || []).includes(`input:${id}`);
+  ((value.match(/input:[\p{L}\p{N}_.-]+/gu) || []) as string[]).includes(`input:${id}`);
 const normalizeName = (value: string) => value.toLowerCase()
   .replace(/\b(?:pdf|docx?|xlsx?|pptx?|file|document)\b/g, "")
   .replace(/用户提供的?|用户上传的?|用户的?|原始的?|现有的?|当前的?|本次的?|完整的?|上传的?|待处理的?/g, "")

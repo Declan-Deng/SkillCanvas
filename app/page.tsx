@@ -1,20 +1,28 @@
 "use client";
 
+import { ComparisonBenefits } from "./comparison-benefits";
+import { comparisonBenefits, revealComparisonDisplay } from "./comparison-presentation";
+
 import { classifyUserEvidence, describeUserEvidence, requirementEvidence } from "./user-evidence";
 import { StartButton } from "./start-button";
-import { repairWorkflowPlan } from "./workflow-plan-repair";
+import { SkillFileWorkspace, type SkillFileExplanation } from "./skill-file-workspace";
+import { inspectWorkflowPlan, repairWorkflowPlan } from "./workflow-plan-repair";
 import { interviewCompletionGate } from "./interview-completion";
 import { EVAL_COMPILER_VERSION, providerRepairNeedsUserAction } from "./eval-prompt";
 import { generationClientBudget } from "./generation-request";
 import { isCapabilityDeltaContractIssue, isSkillIRProjectionIssue, rebuildSkillIRProjections, repairCapabilityDeltaContract, contractRepairFailureReason } from "./skill-projection-repair";
 import { HOST_WEB_SEARCH_CAPABILITY, reconcileHostCapabilityAliases, recommendedHostCapabilityIds } from "./capability-routing";
-import { pickRecommendedInterviewOption } from "./interview-discovery";
+import { INTERVIEW_UNSURE_OPTION, normalizeInterviewQuestions as normalizeInterviewQuestionContract } from "./interview-contract";
+import { previewFixtureMatchesAnswers } from "./representative-fixture";
 import { compileKnowledgeBatches, knowledgeClientTimeout, retainKnowledgeFailure, verifyKnowledgeClaimsInBatches } from "./knowledge-compiler";
 import { selectKnowledgeQueries } from "./knowledge-passages";
 import { runBlueprintPlanning, type BlueprintCheckpoint } from "./blueprint-planner";
 import { HOST_FILE_WORKSPACE_CAPABILITY } from "./host-file-capability";
+import { needsImplicitCsvProcessor } from "./implicit-data-processor";
+import { hasObservedDemoMismatch, observedDemoFeedback, normalizeDemoFeedbackOptions } from "./demo-feedback";
 import { reconcileRuntimeInputResources, missingBundleResources, deduplicateMissingResourceIssues, contractRepairProgress } from "./bundle-resource-repair";
 import { validateImplementationFiles } from "./canonical-mutations";
+import { staticRepairReplacements, staticBlockerSignature, changedBundlePaths, type StaticRepairPayload } from "./static-repair-contract";
 import { generationResultCopy, type GenerationLoopOutcome } from "./generation-result-copy";
 
 import { ChangeEvent, Fragment, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
@@ -122,7 +130,7 @@ import {
   type EvalFailureType,
   type PipelineIssue,
 } from "./skill-pipeline-core";
-import { classifyBundleIssue, validateBundleContentCoherence, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
+import { buildFailureEvidence, classifyBundleIssue, missingIndependentScriptTests, validateBundleContentCoherence, validateBundleStructure, type BundleStaticIssue, type BundleStaticValidation } from "./bundle-validator";
 import { demoReplyNeedsUserTurn, normalizePlannedDemoTurns, type PlannedDemoUserTurn } from "./demo-episode";
 import { isCompilerOwnedEvalCoverageIssue } from "./eval-repair-routing";
 import { compilerOwnedContractIssues } from "./contract-repair-routing";
@@ -236,7 +244,6 @@ import {
   type InterviewReadiness,
 } from "./discovery-preview";
 import {
-  REQUIREMENT_DIMENSIONS,
   WORKFLOW_STEPS,
   canNavigateToWorkflowStep,
   normalizeWorkflowStep,
@@ -577,15 +584,7 @@ type CapabilityCatalogItem = CapabilityItem & {
   hosts: string[];
 };
 
-type FileExplanation = {
-  kind: string;
-  summary: string;
-  contents: string[];
-  usedWhen: string;
-  affects: string;
-  related: string[];
-  validation: string;
-};
+type FileExplanation = SkillFileExplanation;
 
 type OptimizationSuggestion = {
   id: string;
@@ -894,7 +893,7 @@ function normalizeOptimizationResearchDecision(value: unknown): OptimizationRese
   };
 }
 
-const UNSURE_OPTION = "我不确定，请 AI 帮我判断";
+const UNSURE_OPTION = INTERVIEW_UNSURE_OPTION;
 const BUILD_REPAIR_MAX_ROUNDS = 2;
 const STATIC_REPAIR_MAX_ROUNDS = 5;
 const PATCH_PLAN_MAX_ATTEMPTS = 3;
@@ -1161,13 +1160,6 @@ const CAPABILITY_KIND_META: Record<CapabilityKind, { label: string; icon: string
   "builtin-tool": { label: "宿主 Tools", icon: "T" },
   mcp: { label: "MCP 连接", icon: "M" },
   eval: { label: "自动测试", icon: "E" },
-};
-
-const CAPABILITY_STATUS_LABELS: Record<CapabilityStatus, string> = {
-  generate: "AI 自动生成",
-  "use-provided": "使用已上传资料",
-  "requires-setup": "需要安装或授权",
-  "not-needed": "当前不需要",
 };
 
 const CAPABILITY_LIBRARY: CapabilityCatalogItem[] = [
@@ -1663,11 +1655,11 @@ function normalizeLoopPlan(value: unknown, fallback: LoopPlan): LoopPlan {
       verification: cleanText(candidate.verification, fallback.subgoals[Math.min(index, fallback.subgoals.length - 1)]?.verification || "检查可观察结果", 280),
     }];
   }) : [];
-  let qualityGates = Array.isArray(raw.qualityGates) ? raw.qualityGates.slice(0, 6).flatMap((item, index) => {
+  let qualityGates: LoopQualityGate[] = Array.isArray(raw.qualityGates) ? raw.qualityGates.slice(0, 6).flatMap((item, index) => {
     if (!item || typeof item !== "object") return [];
     const candidate = item as Record<string, unknown>;
     if (typeof candidate.criterion !== "string" || typeof candidate.check !== "string") return [];
-    const owner = candidate.owner === "user" || candidate.owner === "shared" ? candidate.owner : "ai";
+    const owner: LoopQualityGate["owner"] = candidate.owner === "user" || candidate.owner === "shared" ? candidate.owner : "ai";
     return [{ id: typeof candidate.id === "string" && candidate.id.trim() ? candidate.id.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") : `gate-${index + 1}`, criterion: candidate.criterion.trim().slice(0, 240), check: candidate.check.trim().slice(0, 300), owner }];
   }) : [];
   qualityGates = qualityGates.length >= 2 ? qualityGates : fallback.qualityGates;
@@ -1861,8 +1853,8 @@ function repairMarkdownEmphasis(text: string) {
 function sensitiveMatchCount(text: string) {
   const patterns = [
     /[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi,
-    /(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)/g,
-    /(?<!\d)\d{17}[\dXx](?!\d)/g,
+    /(?<![A-Za-z0-9_])(?:\+?86[-\s]?)?1[3-9]\d{9}(?![A-Za-z0-9_])/g,
+    /(?<![A-Za-z0-9_])\d{17}[\dXx](?![A-Za-z0-9_])/g,
     /\b(?:sk|api)[-_][A-Za-z0-9_-]{12,}\b/g,
   ];
   return patterns.reduce((count, pattern) => count + (text.match(pattern)?.length || 0), 0);
@@ -1871,8 +1863,8 @@ function sensitiveMatchCount(text: string) {
 function redactSensitiveText(text: string) {
   const redacted = text
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[已隐藏：邮箱]")
-    .replace(/(?<!\d)(?:\+?86[-\s]?)?1[3-9]\d{9}(?!\d)/g, "[已隐藏：手机号]")
-    .replace(/(?<!\d)\d{17}[\dXx](?!\d)/g, "[已隐藏：证件号]")
+    .replace(/(?<![A-Za-z0-9_])(?:\+?86[-\s]?)?1[3-9]\d{9}(?![A-Za-z0-9_])/g, "[已隐藏：手机号]")
+    .replace(/(?<![A-Za-z0-9_])\d{17}[\dXx](?![A-Za-z0-9_])/g, "[已隐藏：证件号]")
     .replace(/\b(?:sk|api)[-_][A-Za-z0-9_-]{12,}\b/g, "[已隐藏：密钥]");
   return redacted.replace(/^(#\s+)([^\n]{2,24})(?=\n[\s\S]{0,220}\[已隐藏：(邮箱|手机号)\])/m, "$1[已隐藏：姓名]");
 }
@@ -3336,7 +3328,7 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
   if (unreachableAssets.length) blockers.push(`${unreachableAssets.length} 个资产没有在 SKILL.md 中说明用途`);
   if (scripts.some((path) => files[path].trim().length < 80)) blockers.push("存在空脚本或不可执行的脚本占位内容");
   if (assets.some((path) => files[path].trim().length < 20)) blockers.push("存在空资产或无实际内容的资产占位文件");
-  const untestedScripts = scripts.filter((path) => !Object.keys(files).some((candidate) => candidate.startsWith("evals/script-tests/") && candidate.endsWith(".py") && candidate.includes(path.split("/").pop()?.replace(/\.py$/, "") || "__never__")));
+  const untestedScripts = missingIndependentScriptTests(files);
   if (untestedScripts.length) blockers.push(`${untestedScripts.length} 个确定性脚本没有独立的脚本级测试`);
   try {
     const manifest = JSON.parse(files["evals/capability-manifest.json"] || "") as { capabilities?: CapabilityItem[]; coverage?: Array<{ requirement_id?: string; evaluation?: { case_ids?: string[] } }>; state_model?: StateModel; output_contract?: OutputContract; control_model?: { scopes?: LoopPlan["scopes"] } };
@@ -3373,7 +3365,7 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
       else if (contracts.tools.some((item) => item.availability === "requires-setup" && !/unavailable until/i.test(item.configuration || ""))) blockers.push("待配置工具没有明确标记为当前不可用");
       else if (contracts.tools.some((item) => item.kind === "mcp" && item.availability === "use-provided" && (!item.server?.trim() || item.user_verified !== true))) blockers.push("MCP 契约缺少用户确认的 Server 或授权状态");
       const manifest = JSON.parse(files["evals/capability-manifest.json"] || "{}") as { capabilities?: Array<{ id?: string; kind?: string; status?: string }> };
-      const declaredTools = new Set((manifest.capabilities || []).filter((item) => (item.kind === "builtin-tool" || item.kind === "mcp") && capabilityIsActive(item)).map((item) => item.id));
+      const declaredTools = new Set((manifest.capabilities || []).filter((item) => (item.kind === "builtin-tool" || item.kind === "mcp") && item.status !== "not-needed").map((item) => item.id));
       const contractedTools = new Set((contracts.tools || []).map((item) => (item as { id?: string }).id));
       if ([...declaredTools].some((id) => !contractedTools.has(id))) blockers.push("能力计划中的工具依赖没有对应运行时契约");
       if ([...contractedTools].some((id) => !declaredTools.has(id))) blockers.push("工具契约声明了能力计划之外的依赖");
@@ -3445,7 +3437,10 @@ function auditSkillFiles(files: Record<string, string>, answers: Record<string, 
   if (sensitive) warnings.push(`检测到 ${sensitive} 个常见直接标识，默认导出时会匿名化`);
   const malformedMarkdown = Object.entries(files).filter(([path, content]) => path.endsWith(".md") && (content.match(/\*\*/g)?.length || 0) % 2 !== 0);
   if (malformedMarkdown.length) warnings.push(`${malformedMarkdown.length} 个 Markdown 文件存在未闭合的强调标记`);
-  return { blockers, warnings, sensitive };
+  // The release UI uses the same P0 detector as Build, including dependencies
+  // inside references, rather than only scanning the main file.
+  const executionBlockers = validateBundleStructure(files).issues.filter((issue) => issue.priority === "P0");
+  return { blockers: [...new Set([...blockers, ...executionBlockers.map((issue) => `[${issue.code}] ${issue.path}: ${issue.message}`)])], warnings, sensitive };
 }
 
 function createStaticEvalResults(files: Record<string, string>, answers: Record<string, string> = {}): EvalResult[] {
@@ -3497,7 +3492,7 @@ function normalizeEvalResults(value: unknown, files: Record<string, string>, ans
     if (coverage === "not-covered") score = 0;
     const normalizedIssue = coverage === "not-covered"
       ? "本轮未覆盖这一分支，需要换一个场景验证；这不代表当前结果做错了。"
-      : clean(candidate.issue, presentation.issue || candidate.detail);
+      : typeof candidate.issue === "string" ? candidate.issue.trim().slice(0, 800) : "";
     const normalizedImpact = coverage === "not-covered"
       ? "当前只能确认这个场景的表现，不能据此判断未测试分支。"
       : clean(candidate.impact, presentation.impact || "这会影响最终结果是否真正可用。");
@@ -3555,48 +3550,12 @@ function demoDiffersMeaningfully(previous: SkillDemo | null, next: SkillDemo) {
   return previous.title.trim() !== next.title.trim() && (promptSimilarity < 0.78 || outputSimilarity < 0.72);
 }
 
-function createPersonalizedFeedbackOptions(answers: Record<string, string>, hasSources: boolean) {
-  const choices: string[] = [];
-  const add = (value: string) => {
-    const cleaned = value.replace(/^我(?:觉得|希望)?/, "").trim().slice(0, 32);
-    if (cleaned && !choices.includes(cleaned)) choices.push(cleaned);
-  };
-  (answers["bad-example"] || "").split("；").filter((item) => item && !item.includes("不确定")).forEach(add);
-  if (hasSources) add("没有真正参考我给的资料");
-  if (answers.workflow && !answers.workflow.includes("不确定")) add(`没有按“${answers.workflow.slice(0, 18)}”推进`);
-  if (answers.style && !answers.style.includes("不确定")) add(`结果没做到“${answers.style.split("；")[0].slice(0, 18)}”`);
-  if (answers["output-format"] && !answers["output-format"].includes("不确定")) add("交付形式和我选的不一致");
-  if (answers["evidence-policy"] && !answers["evidence-policy"].includes("不确定")) add("内容改动程度和我选的不一致");
-  if (answers.outcome && !answers.outcome.includes("不确定")) add("没有解决我最在意的问题");
-  ["重点抓错了", "结果还不够像我会用的版本", "有关键要求没有落实"].forEach(add);
-  return choices.slice(0, 6);
-}
-
 function normalizeFeedbackOptions(value: unknown, fallback: string[]) {
-  if (!Array.isArray(value)) return fallback;
-  const options = value
-    .filter((item): item is string => typeof item === "string")
-    .map((item) => item.replace(/^[+✓\-•]\s*/, "").trim().slice(0, 32))
-    .filter((item, index, list) => item.length >= 3
-      && !/SKILL\.md|metadata|schema|harness|grader|MCP|元数据|数据最小化/i.test(item)
-      && !/(?:没有|未)(?:看到|展示|覆盖|验证|测试).{0,12}(?:异常|缺失|确认|模板|分支|场景)|没有使用模板/i.test(item)
-      && list.indexOf(item) === index)
-    .slice(0, 6);
-  return options.length >= 3 ? options : fallback;
+  return normalizeDemoFeedbackOptions(value, fallback);
 }
 
-function createDemoFeedbackFallback(demo: SkillDemo, results: EvalResult[], fallback: string[]) {
-  const options: string[] = [];
-  const add = (value: string) => {
-    const cleaned = value.replace(/^(主要不足|本轮|目前|仍然|还|结果|它|AI)[：:，,\s]*/g, "").replace(/[。；;]$/g, "").trim().slice(0, 26);
-    if (cleaned.length >= 3 && !options.includes(cleaned)) options.push(cleaned);
-  };
-  [...results].filter((item) => item.coverage !== "not-covered").sort((a, b) => a.score - b.score).forEach((item) => add(item.issue || item.detail));
-  demo.uncertainties
-    .filter((item) => !/(?:未实际|未涉及|未要求|本轮未覆盖|没有.*(?:缺失|异常)|所有.*已提供)/i.test(item))
-    .forEach((item) => add(`没有处理好：${item}`));
-  fallback.forEach(add);
-  return options.slice(0, 6);
+function createDemoFeedbackFallback(results: EvalResult[]) {
+  return observedDemoFeedback(results);
 }
 
 function jsonFromText<T>(raw: string): T {
@@ -4347,7 +4306,7 @@ function normalizeCapabilityPlan(value: unknown): CapabilityPlan | null {
   const allowedStatuses = new Set<CapabilityStatus>(["generate", "use-provided", "requires-setup", "not-needed"]);
   const allowedLayers = new Set<CapabilityLayer>(["runtime", "evaluation", "build-time"]);
   const seen = new Set<string>();
-  const items = raw.items.slice(0, 32).flatMap((item, index) => {
+  const items: CapabilityItem[] = raw.items.slice(0, 32).flatMap((item, index) => {
     if (!item || typeof item !== "object") return [];
     const candidate = item as Record<string, unknown>;
     if (!allowedKinds.has(candidate.kind as CapabilityKind) || typeof candidate.name !== "string" || typeof candidate.purpose !== "string") return [];
@@ -4416,8 +4375,11 @@ function normalizeCapabilityPlan(value: unknown): CapabilityPlan | null {
       ...(["ai", "user"].includes(String(candidate.selectionSource)) ? { selectionSource: candidate.selectionSource as "ai" | "user" } : {}),
     }];
   });
-  if (!items.some((item) => item.kind === "llm")) items.unshift({ ...DEFAULT_CAPABILITY_PLAN.items[0], reason: "规划结果遗漏了语义核心，系统已将需要上下文判断的工作明确归还大模型" });
-  if (!items.some((item) => item.kind === "eval")) items.push({ ...DEFAULT_CAPABILITY_PLAN.items.find((item) => item.kind === "eval")!, reason: "系统补上发布所需的领域回归验证，但不会因此生成额外运行时文件" });
+  if (!items.some((item) => item.kind === "llm")) items.unshift({ ...DEFAULT_CAPABILITY_PLAN.items[0], scope: DEFAULT_CAPABILITY_PLAN.items[0].scope || "task-specific", reason: "规划结果遗漏了语义核心，系统已将需要上下文判断的工作明确归还大模型" });
+  if (!items.some((item) => item.kind === "eval")) {
+    const defaultEval = DEFAULT_CAPABILITY_PLAN.items.find((item) => item.kind === "eval")!;
+    items.push({ ...defaultEval, scope: defaultEval.scope || "task-specific", reason: "系统补上发布所需的领域回归验证，但不会因此生成额外运行时文件" });
+  }
 
   const rawOutcome = raw.outcomeModel && typeof raw.outcomeModel === "object" ? raw.outcomeModel as Record<string, unknown> : {};
   const rawState = raw.stateModel && typeof raw.stateModel === "object" ? raw.stateModel as Record<string, unknown> : {};
@@ -4500,10 +4462,19 @@ function reconcileCapabilityPlanContentPermission(plan: CapabilityPlan, answers:
       uncontrollableOutcomes: reconcileList(plan.outcomeModel.uncontrollableOutcomes),
       observableIndicators: reconcileList(plan.outcomeModel.observableIndicators),
     },
-    stateModel: Object.fromEntries(Object.entries(plan.stateModel).map(([key, value]) => [
-      key,
-      typeof value === "string" ? reconcile(value) : Array.isArray(value) ? reconcileList(value.map(String)) : value,
-    ])),
+    stateModel: {
+      ...plan.stateModel,
+      reason: reconcile(plan.stateModel.reason),
+      fields: plan.stateModel.fields.map((field) => ({
+        ...field,
+        purpose: reconcile(field.purpose),
+        updateRule: reconcile(field.updateRule),
+      })),
+      expiry: reconcile(plan.stateModel.expiry),
+      correction: reconcile(plan.stateModel.correction),
+      missingBehavior: reconcile(plan.stateModel.missingBehavior),
+      privacyBoundary: reconcile(plan.stateModel.privacyBoundary),
+    },
     outputContract: {
       ...plan.outputContract,
       format: reconcile(plan.outputContract.format) || "面向用户的可直接使用结果",
@@ -4550,8 +4521,7 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
     answers["good-example"],
     answers["preference-reuse"],
   ].filter(Boolean).join("；");
-  const structuredInput = /csv|excel|xlsx|表格|数据表|数据集|批量|一批|多条数据/i.test(taskEvidence);
-  const deterministicWork = /计算|公式|排序|排名|筛选|去重|清洗|转换|汇总|统计|校验|验证|导出/i.test(taskEvidence);
+  const implicitCsvProcessor = needsImplicitCsvProcessor(answers.inputs || "", taskEvidence);
   const nonObviousKnowledgeSignal = /官方|规范|标准|政策|法律|合规|专业术语|字段定义|平台规则|行业规则|决策树|边界案例|反例|失败模式|schema|api/i.test(taskEvidence);
   const reusableOutputEvidence = [answers["output-format"], answers["preference-reuse"], plan.outputContract.format].filter(Boolean).join("；");
   const reusableArtifact = reusableOutputAssetRequested(reusableOutputEvidence);
@@ -4619,7 +4589,7 @@ function ensureTaskCapabilities(plan: CapabilityPlan, idea: string, answers: Rec
     });
   }
 
-  if (structuredInput && deterministicWork && !items.some((item) => item.kind === "script" && capabilityIsActive(item))) {
+  if (implicitCsvProcessor && !items.some((item) => item.kind === "script" && capabilityIsActive(item))) {
     items.splice(Math.max(1, items.findIndex((item) => item.kind === "eval")), 0, {
       id: "deterministic-data-processing",
       kind: "script",
@@ -4792,14 +4762,14 @@ function PlatformMark({ name }: { name: string }) {
   return <img src={sources[name]} alt="" aria-hidden="true" />;
 }
 
-function attachCompiledKnowledgeCapability(plan: CapabilityPlan, pack: KnowledgePack) {
+function attachCompiledKnowledgeCapability(plan: CapabilityPlan, pack: KnowledgePack): CapabilityPlan {
   const baseSummary = stripCompiledKnowledgeSummary(plan.summary);
   if (!knowledgePackIsPublishable(pack)) {
     return {
       ...plan,
       summary: baseSummary,
       items: plan.items.map((item) => item.path === "references/domain-playbook.md"
-        ? { ...item, status: "not-needed", enabled: false }
+        ? { ...item, status: "not-needed" as const, enabled: false }
         : item),
     };
   }
@@ -4948,42 +4918,8 @@ function serializeSourceInsights(insights: SourceInsight[]) {
   return insights.map((insight) => `## ${insight.sourceName}\n- 文档类型：${insight.documentType}\n- 使用角色：${insight.roleLabel} (${insight.role})\n- 判断依据：${insight.roleReason}\n- 资料贡献：${insight.summary}\n- 可复用特征：${insight.observableTraits.join("；")}\n- 应影响的问题：${insight.questionInfluence.join("；") || "待确认"}\n- 页码证据：${insight.evidence.join("；") || "待确认"}\n- 隐私：${insight.privacyNote}`).join("\n\n");
 }
 
-function normalizeInterviewQuestions(raw: unknown, roundIndex: number, priorEvidence = "") {
-  if (!Array.isArray(raw)) return [];
-  const roundMeta = INTERVIEW_ROUND_META[roundIndex];
-  const candidates = raw.filter((item) => {
-    if (!item || typeof item !== "object") return false;
-    const value = item as Partial<Question>;
-    const searchable = [value.dimension, value.label, value.helper, ...(Array.isArray(value.options) ? value.options : [])].join(" ");
-    return value.dimension !== "使用频率" && !/(?:多久|多频繁|使用频率|更新频率)/.test(searchable);
-  });
-  return roundMeta.dimensions.map((expectedDimension, index): Question | null => {
-    const item = candidates.find((candidate) => (candidate as Partial<Question>).dimension === expectedDimension) || candidates[index];
-    if (!item || typeof item !== "object") return null;
-    const value = item as Partial<Question>;
-    const label = typeof value.label === "string" ? value.label.trim().slice(0, 180) : "";
-    const options = Array.isArray(value.options)
-      ? Array.from(new Set(value.options.filter((option): option is string => typeof option === "string" && Boolean(option.trim())).map((option) => option.trim().slice(0, 80)))).slice(0, 4)
-      : [];
-    if (label.length < 4 || options.length < 3) return null;
-    if (!options.some((option) => option.includes("不确定"))) options.push(UNSURE_OPTION);
-    const dimension = expectedDimension;
-    // Providers occasionally omit the recommendation even when the prompt
-    // asks for one. The prompt requires the safest recommendation to be the
-    // first option, so the normalizer can recover without losing the beginner
-    // experience or guessing outside the model-proposed choices.
-    const recommendedOption = pickRecommendedInterviewOption(options, value.recommendedOption, priorEvidence, UNSURE_OPTION);
-    return {
-      id: `ai-round-${roundIndex + 1}-question-${index + 1}`,
-      dimension,
-      label,
-      helper: typeof value.helper === "string" ? value.helper.trim().slice(0, 240) : "这个选择会影响 Skill 的具体行为。",
-      placeholder: typeof value.placeholder === "string" ? value.placeholder.trim().slice(0, 180) : "补充你的具体情况",
-      options,
-      selectionMode: value.selectionMode === "multiple" ? "multiple" : "single",
-      recommendedOption,
-    };
-  }).filter((item): item is Question => Boolean(item));
+function normalizeInterviewQuestions(raw: unknown, roundIndex: number, priorEvidence = ""): Question[] {
+  return normalizeInterviewQuestionContract(raw, roundIndex, priorEvidence).questions;
 }
 
 function recommendedInterviewAnswers(questions: Question[]) {
@@ -5072,6 +5008,19 @@ function reportClientGenerationLoopEvent(
   });
 }
 
+function reportClientEvaluationEvent(
+  event: "evaluation_started" | "evaluation_blocked" | "evaluation_finished" | "evaluation_failed",
+  details: Record<string, unknown> = {},
+) {
+  void fetch("/api/client-log", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event, ...details }),
+  }).catch(() => {
+    // Evaluation diagnostics must never block the Demo or change its result.
+  });
+}
+
 const DOT_PROGRESS_COUNT = 36;
 const WAITING_DOT_COUNT = 120;
 
@@ -5120,8 +5069,8 @@ export default function Home() {
   const [idea, setIdea] = useState("");
   const [sourceNames, setSourceNames] = useState<string[]>([]);
   const [sourceWarnings, setSourceWarnings] = useState<string[]>([]);
-  const [sourcesLoading, setSourcesLoading] = useState(false);
-  const [sourceText, setSourceText] = useState("");
+  const [sourcesLoading] = useState(false);
+  const [sourceText] = useState("");
   const [sourceInsights, setSourceInsights] = useState<SourceInsight[]>([]);
   const [sourceReceipt, setSourceReceipt] = useState<SourceReceipt | null>(null);
   const [aiGenerationIssue, setAiGenerationIssue] = useState("");
@@ -5198,9 +5147,12 @@ export default function Home() {
   const [busyTask, setBusyTask] = useState<BusyTask | null>(null);
   const [busyClosing, setBusyClosing] = useState(false);
   const busyCloseTimer = useRef<number | null>(null);
+  const busyTaskRef = useRef<BusyTask | null>(null);
   const autoOptimizationResumeKey = useRef("");
+  const rerunOptimizationLoopRef = useRef(rerunOptimizationLoop);
   const optimizationRunInFlight = useRef(false);
   const evaluationLaunchPendingRef = useRef(false);
+  const evaluationRunInFlight = useRef(false);
   const [busyPhaseIndex, setBusyPhaseIndex] = useState(0);
   const [busyElapsed, setBusyElapsed] = useState(0);
   const [busyExecutionKind, setBusyExecutionKind] = useState<BusyExecutionKind>("local");
@@ -5242,7 +5194,6 @@ export default function Home() {
   useEffect(() => {
     researchProbeController.current?.abort();
     researchProbeController.current = null;
-    // eslint-disable-next-line react-hooks/set-state-in-effect -- Invalidate an external connection result when its configuration changes.
     setResearchProbe({ status: "idle", message: "检索连接与模型连接需要分别测试" });
     return () => { researchProbeController.current?.abort(); researchProbeController.current = null; };
   }, [researchProvider, researchBaseUrl, researchApiKey]);
@@ -5274,18 +5225,15 @@ export default function Home() {
     if (!sessionHydrated || generationLoop.status === "running") return;
     if (!generationLoop.benchmarkRuns || !generationLoop.comparisonRevision) return;
     if (generationLoop.comparisonRevision === currentBundleRevision || generationLoop.comparisonVerdict === "not-run") return;
-    /* eslint-disable react-hooks/set-state-in-effect -- Benchmark evidence is valid only for the exact immutable Bundle revision. */
     setGenerationLoop((current) => ({
       ...current,
       status: "attention",
       comparisonVerdict: "not-run",
       stopReason: "当前 Bundle 已发生变化；旧正式对照已失效，必须用原冻结场景重新验证后才能判断是否有增益",
     }));
-    /* eslint-enable react-hooks/set-state-in-effect */
   }, [currentBundleRevision, generationLoop.benchmarkRuns, generationLoop.comparisonRevision, generationLoop.comparisonVerdict, generationLoop.status, sessionHydrated]);
 
   useEffect(() => {
-    /* eslint-disable react-hooks/set-state-in-effect -- One-time hydration intentionally restores an external browser session snapshot. */
     void (async () => {
       let legacy: Record<string, unknown> | null = null;
       try {
@@ -5585,11 +5533,9 @@ export default function Home() {
     } finally {
       setSessionHydrated(true);
     }
-    /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
   useEffect(() => {
-    /* eslint-disable react-hooks/set-state-in-effect -- Browser permission is external state and must be read after hydration. */
     const syncNotificationPermission = () => {
       setNotificationPermission("Notification" in window ? window.Notification.permission : "unsupported");
     };
@@ -5600,7 +5546,6 @@ export default function Home() {
       document.removeEventListener("visibilitychange", syncNotificationPermission);
       window.removeEventListener("focus", syncNotificationPermission);
     };
-    /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
   useEffect(() => {
@@ -5669,16 +5614,15 @@ export default function Home() {
   const demoAnswers = useMemo(() => ({
     ...createDemoAnswers(interviewRounds, answers),
     __idea: idea,
-    __previewTask: discoveryPreview?.userPrompt || "",
+    __previewTask: previewFixtureMatchesAnswers(interviewRounds[0].questions, answers) ? discoveryPreview?.userPrompt || "" : "",
     // Prefer an input the owner has actually seen in a forward Demo. Preview
     // sampleInput is the next-best privacy-safe fixture. Never use a generated
     // answer as input evidence, including when restoring a legacy preview.
-    __previewInput: skillDemo?.userPrompt || discoveryPreview?.sampleInput || "",
+    __previewInput: skillDemo?.userPrompt || (previewFixtureMatchesAnswers(interviewRounds[0].questions, answers) ? discoveryPreview?.sampleInput || "" : ""),
     __previewFeedback: [...previewFeedback, previewFeedbackCustom.trim()].filter(Boolean).join("；"),
   }), [answers, discoveryPreview, idea, interviewRounds, previewFeedback, previewFeedbackCustom, skillDemo]);
   const requirementCoverage = summarizeRequirementCoverage(interviewEvidence);
   const coveredDimensions = requirementCoverage.covered;
-  const uncertainDimensions = requirementCoverage.uncertain;
   const ideaReady = idea.trim().length >= 2;
   const interviewReady = questions.length > 0 && currentAnsweredCount === questions.length;
   const isFinalInterviewRound = interviewRoundIndex === INTERVIEW_ROUND_META.length - 1;
@@ -5724,13 +5668,13 @@ export default function Home() {
   const evaluationHeadline = !formalComparisonIsCurrent
     ? "还没有与当前版本匹配的裸模型对照"
     : generationLoop.comparisonVerdict === "improved"
-      ? `在 ${formalImprovementRows.length} 个真实任务中，Skill 的回答更好`
+      ? `在 ${formalImprovementRows.length} 次测试中，Skill 的回答更好`
       : generationLoop.comparisonVerdict === "equivalent"
         ? "Skill 与裸模型表现接近，暂不宣称提升"
         : "这版 Skill 还没有稳定超过裸模型";
   const evaluationSummary = !formalComparisonIsCurrent
     ? "需要让同一批任务分别交给裸模型和当前 Skill，再匿名比较两边结果。"
-    : "下面每条结论都来自同一任务、同一模型的匿名 A/B 对照；不再用固定维度或自评分代替真实差异。";
+    : "使用同一测试任务和同一模型，对比普通 AI 与加载你的 Skill 后的回答。这里保留全部结果，包括有提升、表现接近和待改进的场景。";
   const busyStageIndex = busyTask
     ? Math.min(BUSY_STAGES[busyTask].stages.length - 1, busyPhaseIndex)
     : 0;
@@ -5846,7 +5790,7 @@ export default function Home() {
   const selectedFileExplanation = useMemo(() => explainSkillFile(selectedFile, files[selectedFile] || "", files), [files, selectedFile]);
   const personalizedFeedbackOptions = evalRan
     ? feedbackOptions
-    : createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0);
+    : [];
   const optionalToolCapabilities = capabilityPlan.items.filter((item) => item.optional && (item.kind === "builtin-tool" || item.kind === "mcp"));
   const adoptedRuntimeCapabilities = capabilityPlan.items.filter((item) => capabilityIsActive(item) && item.kind !== "eval" && item.layer === "runtime");
   const coreRuntimeCapabilities = adoptedRuntimeCapabilities.filter((item) => !item.optional);
@@ -5903,7 +5847,6 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    /* eslint-disable react-hooks/set-state-in-effect -- Compiler-fixable legacy bundles are migrated once after session hydration so the user is never asked to repair generated invariants manually. */
     if (!sessionHydrated || !files["SKILL.md"] || busy) return;
     const compilerFixable = bundleAudit.blockers.some((blocker) => (
       blocker === "总目标为空、过短或仍是占位内容"
@@ -5930,32 +5873,29 @@ export default function Home() {
         ? { ...DEFAULT_GENERATION_LOOP, stopReason: "跨层编译问题已自动解决；当前版本可直接试跑" }
         : current);
     }
-    /* eslint-enable react-hooks/set-state-in-effect */
   }, [sessionHydrated, files, busy, bundleAudit.blockers, idea, demoAnswers, sourceInsightText, capabilityPlan, loopPlan]);
 
   useEffect(() => {
     if (bundleAudit.blockers.length || !aiGenerationIssue.startsWith("修复后仍有")) return;
-    /* eslint-disable react-hooks/set-state-in-effect -- This effect reconciles a stale async error with the latest compiler audit. */
     setAiGenerationIssue("");
     setRetryAction(null);
-    /* eslint-enable react-hooks/set-state-in-effect */
   }, [aiGenerationIssue, bundleAudit.blockers.length]);
 
   useEffect(() => {
-    /* eslint-disable react-hooks/set-state-in-effect -- Clear legacy loop failure copy after the deterministic compiler has closed every release blocker. */
     if (!sessionHydrated || !files["SKILL.md"] || busy || bundleAudit.blockers.length) return;
     if (!generationLoop.stopReason.includes("Build Loop 的确定性检查未通过")) return;
     setGenerationLoop({ ...DEFAULT_GENERATION_LOOP, stopReason: "跨层编译问题已自动解决；当前版本可直接试跑" });
     setRetryAction(null);
-    /* eslint-enable react-hooks/set-state-in-effect */
   }, [sessionHydrated, files, busy, bundleAudit.blockers.length, generationLoop.stopReason]);
 
   useEffect(() => {
-    /* eslint-disable react-hooks/set-state-in-effect -- A compiler update can make a restored bundle valid without changing its bytes. Keep the visible Build state aligned with the live deterministic audit. */
     if (!sessionHydrated || !files["SKILL.md"] || busy || bundleAudit.blockers.length || buildLoop.status !== "attention") return;
     setBuildLoop((current) => ({ ...current, status: "passed", phase: "frozen", issues: [], frozen: true }));
-    /* eslint-enable react-hooks/set-state-in-effect */
   }, [sessionHydrated, files, busy, bundleAudit.blockers.length, buildLoop.status]);
+
+  useEffect(() => {
+    rerunOptimizationLoopRef.current = rerunOptimizationLoop;
+  });
 
   useEffect(() => {
     if (!sessionHydrated || !completedSteps.has("build") || !files["SKILL.md"] || busy || !hasRealModel) return;
@@ -5963,7 +5903,7 @@ export default function Home() {
     const resumeKey = `${activeSkillName}:${files["SKILL.md"].length}:${files["evals/evals.json"]?.length || 0}`;
     if (autoOptimizationResumeKey.current === resumeKey) return;
     autoOptimizationResumeKey.current = resumeKey;
-    void rerunOptimizationLoop();
+    void rerunOptimizationLoopRef.current();
   }, [sessionHydrated, completedSteps, files, busy, hasRealModel, gateOutcomes.build, generationLoop.status, activeSkillName]);
 
   useEffect(() => {
@@ -6099,7 +6039,7 @@ export default function Home() {
 
   async function deliverBrowserNotification(title: string, options: NotificationOptions) {
     if (!("Notification" in window) || window.Notification.permission !== "granted") return false;
-    const notificationOptions: NotificationOptions = {
+    const notificationOptions: NotificationOptions & { renotify?: boolean } = {
       icon: "/skillcanvas-notification-icon.png",
       requireInteraction: true,
       renotify: true,
@@ -6354,6 +6294,7 @@ export default function Home() {
       busyCloseTimer.current = null;
     }
     setBusyClosing(false);
+    busyTaskRef.current = task;
     setBusyTask(task);
     setBusyPhaseIndex(phase);
     setBusyElapsed(0);
@@ -6371,6 +6312,7 @@ export default function Home() {
     const close = () => {
       setBusyClosing(true);
       busyCloseTimer.current = window.setTimeout(() => {
+        busyTaskRef.current = null;
         setBusyTask(null);
         setBusyClosing(false);
         setBusyPhaseIndex(0);
@@ -6425,7 +6367,7 @@ export default function Home() {
         : ["preview", "interview", "demo", "evaluate", "optimization-diagnose", "optimization-patch-plan", "optimization-research"].includes(mode)
           ? 132_000
           : 108_000;
-    const timeoutMs = generationClientBudget(mode) ?? (mode.startsWith("knowledge-") ? knowledgeClientTimeout(provider) : provider === "compatible"
+    const timeoutMs = generationClientBudget(mode, provider) ?? (mode.startsWith("knowledge-") ? knowledgeClientTimeout(provider) : provider === "compatible"
       ? compatibleTimeoutMs
       : ["build", "repair", "eval-execute", "eval-grade", "eval-compare", "optimization-diagnose", "optimization-patch-plan", "optimization-research", "personalize", "optimization-evidence", "demo", "evaluate"].includes(mode)
           ? 106_000
@@ -6510,7 +6452,22 @@ export default function Home() {
         setBusyOutputText(data.content.slice(0, 16_000));
         setBusyOutputRevision((revision) => revision + 1);
         busyOutputArrivedAt.current = Date.now();
-        return jsonFromText<T>(data.content);
+        try {
+          return jsonFromText<T>(data.content);
+        } catch (contractError) {
+          void fetch("/api/client-log", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              event: "ai_client_contract_error",
+              mode,
+              phase: busyStage,
+              reason: `${contractError instanceof Error ? contractError.message : "invalid JSON"}${data.requestId ? `; request=${data.requestId}` : ""}`,
+            }),
+          }).catch(() => undefined);
+          const requestHint = data.requestId ? `（请求 ${data.requestId}）` : "";
+          throw new Error(`${AI_MODE_LABELS[mode] || mode}返回了无法读取的结构${requestHint}；当前内容已保留，可以重试当前节点`);
+        }
       } catch (error) {
         if (error instanceof Error && error.name === "AbortError") {
           settleEstimatedUsage();
@@ -6803,7 +6760,7 @@ export default function Home() {
       ...comparison,
       revealedWinner: revealWinner(comparison.winner),
       revealedScores,
-      caseResults: comparison.caseResults.map((item) => ({ ...item, revealedWinner: revealWinner(item.winner) })),
+      caseResults: comparison.caseResults.map((item) => ({ ...item, revealedWinner: revealWinner(item.winner), comparisonDisplay: revealComparisonDisplay(item.display, anonymized.reveal) })),
     };
   }
 
@@ -6833,6 +6790,7 @@ export default function Home() {
         skillOutput: (skillCases.get(item.caseId)?.output || "").slice(0, 1_600),
         blindVerdict: revealedWinner,
         comparisonEvidence: (blindCase?.evidence || "").slice(0, 700),
+        ...(blindCase?.comparisonDisplay ? { comparisonDisplay: blindCase.comparisonDisplay } : {}),
       };
     });
   }
@@ -7201,7 +7159,7 @@ export default function Home() {
         setEvalRan(true);
         setDemoExpanded(true);
         setEvals(candidateResults);
-        setFeedbackOptions(createDemoFeedbackFallback(candidateDemo || skillDemo || { title: "", scenario: "", userPrompt: "", output: "", appliedRules: [], uncertainties: [], mockTurns: [] }, candidateResults, candidateEvidence.failurePatterns));
+        setFeedbackOptions(createDemoFeedbackFallback(candidateResults));
         setFeedbackReasons([]);
         setFeedbackCustom("");
         setFeedbackLoopSummary(summary);
@@ -7232,40 +7190,6 @@ export default function Home() {
     if (firstChangedFile) setSelectedFile(firstChangedFile);
     setStep("build");
     closeOptimization();
-  }
-
-  async function handleSources(event: ChangeEvent<HTMLInputElement>) {
-    const input = event.currentTarget;
-    const selected = Array.from(event.target.files || []);
-    if (!selected.length) return;
-    const candidates = selected.slice(0, 8);
-    setSourcesLoading(true);
-    setSourceReceipt({ tone: "reading", title: "正在读取资料", detail: `正在解析 ${candidates.length} 个文件，PDF 会保留页码作为后续证据。` });
-    try {
-      const parsed = await readReferenceFiles(selected);
-      const appended = appendReferenceFiles(sourceText, parsed.successful, 80_000);
-      const successful = appended.accepted;
-      const warnings = [...parsed.warnings, ...appended.warnings];
-      setSourceNames((current) => Array.from(new Set([...current, ...successful.map((item) => item.label)])));
-      setSourceText(appended.text);
-      if (successful.length) setSourceInsights([]);
-      setSourceWarnings(warnings);
-      if (successful.length) {
-        setSourceReceipt({
-          tone: warnings.length ? "warning" : "ready",
-          title: warnings.length ? `已读取 ${successful.length} 份资料，另有内容需要确认` : `已读取 ${successful.length} 份资料`,
-          detail: `${successful.map((item) => item.label).join("；")}。开始后 AI 会先提炼资料角色、可复用特征和页码依据。`,
-        });
-      } else {
-        setSourceReceipt({ tone: "error", title: "资料没有成功读入", detail: warnings.join("；") || "请检查文件格式后重试。" });
-      }
-      setToast(warnings.length ? `已读取 ${successful.length} 份，${warnings.length} 份需要处理` : `已读取 ${successful.length} 份资料`);
-    } catch (error) {
-      setSourceReceipt({ tone: "error", title: "资料读取失败", detail: error instanceof Error ? error.message : "请检查文件后重试。" });
-    } finally {
-      setSourcesLoading(false);
-      input.value = "";
-    }
   }
 
   async function handleContextSources(event: ChangeEvent<HTMLInputElement>, fieldId: ContextFieldId) {
@@ -7586,13 +7510,12 @@ export default function Home() {
     }
   }
 
-  /* eslint-disable react-hooks/immutability -- These bounded compiler loops advance local candidate snapshots; React state changes only through setters. */
   async function runP0StaticRepairLoop(inputFiles: Record<string, string>, generationPlan: CapabilityPlan) {
     let currentFiles = inputFiles;
     showLocalBusy("检查 JSON、YAML、路径、运行器与可执行性");
     let validation = await validateBundle(currentFiles);
     let rounds = 0;
-    let previousSignature = "";
+    let previousRepairFailure = "";
     while (!validation.executionReady && rounds < STATIC_REPAIR_MAX_ROUNDS) {
       const p0Issues = validation.issues.filter((issue) => issue.priority === "P0");
       const infrastructureIssues = p0Issues.filter((issue) => issue.code === "STATIC_VALIDATOR_UNAVAILABLE");
@@ -7608,11 +7531,11 @@ export default function Home() {
         });
         break;
       }
-      const signature = blockers.join("\n");
+      const signature = staticBlockerSignature(p0Issues);
       setBuildLoop((current) => ({ ...current, status: "repairing", phase: "bundle", rounds, issues: blockers.slice(0, 8) }));
       setGenerationLoop((current) => ({ ...current, status: "running", phase: "static", stopReason: `P0 Execution Gate 第 ${rounds + 1}/${STATIC_REPAIR_MAX_ROUNDS} 轮：只修复语法、路径、依赖与启动阻塞` }));
       reportClientGenerationLoopEvent("generation_loop_phase", { phase: "static-repair", round: rounds + 1, blockers, reason: `P0 Execution Gate 发现 ${p0Issues.length} 项：${blockers.slice(0, 2).join("；")}` });
-      let repairedResult: { updatedFiles?: Record<string, unknown> } = {};
+      let replacements: Record<string, string> = {};
       try {
         const issuePaths = p0Issues.map((issue) => issue.path).filter((path) => isSafeSkillFilePath(path) && Boolean(currentFiles[path]));
         const repairPaths = Array.from(new Set([...issuePaths, "SKILL.md", "agents/openai.yaml"]))
@@ -7640,7 +7563,7 @@ export default function Home() {
         } catch {
           compactSkillIR = { unavailable: true };
         }
-        repairedResult = await callAI<{ updatedFiles?: Record<string, unknown> }>("repair", {
+        const repairedResult = await callAI<StaticRepairPayload>("repair", {
           idea,
           sourceText: sourceInsightText.slice(0, 8_000),
           answers: demoAnswers,
@@ -7648,11 +7571,13 @@ export default function Home() {
           loopPlan,
           skillIR: compactSkillIR,
           skill: targetedFiles,
-          evaluation: { priority: "P0", category: "P0_EXECUTION_BLOCKER", repairRoute: "static-execution", blockers, warnings: [], staticAttempt: rounds + 1 },
+          evaluation: { priority: "P0", category: "P0_EXECUTION_BLOCKER", repairRoute: "static-execution", blockers, warnings: [], staticAttempt: rounds + 1, previousRepairFailure },
         });
+        replacements = staticRepairReplacements(repairedResult, currentFiles, parseCanonicalSkillIR(currentFiles), p0Issues);
       } catch (error) {
         rounds += 1;
-        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "static-repair", round: rounds, accepted: false, reason: error instanceof Error ? error.message : "P0 修复请求失败" });
+        previousRepairFailure = error instanceof Error ? error.message : "P0 修复请求失败";
+        reportClientGenerationLoopEvent("generation_loop_candidate", { phase: "static-repair", round: rounds, accepted: false, reason: previousRepairFailure });
         if (providerRepairNeedsUserAction(error)) {
           setFiles(currentFiles);
           throw error;
@@ -7660,20 +7585,26 @@ export default function Home() {
         if (rounds >= STATIC_REPAIR_MAX_ROUNDS) break;
         continue;
       }
-      const replacements = Object.fromEntries(Object.entries(repairedResult.updatedFiles || {}).filter((entry): entry is [string, string] => (
-        isSafeSkillFilePath(entry[0]) && typeof entry[1] === "string" && Boolean(entry[1].trim())
-      )));
       rounds += 1;
+      const beforeFiles = currentFiles;
       if (Object.keys(replacements).length) {
         const mergedFiles = { ...currentFiles, ...replacements };
         currentFiles = finalizeSkillFiles(mergedFiles, idea, demoAnswers, sourceInsightText, generationPlan, loopPlan, parseCanonicalSkillIR(mergedFiles) || undefined);
       }
       showLocalBusy("修复结果已返回，正在重新执行同一组确定性检查");
       validation = await validateBundle(currentFiles);
-      const nextSignature = validation.issues.filter((issue) => issue.priority === "P0").map((issue) => `${issue.code}:${issue.path}:${issue.message}`).join("\n");
+      const nextSignature = staticBlockerSignature(validation.issues);
+      const changedPaths = changedBundlePaths(beforeFiles, currentFiles);
+      reportClientGenerationLoopEvent("generation_loop_candidate", {
+        phase: "static-repair", round: rounds, accepted: validation.executionReady || signature !== nextSignature,
+        reason: `返回 ${Object.keys(replacements).length} 个文件；实际改变 ${changedPaths.length} 个：${changedPaths.slice(0, 8).join(",") || "无"}；${validation.executionReady ? "静态检查通过" : "继续保留未解决的阻塞"}`,
+      });
       if (validation.executionReady) break;
-      if (!Object.keys(replacements).length && nextSignature === previousSignature) break;
-      previousSignature = signature;
+      if (!changedPaths.length && nextSignature === signature) {
+        setGenerationLoop((current) => ({ ...current, status: "attention", phase: "static", stopReason: "修复没有改变文件或解决阻塞；已停止重复请求，保留当前内容" }));
+        break;
+      }
+      previousRepairFailure = nextSignature === signature ? "上轮文件有改变，但相同阻塞仍未解决；请检查具体缺失路径，不要重复相同补丁" : "";
     }
     reportClientGenerationLoopEvent("generation_loop_phase", {
       phase: "static-validation",
@@ -8085,14 +8016,17 @@ export default function Home() {
       if (!validation.executionReady || !state.issues.length) break;
     }
     const passed = validation.executionReady && validation.contractReady && state.issues.length === 0;
-    const failureReason = passed ? "" : contractRepairFailureReason(state.issues, rounds, rejectedAttempts);
+    const failureEvidence = passed ? [] : buildFailureEvidence(validation, state.issues.map((issue) => issue.evidence));
+    const failureReason = passed ? "" : !validation.executionReady
+      ? `P0 Execution Gate 未通过：${failureEvidence.join("；")}`
+      : contractRepairFailureReason(state.issues, rounds, rejectedAttempts);
     reportClientGenerationLoopEvent("generation_loop_phase", {
       phase: "contract-validation",
       round: rounds,
-      blockers: state.issues.map((issue) => issue.evidence),
+      blockers: failureEvidence,
       reason: passed ? "P1 Contract Gate 已通过，可以冻结并进入 Eval" : failureReason,
     });
-    return { files: currentFiles, validation, rounds, nestedP0Rounds, passed, failureReason, ...state };
+    return { files: currentFiles, validation, rounds, nestedP0Rounds, passed, failureReason, failureEvidence, ...state };
   }
 
   async function runOptimizationLoop(initialFiles: Record<string, string>, generationPlan: CapabilityPlan = capabilityPlan) {
@@ -9138,7 +9072,6 @@ export default function Home() {
     notifyGenerationLoopResult(state);
     return { files: bestFiles, state };
   }
-  /* eslint-enable react-hooks/immutability */
 
   async function retrieveInternalMcpEvidence(
     phase: InternalMcpEvidenceReport["phase"],
@@ -9470,12 +9403,25 @@ export default function Home() {
   }
 
   async function ensureValidGenerationWorkflow(plan: CapabilityPlan, saveCheckpoint?: (steps: CapabilityPlan["workflowSteps"]) => void): Promise<CapabilityPlan> {
-    const result = await repairWorkflowPlan({
+    const context = {
       workflowSteps: plan.workflowSteps,
       capabilities: plan.items.filter((item) => item.kind !== "eval" && capabilityIsActive(item)),
       inputs: deriveTaskInputContract({ idea, answers: demoAnswers, capabilityInputs: plan.items.filter((item) => item.kind === "llm").map((item) => item.input) }),
       stateFields: plan.stateModel.needed ? plan.stateModel.fields.map((field) => field.name) : [],
-    }, (workflowRepair) => callAI("workflow-repair", {
+    };
+    const inspected = inspectWorkflowPlan(context);
+    if (inspected.valid) {
+      saveCheckpoint?.(structuredClone(inspected.ordered));
+      reportClientGenerationLoopEvent("generation_loop_phase", {
+        phase: "workflow-dag-preflight", round: 0, bindingChanges: inspected.bindingChanges,
+        reason: "程序已确认输入、用户回复与最终交付连线完整",
+      });
+      return { ...plan, workflowSteps: inspected.ordered };
+    }
+    // A valid linear graph is not evidence of a valid task. Keep conditional
+    // branches, real user checkpoints and tool writes; never serialize the
+    // whole plan merely to make a topology validator green.
+    const repaired = await repairWorkflowPlan(context, (workflowRepair) => callAI("workflow-repair", {
       idea, answers: interviewEvidence, outputContract: plan.outputContract, workflowRepair,
     }), ({ attempt, status, issues, bindingChanges }) => {
       if (status === "repairing") showLoopBusy(`正在修复工作流连线（第 ${attempt} 轮），保留已有任务、知识和用户要求`);
@@ -9484,7 +9430,7 @@ export default function Home() {
         reason: status === "passed" ? "输入、实际产物、用户反馈与交付连线检查通过" : status === "failed" ? "工作流连线修复仍未通过；未开始文件生成" : "只修复有问题的工作流连线，不重新生成需求或专业知识",
       });
     }, saveCheckpoint);
-    return { ...plan, workflowSteps: result.workflowSteps };
+    return { ...plan, workflowSteps: repaired.workflowSteps };
   }
 
   async function compileSkill() {
@@ -9683,10 +9629,8 @@ export default function Home() {
           status: "attention",
           phase: "complete",
           closureScore: contractRepair.closure.score,
-          issues: contractRepair.issues.map((issue) => issue.evidence).slice(0, 8),
-          stopReason: contractRepair.validation.executionReady
-            ? contractRepair.failureReason
-            : "P0 Execution Gate 未通过，P1 Contract Gate、Optimization Loop 与 Eval 没有启动",
+          issues: contractRepair.failureEvidence.slice(0, 8),
+          stopReason: contractRepair.failureReason,
         };
         setGenerationLoop(blockedState);
         notifyGenerationLoopResult(blockedState);
@@ -9695,8 +9639,9 @@ export default function Home() {
       setBusyPhaseIndex(9);
       showLocalBusy("生成与自动优化已结束，正在保存当前最佳版本");
       setFiles(compiledFiles);
-      const unresolvedBuildIssues = contractRepair.passed ? audit.blockers : contractRepair.issues.map((issue) => issue.evidence);
-      setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: unresolvedBuildIssues.length ? "attention" : "passed", phase: unresolvedBuildIssues.length ? "bundle" : "frozen", rounds: repairRounds, issues: unresolvedBuildIssues, frozen: !unresolvedBuildIssues.length });
+      const unresolvedBuildIssues = contractRepair.passed ? audit.blockers : contractRepair.failureEvidence;
+      const buildPassed = contractRepair.passed && !unresolvedBuildIssues.length;
+      setBuildLoop({ ...DEFAULT_BUILD_LOOP, status: buildPassed ? "passed" : "attention", phase: buildPassed ? "frozen" : "bundle", rounds: repairRounds, issues: unresolvedBuildIssues, frozen: buildPassed });
       setEvalRan(false);
       setSkillDemo(null);
       setDemoReviewPending(false);
@@ -10142,7 +10087,7 @@ export default function Home() {
       });
       const reply = typeof result.reply === "string" ? result.reply.trim().slice(0, 12_000) : "";
       if (!reply) throw new Error("AI 没有完成这轮回复");
-      setDemoConversation((current) => [...current, { id: `assistant-${demoRunCount}-${sequence}`, role: "assistant", content: reply }].slice(-12));
+      setDemoConversation((current) => [...current, { id: `assistant-${demoRunCount}-${sequence}`, role: "assistant" as const, content: reply }].slice(-12));
     } catch (error) {
       setDemoConversation((current) => current.filter((item) => item.id !== userMessage.id));
       setDemoChatInput(message);
@@ -10217,8 +10162,8 @@ export default function Home() {
       });
       const normalized = normalizeEvalResults(review.results, files, demoAnswers);
       if (normalized.length !== 5) throw new Error("AI 没有完成五项对话证据评估");
-      const fallback = createDemoFeedbackFallback(skillDemo, normalized, createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0));
-      const hasVisibleMismatch = normalized.some((item) => item.coverage !== "not-covered" && item.score < 90 && !/无实质缺陷|完全符合|准确|流程正确|本轮未覆盖|不构成缺陷/i.test(item.issue || ""));
+      const fallback = createDemoFeedbackFallback(normalized);
+      const hasVisibleMismatch = normalized.some(hasObservedDemoMismatch);
       setEvals(normalized);
       setFeedbackOptions(hasVisibleMismatch ? normalizeFeedbackOptions(review.feedbackOptions, fallback) : []);
       setFeedbackReasons([]);
@@ -10236,15 +10181,27 @@ export default function Home() {
 
   function enterEvaluation() {
     setStep("evaluate");
-    if (evalRan || busy || evaluationLaunchPendingRef.current) return;
+    if (evalRan || evaluationRunInFlight.current || evaluationLaunchPendingRef.current) return;
     evaluationLaunchPendingRef.current = true;
-    // Let React commit and paint the validation workspace before starting a
-    // potentially long model request. This keeps navigation responsive even
-    // when the evaluation provider or browser connection is slow.
-    window.requestAnimationFrame(() => {
+    let waitRounds = 0;
+    const launchWhenReady = () => {
+      const activeTask = busyTaskRef.current;
+      if (activeTask && activeTask !== "evaluate" && waitRounds < 12) {
+        waitRounds += 1;
+        window.setTimeout(launchWhenReady, 100);
+        return;
+      }
       evaluationLaunchPendingRef.current = false;
+      if (activeTask && activeTask !== "evaluate") {
+        reportClientEvaluationEvent("evaluation_blocked", { phase: "launch", reason: `busy:${activeTask}` });
+        setToast("上一阶段仍在收尾；请稍后再点一次“生成第一版 Demo”");
+        return;
+      }
       void runEvaluation();
-    });
+    };
+    // Paint the validation workspace first, then wait briefly for the build
+    // overlay to finish closing instead of silently dropping the user's click.
+    window.requestAnimationFrame(launchWhenReady);
   }
 
   function handleBuildPrimaryAction() {
@@ -10341,8 +10298,8 @@ export default function Home() {
     setBusyPhaseIndex(phaseOffset + 3);
     const normalized = normalizeEvalResults(review.results, candidateFiles, demoAnswers);
     if (normalized.length !== 5) throw new Error("AI 没有完成五项 Demo 对照评估");
-    const fallback = createDemoFeedbackFallback(demo, normalized, createPersonalizedFeedbackOptions(demoAnswers, sourceNames.length > 0));
-    const hasVisibleMismatch = normalized.some((item) => item.coverage !== "not-covered" && item.score < 90 && !/无实质缺陷|完全符合|准确|流程正确|本轮未覆盖|不构成缺陷/i.test(item.issue || ""));
+    const fallback = createDemoFeedbackFallback(normalized);
+    const hasVisibleMismatch = normalized.some(hasObservedDemoMismatch);
     const options = hasVisibleMismatch ? normalizeFeedbackOptions(review.feedbackOptions, fallback) : [];
     if (persistCheckpoint) {
       const completedReplies = episodeConversation.filter((item) => item.role === "assistant");
@@ -10354,13 +10311,25 @@ export default function Home() {
   }
 
   async function runEvaluation() {
+    if (evaluationRunInFlight.current || busyTaskRef.current === "evaluate") {
+      reportClientEvaluationEvent("evaluation_blocked", { phase: "click", reason: "already-running" });
+      setToast("Demo 已经在生成，请等待当前试跑完成");
+      return;
+    }
+    if (busyTaskRef.current) {
+      reportClientEvaluationEvent("evaluation_blocked", { phase: "click", reason: `busy:${busyTaskRef.current}` });
+      setToast("上一阶段仍在收尾；完成后即可生成 Demo");
+      return;
+    }
     if (!hasRealModel) {
+      reportClientEvaluationEvent("evaluation_blocked", { phase: "connection", reason: "model-not-connected" });
       setToast("真实 Demo 需要先连接模型；不会用文件检查冒充实际提升");
       setSettingsOpen(true);
       return;
     }
+    evaluationRunInFlight.current = true;
+    reportClientEvaluationEvent("evaluation_started", { phase: demoReviewPending && skillDemo ? "resume-review" : "generate-demo" });
     const hadResult = evalRan;
-    setEvalDetailsOpen(false);
     beginBusy("evaluate", "evaluate");
     try {
       const savedDemo = demoReviewPending ? skillDemo : null;
@@ -10383,13 +10352,21 @@ export default function Home() {
       setRejectedOptimizations([]);
       setOptimizationSession(null);
       markComplete("evaluate");
+      reportClientEvaluationEvent("evaluation_finished", {
+        phase: "complete",
+        afterCount: reviewed.results.length,
+        reason: savedDemo ? "resumed saved Demo and completed review" : "generated Demo and completed review",
+      });
       setRetryAction(null);
       const automaticTurns = reviewed.conversation.filter((item) => item.role === "assistant").length;
       setToast(automaticTurns ? `Demo 已自动续跑 ${automaticTurns} 轮，并按完整对话评分` : "Demo 已生成，具体不足已根据本次结果列出");
     } catch (error) {
       if (!hadResult || demoReviewPending) setEvalRan(false);
-      setToast(`${error instanceof Error ? error.message : "Skill Demo 试跑失败"}${skillDemo && demoReviewPending ? "；Demo 已保存，只需继续评估" : ""}`);
+      const message = error instanceof Error ? error.message : "Skill Demo 试跑失败";
+      reportClientEvaluationEvent("evaluation_failed", { phase: "run", reason: message });
+      setToast(`${message}${skillDemo && demoReviewPending ? "；Demo 已保存，只需继续评估" : ""}`);
     } finally {
+      evaluationRunInFlight.current = false;
       finishBusy();
     }
   }
@@ -10974,6 +10951,14 @@ export default function Home() {
       return;
     }
     const exportFiles = allowSensitiveExport ? files : sanitizeSkillFiles(files);
+    // Privacy processing happens after the UI's audit. Validate the actual
+    // bytes to be downloaded so redaction cannot silently break evidence
+    // digests or canonical projections in an otherwise valid bundle.
+    const exportValidation = validateBundleStructure(exportFiles);
+    if (!exportValidation.executionReady || !exportValidation.contractReady) {
+      setToast(`导出内容检查未通过：${friendlyReleaseBlocker(exportValidation.issues[0]?.message || "文件契约不完整")}。当前 Skill 已保留，请在编辑页修复后重试。`);
+      return;
+    }
     const frameName = "skillcanvas-download-frame";
     let frame = document.querySelector<HTMLIFrameElement>(`iframe[name="${frameName}"]`);
     if (!frame) {
@@ -11073,26 +11058,13 @@ export default function Home() {
     const conversationScoreIsFresh = Boolean(latestCompletedReplyId) && demoConversationScoredReplyId === latestCompletedReplyId;
     const hasNewConversationEvidence = Boolean(latestCompletedReplyId) && !conversationScoreIsFresh;
     const automaticTurns = demoConversation.filter((message) => message.role === "assistant" && message.source === "mock").length;
-    const visibleComparisonRows = formalComparisonRows.slice(0, 3);
+    const benefits = comparisonBenefits(formalComparisonRows, { current: formalComparisonIsCurrent, pending: pendingReview });
     return (
       <section className={`skill-demo-card ${pendingReview ? "review-pending" : ""}`}>
-        <div className="skill-demo-head">
+        <div className={`skill-demo-head ${benefits.length ? "" : "without-improvements"}`}>
           <div className="skill-demo-title"><span>第 {Math.max(1, demoRunCount)} 次试跑</span><h3>{skillDemo.title}</h3><p>{skillDemo.scenario}</p></div>
           <div className="skill-demo-aside">
-            <section className={`demo-improvement-summary ${pendingReview || !formalComparisonIsCurrent ? "pending" : ""}`} aria-label="相比裸模型的实际变化">
-              <div className="demo-improvement-heading">
-                <span>同题匿名 A/B</span>
-                <strong>{pendingReview || !formalComparisonIsCurrent ? "等待正式对照" : formalImprovementRows.length ? `${formalImprovementRows.length} 个任务中 Skill 更好` : "尚未证明有提升"}</strong>
-              </div>
-              {visibleComparisonRows.length > 0
-                ? <ul>{visibleComparisonRows.map((result) => (
-                    <li className={result.verdict === "candidate" ? "improved" : "gap"} key={result.caseId}>
-                      <span>{result.verdict === "candidate" ? "更好" : result.verdict === "tie" ? "接近" : "待加强"}</span>
-                      <div><strong>{result.title}</strong><p>{result.explanation}</p></div>
-                    </li>
-                  ))}</ul>
-                : <p>{pendingReview ? "完成本轮试跑后，会用生成阶段的裸模型对照给出具体差异。" : "当前版本还没有正式 A/B 证据，重新运行对照后才能判断它是否真的优于裸模型。"}</p>}
-            </section>
+            <ComparisonBenefits benefits={benefits} />
             {!pendingReview && <div className="demo-head-actions">
               <button className="demo-rerun-button" type="button" onClick={runEvaluation} disabled={busy}><img src="/icons/tabler/refresh.svg" alt="" aria-hidden="true" /><span>{busy ? "正在试跑…" : "换个场景"}</span></button>
               <button className={`demo-rerun-button demo-score-button${hasNewConversationEvidence ? " evidence-ready" : ""}`} type="button" onClick={() => void reevaluateDemoConversation()} disabled={!hasNewConversationEvidence || demoConversationScoreBusy || demoChatBusy}><img src="/icons/tabler/star.svg" alt="" aria-hidden="true" /><span>{demoConversationScoreBusy ? "对比中…" : conversationScoreIsFresh ? "对比结论已更新" : "更新对比结论"}</span></button>
@@ -11849,46 +11821,13 @@ export default function Home() {
                 </div>}
                 {generationLoop.status !== "idle" && generationLoop.issues.length > 0 && <details className="generation-loop-issues"><summary>{generationCopy.issueLabel}</summary><p>这些是测试记录，不一定代表不同问题；同一问题可能有多条证据。</p><ul>{generationLoop.issues.map((item) => <li key={item}>{friendlyReleaseBlocker(item)}</li>)}</ul></details>}
               </section>
-              <div className="editor-shell">
-                <div className="file-tree">
-                  <div className="tree-heading">{activeSkillName.toUpperCase()}</div>
-                  {Object.keys(files).map((name) => (
-                    <button className={selectedFile === name ? "selected" : ""} key={name} onClick={() => setSelectedFile(name)}>
-                      <span>{name.endsWith(".md") ? "M↓" : name.endsWith(".json") ? "{}" : name.endsWith(".py") ? ">_" : name.startsWith("assets/") ? "A" : "◇"}</span>{name}
-                    </button>
-                  ))}
-                  <div className="tree-note"><strong>{Object.keys(files).length} 个文件</strong><span>按需加载，节省上下文</span></div>
-                </div>
-                <div className="code-pane">
-                  <div className="code-tab"><span>{selectedFile}</span><span className="valid-mark">可编辑 · 本标签页自动保存</span></div>
-                  <textarea
-                    className="skill-file-editor"
-                    value={files[selectedFile] || ""}
-                    onChange={(event) => updateSelectedFileContent(event.target.value)}
-                    aria-label={`编辑 ${selectedFile}`}
-                    autoCapitalize="off"
-                    autoCorrect="off"
-                    spellCheck={false}
-                  />
-                </div>
-                <div className="inspector-pane">
-                  <div className="inspector-title"><span>文件解释</span><small>{selectedFileExplanation.kind}</small></div>
-                  <div className="inspector-callout"><span>这个文件负责什么？</span><p>{selectedFileExplanation.summary}</p></div>
-                  <section className="inspector-detail-section">
-                    <strong>里面具体有什么</strong>
-                    <ul>{selectedFileExplanation.contents.map((item) => <li key={item}>{item}</li>)}</ul>
-                  </section>
-                  <section className="inspector-detail-grid">
-                    <div><span>什么时候会用</span><p>{selectedFileExplanation.usedWhen}</p></div>
-                    <div><span>改了会影响什么</span><p>{selectedFileExplanation.affects}</p></div>
-                    <div><span>怎么检查它</span><p>{selectedFileExplanation.validation}</p></div>
-                    <div><span>关联文件</span><p>{selectedFileExplanation.related.length ? selectedFileExplanation.related.join("、") : "当前没有检测到直接文件引用"}</p></div>
-                  </section>
-                  <div className="inspector-stat"><span>预计上下文</span><strong>{Math.ceil((files[selectedFile]?.length || 0) / 4)} tokens</strong></div>
-                  <div className="inspector-stat"><span>理解来源</span><strong>{sourceNames.length} 份资料 · {coveredDimensions.size} 个需求维度</strong></div>
-                  <div className="inspector-stat"><span>发布前检查</span><strong className={bundleAudit.blockers.length ? "red-text" : "green-text"}>{bundleAudit.blockers.length ? `${bundleAudit.blockers.length} 项待修复` : "已通过"}</strong></div>
-                </div>
-              </div>
+              <SkillFileWorkspace
+                files={files} skillName={activeSkillName} selectedFile={selectedFile}
+                onSelectFile={setSelectedFile} explanation={selectedFileExplanation}
+                onContentChange={updateSelectedFileContent}
+                sourceCount={sourceNames.length} dimensionCount={coveredDimensions.size}
+                blockerCount={bundleAudit.blockers.length}
+              />
                 </div>
               </details>
             </div>
@@ -11908,7 +11847,7 @@ export default function Home() {
                     <div className="demo-review-checkpoint" role="status" aria-live="polite">
                       <span>✓</span>
                       <div><strong>Demo 已保存，不会重新生成</strong><p>{busy ? "AI 正在根据这份结果寻找具体差距。" : "刚才只中断了后续评估；点击继续时会直接使用上面的 Demo。"}</p></div>
-                      <button className="primary-button compact" onClick={runEvaluation} disabled={busy}>{busy ? "正在评估…" : "继续完成评估"}<span>→</span></button>
+                      <button type="button" className="primary-button compact" onClick={() => void runEvaluation()} aria-busy={busyTask === "evaluate"}>{busyTask === "evaluate" ? "正在评估…" : "继续完成评估"}<span>→</span></button>
                     </div>
                   </>
                 ) : (
@@ -11916,7 +11855,7 @@ export default function Home() {
                     <div className="radar-visual"><span>▶</span><small>真实 Demo</small></div>
                     <h3>先让它完成一次代表性任务</h3>
                     <p>AI 会根据你的目标和资料设计一条真实输入，再严格按当前 Skill 生成完整结果。之后才会指出不足，不再用文件是否齐全代替效果。</p>
-                    <button className="primary-button" onClick={runEvaluation} disabled={busy}>{busy ? "正在生成 Demo…" : "生成第一版 Demo"}<span>↗</span></button>
+                    <button type="button" className="primary-button" onClick={() => void runEvaluation()} aria-busy={busyTask === "evaluate"}>{busyTask === "evaluate" ? "正在生成 Demo…" : "生成第一版 Demo"}<span>↗</span></button>
                     <small>{hasRealModel ? `由 ${model} 试跑 · Key 通过服务端安全代理使用` : "需要先连接模型；不会用文件检查冒充实际提升"}</small>
                   </div>
                 )
@@ -11931,10 +11870,11 @@ export default function Home() {
                       </section>
                     )}
                     {renderSkillDemoCard(false)}
-                    <section className="eval-report-panel expanded" aria-label="本轮效果报告">
+                    <details className="eval-report-panel eval-full-results" aria-label="完整测试结果">
+                    <summary><strong>查看完整测试结果</strong><span>{formalComparisonIsCurrent ? `已完成 ${formalComparisonRows.length} 次对照 · 包含提升与待改进项` : "当前版本还没有完整对照"}</span><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6" /></svg></summary>
                     <div className={`eval-report-summary ${!formalComparisonIsCurrent || formalGapRows.length ? "needs-work" : "ready"}`}>
                       <div className="eval-report-verdict">
-                        <span>裸模型 vs 当前 Skill · 同题匿名对照</span>
+                        <span>普通 AI 与你的 Skill · 使用同一测试任务</span>
                         <strong>{evaluationHeadline}</strong>
                         <p>{evaluationSummary}</p>
                       </div>
@@ -11973,7 +11913,7 @@ export default function Home() {
                         <div>{observedEvals.map((result) => <article key={result.label}><strong>{result.label}</strong><p>{result.strength || result.detail}</p>{result.issue && <small>{result.issue}</small>}</article>)}</div>
                       </details>}
                     </div>
-                    </section>
+                    </details>
                     {bundleAudit.blockers.length > 0 && <div className="finding-card">
                     <span className="finding-icon">!</span>
                     <div><strong>文件发布检查还有 {bundleAudit.blockers.length} 项</strong><p>这是文件结构、隐私和能力接入检查，与上面的 Demo 效果报告分开处理。</p></div>
@@ -12027,12 +11967,13 @@ export default function Home() {
                   <div><span className="stage-kicker">发布前最后看一遍</span><h3>完整 Skill 文件</h3></div>
                   <button type="button" onClick={() => setStep("build")}>返回编辑</button>
                 </div>
-                <div className="release-preview-body">
-                  <div className="release-file-list">
-                    {Object.keys(files).map((name) => <button type="button" className={selectedFile === name ? "selected" : ""} key={name} onClick={() => setSelectedFile(name)}>{name}</button>)}
-                  </div>
-                  <div className="release-file-content"><div><span>{selectedFile}</span><small>{files[selectedFile]?.length || 0} 字符</small></div><pre><code>{files[selectedFile] || ""}</code></pre></div>
-                </div>
+                <SkillFileWorkspace
+                  files={files} skillName={activeSkillName} selectedFile={selectedFile}
+                  onSelectFile={setSelectedFile} explanation={selectedFileExplanation}
+                  readOnly
+                  sourceCount={sourceNames.length} dimensionCount={coveredDimensions.size}
+                  blockerCount={bundleAudit.blockers.length}
+                />
               </section>
               <div className="deploy-summary">
                 <div><span>将导出</span><strong>{Object.keys(files).length} 个文件 · {platforms.length} 个目标</strong></div>
@@ -12295,9 +12236,9 @@ export default function Home() {
               <span>{busyExecutionLabel}</span>
               <p>{busyExecutionNote}</p>
             </div>
-            <div className={`ai-output-stage ${busyOutputText ? "has-output" : "waiting"}`} aria-label={busyOutputText ? "模型本轮输出" : "模型正在处理"}>
+            <div className={`ai-output-stage ${busyOutputText ? "has-output" : "waiting"}`} aria-label="AI 当前处理状态">
               {busyOutputText
-                ? <div className="ai-output-scroll" ref={busyOutputViewportRef} key={busyOutputRevision} tabIndex={0}><pre>{busyOutputText}</pre></div>
+                ? <div className="ai-output-summary" ref={busyOutputViewportRef} key={busyOutputRevision} role="status"><strong>{busyStage}</strong><p>{busyExecutionNote}</p></div>
                 : <WaitingDotField />}
             </div>
             <DotMatrixProgress progress={(busyStageIndex + 0.42) / BUSY_STAGES[busyTask].stages.length} label={`总进度：${busyStage}`} />

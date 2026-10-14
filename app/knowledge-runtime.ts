@@ -1,6 +1,6 @@
 import { normalizeCapabilityDelta, type CapabilityDelta } from "./capability-delta.ts";
 import { knowledgeRequirementPolicy, type KnowledgeAssessment } from "./knowledge-contract.ts";
-import { EMPTY_KNOWLEDGE_PACK, type KnowledgePack } from "./knowledge-research.ts";
+import { EMPTY_KNOWLEDGE_PACK, type KnowledgeCategory, type KnowledgePack } from "./knowledge-research.ts";
 
 /** Bump when a saved browser session must be deterministically reprojected
  * before it can be trusted by the current compiler and validator. */
@@ -49,13 +49,14 @@ export function knowledgeAssessmentFromPack(
       missingCategories: [],
     };
   }
-  const coveredCategories = policy.requiredCategories.filter((category) => pack.categoryCoverage.covered.includes(category));
-  const missingCategories = policy.requiredCategories.filter((category) => !coveredCategories.includes(category));
+  const requiredCategories = policy.requiredCategories as KnowledgeCategory[];
+  const coveredCategories = requiredCategories.filter((category) => pack.categoryCoverage.covered.includes(category));
+  const missingCategories = requiredCategories.filter((category) => !coveredCategories.includes(category));
   const coveredGapIds = policy.requiredGapIds.filter((gapId) => pack.evidenceCoverage?.coveredGapIds.includes(gapId));
   const missingGapIds = policy.requiredGapIds.filter((gapId) => !coveredGapIds.includes(gapId));
   return {
     status: pack.sufficiency === "sufficient" && missingCategories.length === 0 && missingGapIds.length === 0 ? "sufficient" : "insufficient",
-    requiredCategories: [...policy.requiredCategories],
+    requiredCategories: [...requiredCategories],
     coveredCategories,
     missingCategories,
     requiredGapIds: [...policy.requiredGapIds],
@@ -81,7 +82,6 @@ export function reconcileKnowledgePackWithCapabilityDelta(
     requiredGapIds: [...policy.requiredGapIds],
     coveredGapIds: [],
     missingGapIds: [...policy.requiredGapIds],
-    requiredCategories: [...policy.requiredCategories],
     coveredCategories: [],
     missingCategories: [...policy.requiredCategories],
     observedCategories: [],
@@ -90,8 +90,9 @@ export function reconcileKnowledgePackWithCapabilityDelta(
   };
   const coveredGapIds = policy.requiredGapIds.filter((gapId) => evidenceCoverage.coveredGapIds.includes(gapId));
   const missingGapIds = policy.requiredGapIds.filter((gapId) => !coveredGapIds.includes(gapId));
-  const coveredCategories = policy.requiredCategories.filter((category) => evidenceCoverage.coveredCategories.includes(category));
-  const missingCategories = policy.requiredCategories.filter((category) => !coveredCategories.includes(category));
+  const requiredCategories = policy.requiredCategories as KnowledgeCategory[];
+  const coveredCategories = requiredCategories.filter((category) => evidenceCoverage.coveredCategories.includes(category));
+  const missingCategories = requiredCategories.filter((category) => !coveredCategories.includes(category));
   const sufficient = missingGapIds.length === 0 && missingCategories.length === 0 && pack.atoms.length > 0;
   return {
     ...pack,
@@ -103,7 +104,7 @@ export function reconcileKnowledgePackWithCapabilityDelta(
       ...pack.plan,
       required: true,
       capabilityDeltaGapIds: [...policy.requiredGapIds],
-      requiredCategories: [...policy.requiredCategories],
+      requiredCategories: [...requiredCategories],
       knowledgeGaps: policy.externalGaps.map((gap) => gap.taskDecision),
       queries: capabilityDelta.researchFocus.slice(0, 4),
     },
@@ -117,7 +118,6 @@ export function reconcileKnowledgePackWithCapabilityDelta(
       requiredGapIds: [...policy.requiredGapIds],
       coveredGapIds,
       missingGapIds,
-      requiredCategories: [...policy.requiredCategories],
       coveredCategories,
       missingCategories,
     },

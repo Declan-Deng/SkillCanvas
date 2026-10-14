@@ -547,6 +547,8 @@ export function semanticGateAudit(files: Record<string, string>) {
   let evalBank: Record<string, unknown> | null = null;
   try { manifest = JSON.parse(files["evals/capability-manifest.json"] || ""); } catch { return ["跨层语义编译失败：能力清单不是有效 JSON"]; }
   try { evalBank = JSON.parse(files["evals/evals.json"] || ""); } catch { return ["跨层语义编译失败：评测集不是有效 JSON"]; }
+  if (!manifest || typeof manifest !== "object") return ["跨层语义编译失败：能力清单必须是 JSON 对象"];
+  if (!evalBank || typeof evalBank !== "object") return ["跨层语义编译失败：评测集必须是 JSON 对象"];
   const capabilities = Array.isArray(manifest.capabilities) ? manifest.capabilities as Array<Record<string, unknown>> : [];
   const active = capabilities.filter((item) => item.enabled !== false && item.status !== "not-needed");
   const summary = String(manifest.summary || "");
